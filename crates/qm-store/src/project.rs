@@ -7058,10 +7058,10 @@ mod tests {
         // `is_current` over a grid of paths crossed with every page id the two
         // scopes know about, so both "yes" and "no" are compared.
         let mut ids: Vec<String> = Vec::new();
-        for (_, entry) in &whole_loaded.manifest.pages {
+        for entry in whole_loaded.manifest.pages.values() {
             ids.push(entry.page_id.to_string());
         }
-        for (_, entry) in &sharded_loaded.manifest.pages {
+        for entry in sharded_loaded.manifest.pages.values() {
             ids.push(entry.page_id.to_string());
         }
         ids.push("0".repeat(64));
