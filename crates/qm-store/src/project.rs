@@ -388,19 +388,20 @@ impl ProjectStore {
     /// A tombstoned path is absent from `manifest.pages` by construction, so
     /// deleted pages need no extra filter here.
     ///
-    /// Each returned path is the canonical spelling the store keys pages by,
-    /// which is not always the spelling the key was committed from: `PagePath`
-    /// trims, then strips one leading `/`, and that pair is not idempotent
-    /// (`"/ x"` normalises to `" x"`, which normalises again to `"x"`). A key
-    /// stored under such a spelling therefore lists under its re-normalised
-    /// form. Corrupting the listing instead would make one odd path unlistable
-    /// for the whole project, and making the normaliser idempotent would change
-    /// `PagePath::new`'s public semantics — so this stays as it is, on purpose.
+    /// Only keys that `PagePath::new` reproduces *exactly* are listed. That
+    /// filter exists because the normaliser is not idempotent: it trims and
+    /// then strips one leading `/`, so `"/ ."` is accepted while the `" ."` it
+    /// stores is rejected on the next pass, and `"/ notes/odd.md"` is accepted
+    /// while its key re-normalises to `"notes/odd.md"`. The return type can
+    /// only carry paths the normaliser accepts, so listing such a key would
+    /// hand back a spelling no reader can open — an invented handle. Omitting
+    /// it is deliberate; making `PagePath::new` idempotent would fix the root
+    /// cause but changes its public semantics, which is out of scope here.
     ///
     /// # Errors
-    /// [`StoreError::Corrupt`] when a committed path is no longer a valid page
-    /// path — a manifest that cannot be listed is a manifest to repair, not to
-    /// render partially.
+    /// Propagates backend and decode failures from [`Self::load`]. A path that
+    /// cannot be represented is skipped, never rendered partially or allowed to
+    /// make a whole project unlistable.
     pub async fn recent_pages(
         &self,
         workspace_id: &WorkspaceId,
@@ -410,9 +411,14 @@ impl ProjectStore {
         let loaded = self.load(workspace_id, project_id).await?;
         let mut pages = Vec::with_capacity(loaded.manifest.pages.len());
         for (raw, entry) in loaded.manifest.pages {
-            let path = PagePath::new(&raw).map_err(|error| {
-                StoreError::Corrupt(format!("manifest page path {raw:?}: {error}"))
-            })?;
+            // One key we cannot represent must not take the whole listing down
+            // with it: skip it, the way the doc above explains.
+            let Ok(path) = PagePath::new(&raw) else {
+                continue;
+            };
+            if path.as_str() != raw {
+                continue;
+            }
             pages.push((path, entry));
         }
         pages.sort_by(recency_order);
@@ -2049,27 +2055,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_pages_list_a_page_committed_under_an_odd_spelling() {
+    async fn recent_pages_skip_keys_a_reader_could_never_open() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = machine(&bucket);
 
-        // `PagePath::new` trims and then strips a leading `/`, and that pair is
-        // not idempotent: this spelling commits under the key `" notes/odd.md"`.
-        // The listing must still work — one odd path may not make a whole
-        // project unlistable — and it reports the re-normalised spelling.
-        let odd = PagePath::new("/ notes/odd.md").unwrap();
-        assert_eq!(odd.as_str(), " notes/odd.md");
+        // Two shapes of stored key that `PagePath::new` does not reproduce.
+        // `"/ ."` commits under `" ."`, which stops parsing at all; `"/ notes/
+        // odd.md"` commits under `" notes/odd.md"`, which parses to a
+        // *different* string. Either way the return type cannot carry a path
+        // that resolves back to the stored key, so listing it would hand back a
+        // handle nobody can open.
+        for (spelling, stored) in [("/ .", " ."), ("/ notes/odd.md", " notes/odd.md")] {
+            let odd = PagePath::new(spelling).unwrap();
+            assert_eq!(odd.as_str(), stored, "{spelling} normalises to {stored}");
+            store
+                .commit_page(CommitPageRequest {
+                    path: odd,
+                    ..request("mbp-a", "notes/filler.md", "body", 1_000)
+                })
+                .await
+                .expect("commit");
+        }
         store
-            .commit_page(CommitPageRequest {
-                path: odd,
-                ..request("mbp-a", "notes/filler.md", "body", 1_000)
-            })
+            .commit_page(request("mbp-a", "notes/keep.md", "body", 2_000))
             .await
             .expect("commit");
 
         let listed = store.recent_pages(&ws(), &proj(), 10).await.unwrap();
-        assert_eq!(listed.len(), 1, "an odd key must not break the listing");
-        assert_eq!(listed[0].0.as_str(), "notes/odd.md");
+        let shown: Vec<&str> = listed.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            shown,
+            ["notes/keep.md"],
+            "an unopenable key must neither break the listing nor appear in it"
+        );
     }
 
     #[tokio::test]
