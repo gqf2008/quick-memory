@@ -380,6 +380,65 @@ pub async fn materialize_splits(
     Ok(dirs)
 }
 
+/// Marker written inside a cached split once it is complete.
+const CACHE_MARKER: &str = ".qm-cache-complete";
+
+/// Materialise splits into a cache that survives across commands.
+///
+/// A search re-reads the catalog every time, so without a cache every query
+/// would re-download every split. The cache is keyed by the split's content
+/// hash: an immutable split maps to one directory, and a hit means there is
+/// nothing to download at all. Staging into a unique directory and renaming it
+/// into place means a crash never leaves a half-populated cache entry looking
+/// complete.
+///
+/// # Errors
+/// Fails when a split cannot be materialised, or when the cache directory
+/// cannot be created.
+pub async fn materialize_splits_cached(
+    store: &dyn ObjectStore,
+    splits: &[(String, String)],
+    cache_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("creating cache dir {}", cache_root.display()))?;
+    let mut dirs = Vec::with_capacity(splits.len());
+    for (index, (prefix, content_hash)) in splits.iter().enumerate() {
+        let key: String = content_hash.chars().take(24).collect();
+        let dir = cache_root.join(format!("split-{key}"));
+        if dir.join(CACHE_MARKER).is_file() {
+            dirs.push(dir);
+            continue;
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let staging = cache_root.join(format!(".staging-{}-{index}-{nanos}", std::process::id()));
+        materialize(store, prefix, &staging)
+            .await
+            .with_context(|| format!("materialising split {prefix}"))?;
+        std::fs::write(staging.join(CACHE_MARKER), b"complete")
+            .context("marking a cached split complete")?;
+
+        match std::fs::rename(&staging, &dir) {
+            Ok(()) => dirs.push(dir),
+            Err(_) if dir.join(CACHE_MARKER).is_file() => {
+                // Another process published this split first; use theirs and
+                // drop our staging copy.
+                let _ = std::fs::remove_dir_all(&staging);
+                dirs.push(dir);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(error).context("publishing a cached split");
+            }
+        }
+    }
+    Ok(dirs)
+}
+
 /// Reciprocal-rank fusion across result lists.
 ///
 /// Every split is searched independently and contributes by rank, so a page
@@ -602,7 +661,13 @@ pub async fn search_project(
         ("entities", &["entities"]),
         ("links", &["links"]),
     ];
-    let dirs = materialize_splits(store, &prefixes, cache_root).await?;
+    let split_keys: Vec<(String, String)> = loaded
+        .catalog
+        .splits
+        .iter()
+        .map(|split| (split.prefix.clone(), split.content_hash.clone()))
+        .collect();
+    let dirs = materialize_splits_cached(store, &split_keys, cache_root).await?;
     let mut lists = Vec::new();
     let mut candidates = 0usize;
     let mut stream_candidates = std::collections::BTreeMap::new();
@@ -920,6 +985,104 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.hits, second.hits);
+    }
+
+    /// The cache is what makes repeat searches cheap: after the first query the
+    /// split objects can vanish from the bucket and results still come back.
+    #[tokio::test]
+    async fn a_cached_split_is_reused_without_touching_the_bucket() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let cache_root = TempDir::new().unwrap();
+
+        let page_path = PagePath::new("notes/quickwit.md").unwrap();
+        project
+            .commit_page(CommitPageRequest {
+                workspace_id: workspace.clone(),
+                project_id: project_id.clone(),
+                path: page_path.clone(),
+                title: "Quickwit".into(),
+                body: "tantivy splits in object storage".into(),
+                writer_id: WriterId::new("mbp-a").unwrap(),
+                now_ms: 1,
+            })
+            .await
+            .unwrap();
+        let page = project
+            .read_page(&workspace, &project_id, &page_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let doc = PageDoc::from_version(&workspace, &project_id, &page, 1);
+        publish_split_index(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            &WriterId::new("mbp-a").unwrap(),
+            1,
+            &[doc],
+            &build_root.path().join("s1"),
+            1,
+        )
+        .await
+        .unwrap();
+
+        let first = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            cache_root.path(),
+            "tantivy",
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.hits.len(), 1);
+        assert!(
+            std::fs::read_dir(cache_root.path())
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("split-")),
+            "a complete split must be cached"
+        );
+
+        // Delete every split object: only the cache can answer now.
+        let catalog = project.load_catalog(&workspace, &project_id).await.unwrap();
+        for split in &catalog.catalog.splits {
+            let prefix = object_store::path::Path::parse(&split.prefix).unwrap();
+            let mut stream = bucket.list(Some(&prefix));
+            let mut keys = Vec::new();
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                keys.push(item.unwrap().location);
+            }
+            for key in keys {
+                bucket.delete(&key).await.unwrap();
+            }
+        }
+
+        let second = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            cache_root.path(),
+            "tantivy",
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.hits, first.hits,
+            "the second search must be served from the cache"
+        );
     }
 
     /// Multi-stream retrieval: a page that *declares* the identifier should

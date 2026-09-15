@@ -497,8 +497,16 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .load(&ctx.workspace, &ctx.project_id)
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let mut docs = Vec::with_capacity(loaded.manifest.pages.len());
+            let watermark_path = publish_watermark_path(&ctx);
+            let watermark = read_watermark(&watermark_path);
+            let mut docs = Vec::new();
             for (path, entry) in &loaded.manifest.pages {
+                // Only what changed since this machine last published. Without
+                // the watermark (a fresh cache) everything is republished,
+                // which is wasteful but never wrong.
+                if entry.seq <= watermark {
+                    continue;
+                }
                 let page_path = PagePath::new(path)?;
                 let page = ctx
                     .project
@@ -513,7 +521,15 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 ));
             }
             if docs.is_empty() {
-                bail!("nothing to publish: the project has no live pages");
+                let reason = if loaded.manifest.pages.is_empty() {
+                    "nothing to publish: the project has no live pages".to_string()
+                } else {
+                    format!(
+                        "nothing to publish: this machine is up to date through seq {}",
+                        watermark
+                    )
+                };
+                return Ok(reason);
             }
             let seq = loaded.manifest.seq + 1;
             // One directory per invocation: a leftover build directory from an
@@ -534,11 +550,13 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 ctx.now_ms,
             )
             .await?;
+            write_watermark(&watermark_path, loaded.manifest.seq)?;
             Ok(if ctx.json {
                 serde_json::json!({
                     "generation": outcome.generation,
                     "already_present": outcome.already_present,
                     "pages": docs.len(),
+                    "manifest_seq": loaded.manifest.seq,
                 })
                 .to_string()
             } else if outcome.already_present {
@@ -846,6 +864,40 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
     }
+}
+
+/// Local record of how far this machine has published.
+///
+/// Deliberately local: each machine publishes its own splits, so its publish
+/// position is its own business. Losing the file costs one redundant full
+/// publish, never correctness.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PublishWatermark {
+    manifest_seq: u64,
+}
+
+fn publish_watermark_path(ctx: &Context) -> PathBuf {
+    ctx.cache_dir.join(format!(
+        "publish-{}-{}-{}.json",
+        ctx.workspace, ctx.project_id, ctx.writer
+    ))
+}
+
+fn read_watermark(path: &PathBuf) -> u64 {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PublishWatermark>(&bytes).ok())
+        .map(|watermark| watermark.manifest_seq)
+        .unwrap_or(0)
+}
+
+fn write_watermark(path: &PathBuf, manifest_seq: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec(&PublishWatermark { manifest_seq })?;
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Hard cap on hook input, applied before any parsing.
@@ -1239,6 +1291,76 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("\"sessions\":1"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn publishing_is_incremental_per_machine() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/one.md",
+                "--body",
+                "first page",
+            ]),
+            Context {
+                now_ms: 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 2_000;
+        let first = execute(&cli(&["publish"]), ctx).await.unwrap();
+        assert!(first.contains("published 1 page(s)"), "{first}");
+
+        // Nothing changed: a second publish must not append another split.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 3_000;
+        let second = execute(&cli(&["publish"]), ctx).await.unwrap();
+        assert!(second.contains("nothing to publish"), "{second}");
+        let catalog = {
+            let ctx = context(Arc::clone(&bucket), &cache);
+            ctx.project
+                .load_catalog(&ctx.workspace, &ctx.project_id)
+                .await
+                .unwrap()
+        };
+        assert_eq!(catalog.catalog.splits.len(), 1);
+
+        // One new page: only that page is republished.
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/two.md",
+                "--body",
+                "second page",
+            ]),
+            Context {
+                now_ms: 4_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 5_000;
+        let third = execute(&cli(&["publish"]), ctx).await.unwrap();
+        assert!(third.contains("published 1 page(s)"), "{third}");
+        let catalog = {
+            let ctx = context(Arc::clone(&bucket), &cache);
+            ctx.project
+                .load_catalog(&ctx.workspace, &ctx.project_id)
+                .await
+                .unwrap()
+        };
+        assert_eq!(catalog.catalog.splits.len(), 2);
     }
 
     #[tokio::test]
