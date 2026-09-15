@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use futures::StreamExt;
 use object_store::ObjectStore;
 use qm_core::{
     CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease,
@@ -27,6 +28,19 @@ use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
 
 /// Upper bound on how far back `page_history` will walk a supersession chain.
 const MAX_HISTORY_DEPTH: usize = 100_000;
+
+/// How many commit records [`ProjectStore::read_commit_log`] keeps in flight at
+/// once.
+///
+/// The log is read whole and sorted afterwards, so this bounds *overlap*, not
+/// how much is read: a project with N commits still fetches N objects, but the
+/// store layer never has more than this many requests open. On a bucket where
+/// each read costs a round trip that turns the read's latency from `N * RTT`
+/// into roughly `ceil(N / K) * RTT`, without turning a large project into one
+/// unbounded fan-out. 16 is enough to hide most of one round trip behind the
+/// others while staying small next to what the records cost (a few hundred
+/// bytes each).
+const COMMIT_LOG_READ_CONCURRENCY: usize = 16;
 
 /// How hard to fight for the commit point before giving up.
 #[derive(Debug, Clone)]
@@ -1826,6 +1840,10 @@ impl ProjectStore {
     /// Advisory metadata: entries can be missing (a crash between the commit
     /// and this write), and nothing authoritative depends on them.
     ///
+    /// The whole log is listed and read — `limit` caps the answer, not the
+    /// work — but the reads overlap up to a fixed bound. The order comes from
+    /// the sort below, never from the order the reads finish in.
+    ///
     /// # Errors
     /// Propagates listing and decode failures.
     pub async fn read_commit_log(
@@ -1836,13 +1854,23 @@ impl ProjectStore {
     ) -> Result<Vec<CommitRecord>, StoreError> {
         let prefix = self.layout.commit_prefix(workspace_id, project_id);
         let listed = self.cas.list(&prefix).await?;
-        let mut records = Vec::with_capacity(listed.len());
-        for (key, _) in listed {
-            if !key.ends_with(".json") {
-                continue;
-            }
-            let (bytes, _) = self.cas.read(&key).await?;
-            records.push(decode::<CommitRecord>(&bytes, &key)?);
+        let keys: Vec<String> = listed
+            .into_iter()
+            .filter_map(|(key, _)| key.ends_with(".json").then_some(key))
+            .collect();
+        // Records are immutable and independent, so overlapping their reads
+        // cannot change the answer: the order below comes from the sort, never
+        // from the order the reads happen to finish in. Only the number of
+        // requests in flight is bounded.
+        let mut records = Vec::with_capacity(keys.len());
+        let mut reads = futures::stream::iter(keys)
+            .map(|key| async move {
+                let (bytes, _) = self.cas.read(&key).await?;
+                decode::<CommitRecord>(&bytes, &key)
+            })
+            .buffer_unordered(COMMIT_LOG_READ_CONCURRENCY);
+        while let Some(record) = reads.next().await {
+            records.push(record?);
         }
         records.sort_by_key(|record| std::cmp::Reverse(record.seq));
         records.truncate(limit);
