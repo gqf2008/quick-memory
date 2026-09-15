@@ -396,10 +396,18 @@ fn encode_manifest(
 /// Encode a manifest on the delete path, where [`MANIFEST_MAX_BYTES`] does not
 /// apply.
 ///
-/// Deletion is the only shipped operation that can shrink a manifest, so
-/// refusing it would leave a scope that is already over the limit with no way
-/// back under it. The exemption costs a bounded overshoot (a tombstone can be
-/// a few bytes larger than the entry it replaces) and buys an escape hatch.
+/// Deletion is the one shipped operation that can *shrink* a manifest — it
+/// drops the entry of a path that exists — so refusing it would leave a scope
+/// that is already over the limit with no way back under it. Shrinking is not
+/// guaranteed, though: deleting a path that was never written only adds a
+/// tombstone, and a tombstone is a whole entry. That grows the manifest, and
+/// because this path is unguarded the growth is silent — each delete adds at
+/// most one tombstone, but nothing bounds how many of them an operator can
+/// add. The next commit that goes through [`encode_manifest`] is what refuses.
+///
+/// So the exemption buys the escape hatch at the price of an unsignalled
+/// overshoot. That is the trade this function exists to make; the alternative
+/// strands an over-limit scope forever.
 fn encode_manifest_for_delete(manifest: &Manifest) -> Result<Bytes, StoreError> {
     encode(manifest)
 }
@@ -4991,10 +4999,14 @@ mod tests {
 
     /// A scope that is already over the ceiling can still be repaired.
     ///
-    /// The delete path is deliberately unguarded: deletion is the only shipped
+    /// The delete path is deliberately unguarded: deletion is the one shipped
     /// operation that can shrink a manifest, so refusing it would leave an
     /// over-limit scope with no way back under the limit. This test goes red if
     /// the ceiling guard is ever applied there.
+    ///
+    /// "Can shrink" is not "always shrinks" — deleting a path that was never
+    /// written adds a tombstone and grows the manifest. That is the accepted
+    /// price of the escape hatch, not an oversight.
     #[tokio::test]
     async fn a_scope_over_the_ceiling_can_still_be_deleted_from() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
