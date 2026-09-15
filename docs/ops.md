@@ -173,8 +173,10 @@ HTTP stub，不是真 provider；MinIO 也不是 R2，不能把这组结果扩�
 Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `design.md` §6.4），这不是真 R2 证据。
 仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**ACL/签名/区域/一致性/配额/延迟/错误 XML 变体**，
 以及**在真 R2 上跑一遍向量闭环与跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project`
-必填，两者必须传同一组唯一值）。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这组后端差异；
-向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点，digest 另有 `digest-probe` 的跨进程闭环。
+必填，两者必须传同一组唯一值）；此外，**向量链的真 provider 仍未验证**（当前 vector 证据使用本地
+deterministic HTTP stub，不是真 provider）。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，
+它专门盯这组后端差异；向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点，digest 另有
+`digest-probe` 的跨进程闭环。
 
 没有凭据时能走多远：`qm-probe` 里有一个进程内的最小 S3 stub（`s3-stub` 二进制 / `qm_probe::s3_stub`），
 探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页、跨进程检索、跨进程 digest，以及“独立进程 A 经真实 HTTP

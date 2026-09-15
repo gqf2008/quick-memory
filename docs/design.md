@@ -1276,8 +1276,9 @@ GET 不返回 version、ACL/凭据边界、服务端签名拒绝、区域/一致
   因此不能把 Quickwit 作为库依赖，只能作为**外部服务/构建器**。
 - tantivy 0.26 的 `TopDocs` 必须先 `order_by_score()` 才能作为 collector 使用。
 
-待验证（2026-09-16 的 MinIO current-head 复验已完成；仍只剩真 R2 凭据）：
+待验证（2026-09-16 的 MinIO current-head 复验已完成）：
 
+MinIO current-head 复验完成后分两层：**后端专属项仍只剩真 R2 凭据；向量链另有真 provider 待验证**。
 MinIO 这次是真实 S3-compatible HTTP 后端，不是 R2；它复验了下列命令的 MinIO 行为，不能抵掉真 R2 项。
 原始结果与复现命令见 §10.5。Quickwit 官方 `quickwit/quickwit:0.9.0` 产出的真分片已于 2026-09-15 验证
 （6893 字节、解包 8 个文件、检索命中 1 条；见 §6.4），因此不再是待验证项。
