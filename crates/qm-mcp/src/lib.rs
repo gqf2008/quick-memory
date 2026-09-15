@@ -56,6 +56,13 @@ pub struct SearchArgs {
     /// Search every project in the workspace instead of just this one.
     #[serde(default)]
     pub global: Option<bool>,
+    /// Disable the vector stream for this search.
+    ///
+    /// Only useful to force keyword-only recall; leaving it unset runs the
+    /// vector stream whenever an embedding provider is configured, and means
+    /// nothing when none is.
+    #[serde(default)]
+    pub no_vector: Option<bool>,
 }
 
 /// Arguments for `memory_write_page`.
@@ -309,7 +316,10 @@ impl MemoryServer {
                        has been checked against the authoritative manifest, so \
                        superseded and deleted content never appears. Pass
                        global=true to search every project in the workspace;
-                       hits then carry their workspace and project."
+                       hits then carry their workspace and project. When an
+                       embedding provider is configured (QM_EMBEDDING_*), a
+                       semantic vector stream also runs, so pages that mean the
+                       same thing without sharing words are still found."
     )]
     async fn memory_search(
         &self,
@@ -323,6 +333,7 @@ impl MemoryServer {
             // the CLI does; both are bounded and reported per hit.
             no_recency: false,
             no_neighbors: false,
+            no_vector: args.no_vector.unwrap_or(false),
         })
         .await
     }

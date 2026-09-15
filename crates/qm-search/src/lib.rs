@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use qm_core::{PageVersion, ProjectId, SplitEntry, WorkspaceId, WriterId, content_hash};
+use qm_llm::Embedder;
 use qm_store::{ProjectStore, PublishOutcome};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
@@ -49,6 +50,14 @@ pub struct PageDoc {
     /// Link targets the page points at.
     #[serde(default)]
     pub links: Vec<String>,
+    /// Dense embedding of the page text, when a provider was configured at
+    /// publish time. Absent is the normal case: a bucket with no embedding
+    /// provider still indexes and searches, just without the vector stream.
+    ///
+    /// `serde(default)` keeps previously published JSONL documents readable —
+    /// a corpus written before this field existed must not become unparseable.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl PageDoc {
@@ -70,7 +79,17 @@ impl PageDoc {
             updated_at_ms,
             entities: entities::extract(&page.body).entities,
             links: entities::extract(&page.body).links,
+            // The embedding is not a function of the page alone — it needs a
+            // provider — so it is filled in by whoever builds the split.
+            embedding: None,
         }
+    }
+
+    /// Attach an embedding to this document.
+    #[must_use]
+    pub fn with_embedding(mut self, embedding: Option<Vec<f32>>) -> Self {
+        self.embedding = embedding;
+        self
     }
 }
 
@@ -123,6 +142,10 @@ fn schema() -> Schema {
     // "who links to exactly this path", which a tokenised field cannot answer.
     builder.add_text_field("links_exact", STRING | STORED);
     builder.add_i64_field("updated_at_ms", FAST | STORED);
+    // The embedding is a column, not a searchable field: the vector stream
+    // scans it by doc id, so `FAST` alone is what it needs. Raw little-endian
+    // f32 bytes rather than a string, because f32->text->f32 is lossy.
+    builder.add_bytes_field("embedding", FAST);
     builder.build()
 }
 
@@ -154,10 +177,60 @@ pub fn build_index(dir: &Path, docs: &[PageDoc]) -> Result<()> {
             document.add_text(links_exact, link);
         }
         document.add_i64(f("updated_at_ms"), page.updated_at_ms);
+        if let Some(embedding) = &page.embedding {
+            // An empty vector is not a "no vector": it is a value nothing can
+            // be compared against, and every search over this split would fail
+            // on it. Refuse it here, where it is still cheap to notice.
+            if embedding.is_empty() {
+                bail!(
+                    "page {} has a zero-width embedding; a split containing it could never be searched",
+                    page.path
+                );
+            }
+            document.add_bytes(f("embedding"), &vector::encode(embedding));
+        }
         writer.add_document(document)?;
     }
     writer.commit().context("committing index")?;
     Ok(())
+}
+
+/// The text a page is embedded from.
+///
+/// Title and body together: the title is often the most information-dense part
+/// of a note, and dropping it would make short pages relatively hard to find.
+/// Changing this function changes every stored vector, so it is versioned by
+/// the split rather than mutated in place — a rebuild is the migration.
+#[must_use]
+pub fn embedding_text(doc: &PageDoc) -> String {
+    format!("{}\n\n{}", doc.title, doc.body)
+}
+
+/// Attach embeddings to a batch of documents when a provider is configured.
+///
+/// One request for the whole batch: providers bill and rate-limit per call, so
+/// embedding a page at a time would turn a publish into as many round trips as
+/// there are changed pages. Without a provider the documents are returned
+/// untouched — an unconfigured bucket keeps publishing, just without vectors.
+///
+/// # Errors
+/// Fails when the provider fails, or when it breaches its contract (see
+/// [`vector::embed_texts`]). Publication is then abandoned rather than
+/// publishing a split whose vectors are silently wrong.
+pub async fn attach_embeddings(
+    docs: Vec<PageDoc>,
+    embedder: Option<&dyn Embedder>,
+) -> Result<Vec<PageDoc>> {
+    let Some(embedder) = embedder else {
+        return Ok(docs);
+    };
+    let texts: Vec<String> = docs.iter().map(embedding_text).collect();
+    let vectors = vector::embed_texts(embedder, &texts).await?;
+    Ok(docs
+        .into_iter()
+        .zip(vectors)
+        .map(|(doc, vector)| doc.with_embedding(Some(vector)))
+        .collect())
 }
 
 /// Upload every file of a local index to `prefix`, returning the object keys.
@@ -673,6 +746,7 @@ pub async fn search_workspace(
         query,
         limit,
         &SearchTuning::default(),
+        None,
     )
     .await
 }
@@ -694,6 +768,7 @@ pub async fn search_workspace_tuned(
     query: &str,
     limit: usize,
     tuning: &SearchTuning,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<SearchOutcome> {
     let mut lists = Vec::new();
     let mut splits_searched = 0usize;
@@ -702,7 +777,10 @@ pub async fn search_workspace_tuned(
     let mut stream_candidates = std::collections::BTreeMap::new();
     for project_id in projects {
         let project_cache = cache_root.join(format!("{workspace_id}-{project_id}"));
-        let outcome = search_project(
+        // Each project fuses its own streams (vector included) and the
+        // per-project lists are fused again below. The recency prior is still
+        // applied once, after the cross-project fusion.
+        let outcome = search_project_tuned(
             store,
             project_store,
             workspace_id,
@@ -710,6 +788,8 @@ pub async fn search_workspace_tuned(
             &project_cache,
             query,
             limit,
+            &SearchTuning::default(),
+            embedder,
         )
         .await?;
         splits_searched += outcome.splits_searched;
@@ -765,6 +845,18 @@ pub struct SearchTuning {
     pub neighbor_seeds: usize,
     /// Weight of the neighbour list in the fusion (direct matches are 1.0).
     pub neighbor_weight: f32,
+    /// Run the vector stream when an embedder is available.
+    ///
+    /// Off is the answer for a caller that wants keyword recall only, and for
+    /// `--no-vector`; it is not a way to hide a broken provider, because a
+    /// configured-but-failing provider is an error either way.
+    pub vector_search: bool,
+    /// Weight of the vector list in the fusion.
+    ///
+    /// Below 1.0 on purpose: a semantic neighbour is a weaker signal than a
+    /// page that actually contains the query terms, so the vector stream may
+    /// add recall without displacing the direct matches.
+    pub vector_weight: f32,
 }
 
 impl Default for SearchTuning {
@@ -776,6 +868,8 @@ impl Default for SearchTuning {
             neighbor_expansion: true,
             neighbor_seeds: 3,
             neighbor_weight: 0.4,
+            vector_search: true,
+            vector_weight: 0.6,
         }
     }
 }
@@ -872,6 +966,7 @@ pub async fn compact_project(
     build_dir: &Path,
     now_ms: i64,
     lease_ttl_ms: i64,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<CompactOutcome> {
     let scope = format!("compact/{workspace_id}/{project_id}");
     let Some(lease) = project_store
@@ -920,6 +1015,9 @@ pub async fn compact_project(
             entry.created_at_ms,
         ));
     }
+    // A rebuild that dropped vectors would silently delete the vector stream:
+    // the index is derived, but it must derive the *same* documents.
+    let docs = attach_embeddings(docs, embedder).await?;
 
     let seq = loaded.manifest.seq + 1;
     let prefix = project_store
@@ -980,6 +1078,7 @@ pub async fn search_project(
         query,
         limit,
         &SearchTuning::default(),
+        None,
     )
     .await
 }
@@ -998,6 +1097,7 @@ pub async fn search_project_tuned(
     query: &str,
     limit: usize,
     tuning: &SearchTuning,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<SearchOutcome> {
     let loaded = project_store
         .load_catalog(workspace_id, project_id)
@@ -1074,6 +1174,22 @@ pub async fn search_project_tuned(
             }
         }
     }
+    // Vector stream: pages that are semantically close to the query without
+    // sharing its words. The query is embedded once and every split is scored
+    // against the same vector. A split published before a provider existed has
+    // no embedding column and contributes nothing, which is why a corpus can
+    // mix split generations without failing a search.
+    if let Some(embedder) = embedder.filter(|_| tuning.vector_search && tuning.vector_weight > 0.0)
+    {
+        let query_vector = vector::embed_one(embedder, query).await?;
+        for dir in &dirs {
+            let hits = vector::search_vector(dir, &query_vector, "vector", limit)?;
+            if !hits.is_empty() {
+                *stream_candidates.entry("vector".to_string()).or_insert(0) += hits.len();
+                weighted.push((hits, tuning.vector_weight));
+            }
+        }
+    }
     let streams_active: Vec<String> = stream_candidates
         .iter()
         .filter(|(_, count)| **count > 0)
@@ -1115,6 +1231,7 @@ pub mod compile;
 pub mod consolidate;
 pub mod entities;
 pub mod quickwit_split;
+pub mod vector;
 
 #[cfg(test)]
 mod tests {
@@ -1124,6 +1241,7 @@ mod tests {
     use crate::consolidate::consolidate_session;
     use object_store::memory::InMemory;
     use qm_core::{PagePath, SessionId, WriterId};
+    use qm_llm::{EmbedFuture, Embedder};
     use qm_store::{CommitPageRequest, RetryPolicy};
     use tempfile::TempDir;
 
@@ -1206,6 +1324,7 @@ mod tests {
                 updated_at_ms: 1,
                 entities: Vec::new(),
                 links: Vec::new(),
+                embedding: None,
             },
             PageDoc {
                 workspace_id: "acme".into(),
@@ -1217,6 +1336,7 @@ mod tests {
                 updated_at_ms: 2,
                 entities: Vec::new(),
                 links: Vec::new(),
+                embedding: None,
             },
         ]
     }
@@ -1588,6 +1708,7 @@ mod tests {
             "consensus",
             10,
             &tuning,
+            None,
         )
         .await
         .unwrap();
@@ -1631,6 +1752,7 @@ mod tests {
             "consensus",
             10,
             &off,
+            None,
         )
         .await
         .unwrap();
@@ -1709,6 +1831,7 @@ mod tests {
             "consensus",
             10,
             &tuning,
+            None,
         )
         .await
         .unwrap();
@@ -1938,6 +2061,7 @@ mod tests {
             &build_root.path().join("compact-1"),
             50,
             60_000,
+            None,
         )
         .await
         .unwrap();
@@ -2004,6 +2128,7 @@ mod tests {
             build_root.path(),
             2_000,
             60_000,
+            None,
         )
         .await
         .unwrap();
@@ -2287,6 +2412,7 @@ mod tests {
                         updated_at_ms: now_ms,
                         entities: Vec::new(),
                         links: Vec::new(),
+                        embedding: None,
                     };
                     if keep_declared {
                         doc.entities = entities::extract(&doc.body).entities;
@@ -2374,5 +2500,543 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    /// An embedder whose answers the test writes down.
+    ///
+    /// Not `DeterministicEmbedder`: that would make "close" a property of
+    /// SHA-256, and a real provider would make it a property of the model.
+    /// What these tests ask is whether a vector travels intact from publish,
+    /// through the index, into the fusion — so the numbers are literal, and a
+    /// wrong answer is expressible on purpose (see `answer`).
+    struct FakeEmbedder {
+        dim: usize,
+        answers: std::collections::HashMap<String, Vec<Vec<f32>>>,
+        default: Vec<f32>,
+    }
+
+    impl FakeEmbedder {
+        fn new(dim: usize, default: Vec<f32>) -> Self {
+            assert_eq!(default.len(), dim);
+            Self {
+                dim,
+                answers: std::collections::HashMap::new(),
+                default,
+            }
+        }
+
+        /// Answer `text` with exactly these rows — as many, and as wide, as
+        /// the test asks for, so a contract breach can be expressed as data.
+        fn answer(mut self, text: &str, rows: Vec<Vec<f32>>) -> Self {
+            self.answers.insert(text.to_string(), rows);
+            self
+        }
+    }
+
+    impl Embedder for FakeEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a> {
+            Box::pin(async move {
+                Ok(texts
+                    .iter()
+                    .flat_map(|text| {
+                        self.answers
+                            .get(text)
+                            .cloned()
+                            .unwrap_or_else(|| vec![self.default.clone()])
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    /// The text a page is embedded from, spelled out so a test can key a fake
+    /// answer on it without duplicating the formatting rule.
+    fn text_for(title: &str, body: &str) -> String {
+        format!("{title}\n\n{body}")
+    }
+
+    /// Commit `pages` and publish one split, embedding them when asked.
+    async fn publish_pages(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+        build_root: &Path,
+        pages: &[(&str, &str, &str)],
+        embedder: Option<&dyn Embedder>,
+    ) {
+        let project = reader(bucket);
+        let writer = WriterId::new("mbp-a").unwrap();
+        let mut docs = Vec::new();
+        for (index, (path, title, body)) in pages.iter().enumerate() {
+            let page_path = PagePath::new(*path).unwrap();
+            let now_ms = index as i64 + 1;
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: page_path.clone(),
+                    title: (*title).to_string(),
+                    body: (*body).to_string(),
+                    writer_id: writer.clone(),
+                    now_ms,
+                })
+                .await
+                .unwrap();
+            let page = project
+                .read_page(workspace, project_id, &page_path)
+                .await
+                .unwrap()
+                .unwrap();
+            docs.push(PageDoc::from_version(workspace, project_id, &page, now_ms));
+        }
+        let docs = attach_embeddings(docs, embedder).await.unwrap();
+        publish_split_index(
+            bucket,
+            &project,
+            workspace,
+            project_id,
+            &writer,
+            1,
+            &docs,
+            &build_root.join("split"),
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn search_with_embedder(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+        query: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> SearchOutcome {
+        // No recency prior: these tests are about recall, not ranking drift.
+        let tuning = SearchTuning {
+            now_ms: 0,
+            ..Default::default()
+        };
+        search_project_tuned(
+            bucket.as_ref(),
+            &reader(bucket),
+            workspace,
+            project_id,
+            TempDir::new().unwrap().path(),
+            query,
+            10,
+            &tuning,
+            embedder,
+        )
+        .await
+        .unwrap()
+    }
+
+    const QUERY: &str = "consensus";
+    const KEYWORD: (&str, &str, &str) = (
+        "notes/keyword.md",
+        "Raft consensus",
+        "leader election and log replication",
+    );
+    const PARAPHRASE: (&str, &str, &str) = (
+        "notes/paraphrase.md",
+        "Choosing a leader",
+        "a cluster picks one node to direct writes",
+    );
+
+    /// A vector that points the same way as the query.
+    fn near_query() -> Vec<f32> {
+        vec![0.95, 0.05, 0.0, 0.0]
+    }
+
+    /// The query vector itself.
+    fn query_vector() -> Vec<f32> {
+        vec![1.0, 0.0, 0.0, 0.0]
+    }
+
+    /// A vector that shares nothing with the query's direction.
+    fn orthogonal() -> Vec<f32> {
+        vec![0.0, 1.0, 0.0, 0.0]
+    }
+
+    /// The acceptance case: `PARAPHRASE` shares no words with the query, so
+    /// only the vector stream can reach it.
+    fn corpus() -> [(&'static str, &'static str, &'static str); 2] {
+        [KEYWORD, PARAPHRASE]
+    }
+
+    fn fake_for_corpus() -> FakeEmbedder {
+        FakeEmbedder::new(4, orthogonal())
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(KEYWORD.1, KEYWORD.2), vec![orthogonal()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()])
+    }
+
+    #[tokio::test]
+    async fn a_page_without_the_query_words_is_recalled_by_the_vector_stream() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let embedder = fake_for_corpus();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&embedder),
+        )
+        .await;
+
+        // The premise: the paraphrase really does not contain the query.
+        assert!(
+            !text_for(PARAPHRASE.1, PARAPHRASE.2).contains(QUERY),
+            "the paraphrase must not mention the query word, or the vector \
+             stream is not what found it"
+        );
+
+        let outcome =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&embedder)).await;
+        assert_eq!(
+            outcome.streams_active,
+            vec!["body".to_string(), "vector".to_string()],
+            "both streams must have contributed: {outcome:?}"
+        );
+        let paraphrase = outcome
+            .hits
+            .iter()
+            .find(|hit| hit.path == PARAPHRASE.0)
+            .unwrap_or_else(|| panic!("the paraphrase was not recalled: {outcome:?}"));
+        assert!(
+            paraphrase.streams.contains(&"vector".to_string()),
+            "the paraphrase is only reachable through its embedding: {paraphrase:?}"
+        );
+        assert_eq!(outcome.stream_candidates["vector"], 1);
+        // Both pages are present, and the keyword match is not displaced.
+        assert_eq!(outcome.hits.len(), 2, "{outcome:?}");
+        assert_eq!(outcome.hits[0].path, KEYWORD.0, "{outcome:?}");
+    }
+
+    /// The other half of the acceptance case: with no vector stream running —
+    /// because no provider is configured, or because the split was published
+    /// without one — the paraphrase must not appear at all.
+    #[tokio::test]
+    async fn the_paraphrase_is_absent_whenever_the_vector_stream_does_not_run() {
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let embedder = fake_for_corpus();
+
+        // (a) The split has embeddings, but the search does not run the stream.
+        let embedded_bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let build_root = TempDir::new().unwrap();
+        publish_pages(
+            &embedded_bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&embedder),
+        )
+        .await;
+        let outcome =
+            search_with_embedder(&embedded_bucket, &workspace, &project_id, QUERY, None).await;
+        assert_eq!(
+            outcome.hits.len(),
+            1,
+            "only the keyword match may survive: {outcome:?}"
+        );
+        assert_eq!(outcome.hits[0].path, KEYWORD.0);
+        assert!(
+            !outcome.streams_active.contains(&"vector".to_string()),
+            "no provider was passed, so no vector stream ran: {outcome:?}"
+        );
+
+        // (b) The search would run the stream, but the split has no vectors.
+        let plain_bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let build_root = TempDir::new().unwrap();
+        publish_pages(
+            &plain_bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            None,
+        )
+        .await;
+        let outcome = search_with_embedder(
+            &plain_bucket,
+            &workspace,
+            &project_id,
+            QUERY,
+            Some(&embedder),
+        )
+        .await;
+        assert_eq!(outcome.hits.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.hits[0].path, KEYWORD.0);
+        assert!(
+            !outcome.stream_candidates.contains_key("vector"),
+            "a split published without embeddings contributes no vector \
+             candidates and must not fail the search: {outcome:?}"
+        );
+    }
+
+    /// An orthogonal page carries no evidence that it is about the query, so it
+    /// must not enter the fusion — with the opposite answer as the positive
+    /// control, so the check cannot pass by refusing everything.
+    #[tokio::test]
+    async fn only_positively_correlated_pages_become_vector_candidates() {
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let pages = [PARAPHRASE];
+
+        let orthogonal_answer =
+            FakeEmbedder::new(4, orthogonal()).answer(QUERY, vec![query_vector()]);
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let build_root = TempDir::new().unwrap();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &pages,
+            Some(&orthogonal_answer),
+        )
+        .await;
+        let outcome = search_with_embedder(
+            &bucket,
+            &workspace,
+            &project_id,
+            QUERY,
+            Some(&orthogonal_answer),
+        )
+        .await;
+        assert!(
+            outcome.hits.is_empty(),
+            "an orthogonal embedding is not a candidate: {outcome:?}"
+        );
+
+        let near_answer = FakeEmbedder::new(4, orthogonal())
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()]);
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let build_root = TempDir::new().unwrap();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &pages,
+            Some(&near_answer),
+        )
+        .await;
+        let outcome =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&near_answer)).await;
+        assert_eq!(
+            outcome.hits.len(),
+            1,
+            "the same corpus with a near answer must recall the page: {outcome:?}"
+        );
+    }
+
+    /// A provider that returns the wrong width or the wrong number of rows is a
+    /// contract breach. Repairing it silently would corrupt every later
+    /// comparison, so the search fails instead.
+    #[tokio::test]
+    async fn a_provider_that_breaches_its_contract_fails_the_search() {
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let good = fake_for_corpus();
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&good),
+        )
+        .await;
+
+        let tuning = SearchTuning {
+            now_ms: 0,
+            ..Default::default()
+        };
+        let search_with = |embedder: &'static dyn Embedder| {
+            let bucket = Arc::clone(&bucket);
+            let workspace = workspace.clone();
+            let project_id = project_id.clone();
+            async move {
+                search_project_tuned(
+                    bucket.as_ref(),
+                    &reader(&bucket),
+                    &workspace,
+                    &project_id,
+                    TempDir::new().unwrap().path(),
+                    QUERY,
+                    10,
+                    &tuning,
+                    Some(embedder),
+                )
+                .await
+            }
+        };
+
+        // Wrong width: the provider advertises four dimensions, answers with three.
+        let narrow = Box::leak(Box::new(
+            FakeEmbedder::new(4, orthogonal()).answer(QUERY, vec![vec![1.0, 0.0, 0.0]]),
+        ));
+        let error = search_with(narrow)
+            .await
+            .expect_err("a three-wide answer to a four-wide provider must fail");
+        assert!(
+            format!("{error:#}").contains("configured width is 4"),
+            "the error must name the breach: {error:#}"
+        );
+
+        // Wrong count: two rows for one input.
+        let duplicated = Box::leak(Box::new(
+            FakeEmbedder::new(4, orthogonal()).answer(QUERY, vec![query_vector(), query_vector()]),
+        ));
+        let error = search_with(duplicated)
+            .await
+            .expect_err("two rows for one input must fail");
+        assert!(
+            format!("{error:#}").contains("returned 2 vector(s) for 1 input(s)"),
+            "the error must name the breach: {error:#}"
+        );
+    }
+
+    /// The publish path enforces the same contract, so a breach cannot be
+    /// baked into an immutable split and discovered only at query time.
+    #[tokio::test]
+    async fn attaching_embeddings_fails_closed_on_a_contract_breach() {
+        let docs = docs();
+        // One of the two inputs gets no row: the batch is short by one.
+        let short = FakeEmbedder::new(4, vec![0.0, 0.0, 0.0, 0.0])
+            .answer(&embedding_text(&docs[0]), Vec::new());
+        let error = attach_embeddings(docs.clone(), Some(&short))
+            .await
+            .expect_err("a missing row must fail the batch");
+        assert!(
+            format!("{error:#}").contains("returned 1 vector(s) for 2 input(s)"),
+            "{error:#}"
+        );
+
+        let wide = FakeEmbedder::new(4, vec![0.0, 0.0, 0.0, 0.0])
+            .answer(&embedding_text(&docs[0]), vec![vec![1.0, 2.0, 3.0]]);
+        let error = attach_embeddings(docs, Some(&wide))
+            .await
+            .expect_err("a wrong width must fail the batch");
+        assert!(
+            format!("{error:#}").contains("3-wide vector at position 0"),
+            "{error:#}"
+        );
+    }
+
+    /// The one text rule, checked directly: a change here changes every stored
+    /// vector, so it must not drift silently.
+    #[test]
+    fn a_page_is_embedded_from_its_title_and_body() {
+        assert_eq!(
+            embedding_text(&docs()[0]),
+            "Raft consensus\n\nleader election and log replication"
+        );
+    }
+
+    /// Compaction rebuilds the index from authoritative pages. If it dropped
+    /// the vectors, semantic recall would disappear on the first compaction —
+    /// silently, since the keyword streams would still answer.
+    #[tokio::test]
+    async fn compaction_keeps_the_vector_stream_alive() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let embedder = fake_for_corpus();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&embedder),
+        )
+        .await;
+
+        let outcome = compact_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            &WriterId::new("compactor").unwrap(),
+            &build_root.path().join("compact"),
+            100,
+            60_000,
+            Some(&embedder),
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.skipped, "{outcome:?}");
+
+        let outcome =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&embedder)).await;
+        assert!(
+            outcome
+                .hits
+                .iter()
+                .any(|hit| hit.path == PARAPHRASE.0 && hit.streams.contains(&"vector".to_string())),
+            "the rebuilt split must still carry embeddings: {outcome:?}"
+        );
+    }
+
+    /// The stored bytes have to survive the round trip, and a value that is not
+    /// a whole number of f32s is a corrupted column rather than a short vector.
+    #[test]
+    fn embeddings_round_trip_through_their_byte_encoding() {
+        let values = vec![0.0f32, 1.5, -2.25, f32::MIN_POSITIVE];
+        assert_eq!(vector::decode(&vector::encode(&values)).unwrap(), values);
+        assert_eq!(vector::encode(&values).len(), values.len() * 4);
+        let error = vector::decode(&[0, 1, 2]).expect_err("three bytes is not one f32");
+        assert!(
+            format!("{error:#}").contains("not a whole number"),
+            "{error:#}"
+        );
+    }
+
+    /// A split containing a zero-width embedding would fail every search, so
+    /// the builder refuses to create one. The positive control is in the same
+    /// test: the same document with a real vector builds fine.
+    #[test]
+    fn build_index_refuses_a_zero_width_embedding() {
+        let dir = TempDir::new().unwrap();
+        let mut doc = docs().remove(0);
+        doc.embedding = Some(Vec::new());
+        let error = build_index(dir.path(), &[doc]).expect_err("zero width must be refused");
+        assert!(
+            format!("{error:#}").contains("zero-width embedding"),
+            "{error:#}"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let mut doc = docs().remove(0);
+        doc.embedding = Some(vec![0.25, 0.5, 0.75]);
+        build_index(dir.path(), &[doc]).expect("a real vector builds");
+    }
+
+    /// Cosine refuses the inputs it cannot answer honestly: a width mismatch, a
+    /// zero vector, and a non-finite component.
+    #[test]
+    fn cosine_refuses_undefined_comparisons() {
+        assert!(vector::cosine(&[1.0, 0.0], &[1.0]).is_err());
+        assert!(vector::cosine(&[0.0, 0.0], &[1.0, 0.0]).is_err());
+        assert!(vector::cosine(&[1.0, 0.0], &[0.0, 0.0]).is_err());
+        assert!(vector::cosine(&[f32::NAN, 0.0], &[1.0, 0.0]).is_err());
+        // Positive control: the same call with a defined pair answers 1.0.
+        assert!((vector::cosine(&[2.0, 0.0], &[0.5, 0.0]).unwrap() - 1.0).abs() < 1e-6);
     }
 }

@@ -1483,6 +1483,7 @@ dependencies = [
  "futures",
  "object_store",
  "qm-core",
+ "qm-llm",
  "qm-store",
  "reqwest",
  "serde",

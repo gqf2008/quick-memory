@@ -610,6 +610,9 @@ pub async fn run_search_scenario(
         &build_root.path().join("compact"),
         50,
         60_000,
+        // The probe runs without an embedding provider, so it exercises the
+        // keyword-only compaction path.
+        None,
     )
     .await?;
     if compact.skipped {

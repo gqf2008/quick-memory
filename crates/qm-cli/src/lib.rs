@@ -22,7 +22,8 @@ use qm_core::{
 };
 use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
 use qm_search::{
-    PageDoc, compact_project, publish_split_index, search_project_tuned, search_workspace_tuned,
+    PageDoc, attach_embeddings, compact_project, publish_split_index, search_project_tuned,
+    search_workspace_tuned,
 };
 use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
@@ -151,6 +152,9 @@ pub enum Command {
         /// Do not expand results with pages that link to the matches.
         #[arg(long, default_value_t = false)]
         no_neighbors: bool,
+        /// Disable the vector stream even when an embedding provider is configured.
+        #[arg(long, default_value_t = false)]
+        no_vector: bool,
     },
     /// Rebuild this machine's split from the current pages and publish it.
     Publish,
@@ -638,14 +642,24 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             global,
             no_recency,
             no_neighbors,
+            no_vector,
         } => {
             // Freshness helps but must not dominate relevance: the boost is
             // bounded, and --no-recency turns it off entirely.
             let tuning = qm_search::SearchTuning {
                 now_ms: if *no_recency { 0 } else { ctx.now_ms },
                 neighbor_expansion: !*no_neighbors,
+                vector_search: !*no_vector,
                 ..Default::default()
             };
+            // An unconfigured provider is not an error, it simply means this
+            // search has no vector stream.
+            let embedder = if *no_vector {
+                None
+            } else {
+                qm_search::vector::embedder_from_env()?
+            };
+            let embedder = embedder.as_deref();
             let outcome = if *global {
                 let projects = ctx
                     .project
@@ -661,6 +675,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     query,
                     *limit,
                     &tuning,
+                    embedder,
                 )
                 .await?
             } else {
@@ -673,6 +688,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     query,
                     *limit,
                     &tuning,
+                    embedder,
                 )
                 .await?
             };
@@ -725,7 +741,18 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let watermark_path = publish_watermark_path(&ctx);
+            let embedder = qm_search::vector::embedder_from_env()?;
+            let embedded = embedder.is_some();
             let watermark = read_watermark(&watermark_path);
+            // Enabling a provider has to re-embed pages that were published
+            // without one, and their sequence numbers have not moved. Without
+            // this the vector stream would stay empty forever on a machine
+            // that had already caught up.
+            let watermark = if embedded && !watermark.embedded {
+                0
+            } else {
+                watermark.manifest_seq
+            };
             let mut docs = Vec::new();
             for (path, entry) in &loaded.manifest.pages {
                 // Only what changed since this machine last published. Without
@@ -758,6 +785,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 };
                 return Ok(reason);
             }
+            let docs = attach_embeddings(docs, embedder.as_deref()).await?;
             let seq = loaded.manifest.seq + 1;
             // One directory per invocation: building an index into a directory
             // that already holds one fails, and seq+timestamp is not unique
@@ -775,13 +803,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 ctx.now_ms,
             )
             .await?;
-            write_watermark(&watermark_path, loaded.manifest.seq)?;
+            write_watermark(&watermark_path, loaded.manifest.seq, embedded)?;
             Ok(if ctx.json {
                 serde_json::json!({
                     "generation": outcome.generation,
                     "already_present": outcome.already_present,
                     "pages": docs.len(),
                     "manifest_seq": loaded.manifest.seq,
+                    "embedded": embedded,
                 })
                 .to_string()
             } else if outcome.already_present {
@@ -796,6 +825,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
         }
         Command::Compact => {
             let build_dir = unique_build_dir(&ctx, "compact");
+            let embedder = qm_search::vector::embedder_from_env()?;
             let outcome = compact_project(
                 ctx.bucket.as_ref(),
                 &ctx.project,
@@ -805,6 +835,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 &build_dir,
                 ctx.now_ms,
                 60_000,
+                embedder.as_deref(),
             )
             .await?;
             Ok(if ctx.json {
@@ -1706,6 +1737,13 @@ fn unique_build_dir(ctx: &Context, label: &str) -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PublishWatermark {
     manifest_seq: u64,
+    /// Whether the split published at that position carried embeddings.
+    ///
+    /// `serde(default)` reads a file written before the vector stream existed
+    /// as `false`, which is exactly what it was — and that is what makes the
+    /// first publish after a provider is configured re-embed everything.
+    #[serde(default)]
+    embedded: bool,
 }
 
 fn publish_watermark_path(ctx: &Context) -> PathBuf {
@@ -1715,20 +1753,25 @@ fn publish_watermark_path(ctx: &Context) -> PathBuf {
     ))
 }
 
-fn read_watermark(path: &PathBuf) -> u64 {
+fn read_watermark(path: &PathBuf) -> PublishWatermark {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<PublishWatermark>(&bytes).ok())
-        .map(|watermark| watermark.manifest_seq)
-        .unwrap_or(0)
+        .unwrap_or(PublishWatermark {
+            manifest_seq: 0,
+            embedded: false,
+        })
 }
 
-fn write_watermark(path: &PathBuf, manifest_seq: u64) -> Result<()> {
+fn write_watermark(path: &PathBuf, manifest_seq: u64, embedded: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec(&PublishWatermark { manifest_seq })?;
+    let bytes = serde_json::to_vec(&PublishWatermark {
+        manifest_seq,
+        embedded,
+    })?;
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -3144,5 +3187,78 @@ mod tests {
         assert_eq!(parsed.workspace, "acme");
         assert_eq!(parsed.project, "ai-memory");
         assert_eq!(parsed.writer, "mbp-1");
+    }
+    /// The vector stream is optional, so both of its absent forms have to work:
+    /// a bucket with no provider, and a caller that explicitly turns it off.
+    /// `--no-vector` is asserted unconditionally because a flag that only
+    /// behaves when a provider happens to be configured is not a flag.
+    #[tokio::test]
+    async fn search_succeeds_with_the_vector_stream_off() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        let out = execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/raft.md",
+                "--title",
+                "Raft",
+                "--body",
+                "leader election and log replication",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("committed notes/raft.md"), "{out}");
+
+        let mut publisher = context(Arc::clone(&bucket), &cache);
+        publisher.now_ms = 2_000;
+        let out = execute(&cli(&["publish"]), publisher).await.unwrap();
+        assert!(out.contains("published 1 page"), "{out}");
+
+        let mut searcher = context(Arc::clone(&bucket), &cache);
+        searcher.now_ms = 3_000;
+        let out = execute(
+            &cli(&["search", "leader", "--no-vector", "--json"]),
+            searcher,
+        )
+        .await
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let streams = payload["streams_active"].to_string();
+        assert!(streams.contains("body"), "{out}");
+        assert!(
+            !streams.contains("vector"),
+            "--no-vector must keep the vector stream out of the outcome: {out}"
+        );
+        assert_eq!(payload["hits"].as_array().unwrap().len(), 1, "{out}");
+    }
+
+    /// A watermark written before the vector stream existed has to read as
+    /// "not embedded". That is what makes the first publish after a provider is
+    /// configured re-embed pages whose sequence numbers have not moved — the
+    /// alternative is a vector stream that stays empty forever.
+    #[test]
+    fn a_watermark_from_before_the_vector_stream_reads_as_not_embedded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("watermark.json");
+        std::fs::write(&path, br#"{"manifest_seq":7}"#).unwrap();
+
+        let watermark = read_watermark(&path);
+        assert_eq!(watermark.manifest_seq, 7);
+        assert!(!watermark.embedded, "an older file embedded nothing");
+
+        write_watermark(&path, 7, true).unwrap();
+        let watermark = read_watermark(&path);
+        assert_eq!(watermark.manifest_seq, 7);
+        assert!(watermark.embedded);
+
+        // A missing file is the same shape as "nothing published yet".
+        assert_eq!(
+            read_watermark(&dir.path().join("absent.json")).manifest_seq,
+            0
+        );
     }
 }

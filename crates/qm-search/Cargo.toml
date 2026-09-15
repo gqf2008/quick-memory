@@ -14,6 +14,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 qm-core = { workspace = true }
+qm-llm = { workspace = true }
 qm-store = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
