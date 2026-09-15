@@ -188,6 +188,12 @@ impl KeyLayout {
         }
     }
 
+    /// Root prefix of the layout.
+    #[must_use]
+    pub fn root_prefix(&self) -> &str {
+        &self.root
+    }
+
     /// Key prefix of one project scope.
     #[must_use]
     pub fn scope_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {

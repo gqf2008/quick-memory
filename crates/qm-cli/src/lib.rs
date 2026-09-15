@@ -21,7 +21,7 @@ use qm_core::{
     WriterId,
 };
 use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
-use qm_search::{PageDoc, compact_project, publish_split_index, search_project};
+use qm_search::{PageDoc, compact_project, publish_split_index, search_project, search_workspace};
 use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
 /// Command line interface.
@@ -127,13 +127,16 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
-    /// Search the project.
+    /// Search the project (or every project in the workspace with `--global`).
     Search {
         /// Query text.
         query: String,
         /// Maximum hits.
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Search every project in the workspace, not just the current one.
+        #[arg(long, default_value_t = false)]
+        global: bool,
     },
     /// Rebuild this machine's split from the current pages and publish it.
     Publish,
@@ -552,17 +555,39 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             })
         }
-        Command::Search { query, limit } => {
-            let outcome = search_project(
-                ctx.bucket.as_ref(),
-                &ctx.project,
-                &ctx.workspace,
-                &ctx.project_id,
-                &ctx.cache_dir,
-                query,
-                *limit,
-            )
-            .await?;
+        Command::Search {
+            query,
+            limit,
+            global,
+        } => {
+            let outcome = if *global {
+                let projects = ctx
+                    .project
+                    .list_projects(&ctx.workspace)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                search_workspace(
+                    ctx.bucket.as_ref(),
+                    &ctx.project,
+                    &ctx.workspace,
+                    &projects,
+                    &ctx.cache_dir,
+                    query,
+                    *limit,
+                )
+                .await?
+            } else {
+                search_project(
+                    ctx.bucket.as_ref(),
+                    &ctx.project,
+                    &ctx.workspace,
+                    &ctx.project_id,
+                    &ctx.cache_dir,
+                    query,
+                    *limit,
+                )
+                .await?
+            };
             Ok(if ctx.json {
                 serde_json::json!({
                     "hits": outcome.hits,
@@ -588,8 +613,13 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .hits
                     .iter()
                     .map(|hit| {
+                        let scope = if *global {
+                            format!("{}/{}:", hit.workspace_id, hit.project_id)
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "{:.4}\t{}\t{}\t[{}]",
+                            "{:.4}\t{scope}{}\t{}\t[{}]",
                             hit.score,
                             hit.path,
                             hit.title.replace('\n', " "),
@@ -641,12 +671,10 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 return Ok(reason);
             }
             let seq = loaded.manifest.seq + 1;
-            // One directory per invocation: a leftover build directory from an
-            // earlier run (same seq, different process) must never be reused,
-            // because building an index into a non-empty directory fails.
-            let build_dir =
-                ctx.cache_dir
-                    .join(format!("build-{seq}-{}-{}", std::process::id(), ctx.now_ms));
+            // One directory per invocation: building an index into a directory
+            // that already holds one fails, and seq+timestamp is not unique
+            // enough (two projects can publish in the same millisecond).
+            let build_dir = unique_build_dir(&ctx, "build");
             let outcome = publish_split_index(
                 ctx.bucket.as_ref(),
                 &ctx.project,
@@ -679,9 +707,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
         Command::Compact => {
-            let build_dir =
-                ctx.cache_dir
-                    .join(format!("compact-{}-{}", std::process::id(), ctx.now_ms));
+            let build_dir = unique_build_dir(&ctx, "compact");
             let outcome = compact_project(
                 ctx.bucket.as_ref(),
                 &ctx.project,
@@ -1109,6 +1135,24 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
     }
+}
+
+/// A build directory that no other invocation can be using.
+///
+/// Tantivy refuses to create an index in a directory that already has one, so
+/// this must be unique across projects, processes and time — a millisecond
+/// timestamps is not enough.
+fn unique_build_dir(ctx: &Context, label: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    ctx.cache_dir
+        .join(format!("{label}-{}-{nanos}-{counter}", std::process::id()))
 }
 
 /// Local record of how far this machine has published.
@@ -1613,6 +1657,101 @@ mod tests {
         .await
         .expect_err("restoring a version that does not exist must fail");
         assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn global_search_spans_projects_and_reports_provenance() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        // Two projects, each publishing a page that answers the same query.
+        for (project, body) in [
+            ("alpha", "we run `tantivy` in alpha"),
+            ("beta", "tantivy powers beta too"),
+        ] {
+            let ctx = Context::new(
+                Arc::clone(&bucket),
+                "acme",
+                project,
+                "mbp-a",
+                cache.path().to_path_buf(),
+                1_000,
+                false,
+            )
+            .unwrap();
+            execute(
+                &cli(&["write-page", "--path", "notes/engine.md", "--body", body]),
+                Context {
+                    now_ms: 1_000,
+                    ..ctx
+                },
+            )
+            .await
+            .unwrap();
+            let mut ctx = Context::new(
+                Arc::clone(&bucket),
+                "acme",
+                project,
+                "mbp-a",
+                cache.path().to_path_buf(),
+                2_000,
+                false,
+            )
+            .unwrap();
+            ctx.now_ms = 2_000;
+            execute(&cli(&["publish"]), ctx).await.unwrap();
+        }
+
+        // Scoped search sees only the project it is scoped to.
+        let mut scoped = Context::new(
+            Arc::clone(&bucket),
+            "acme",
+            "alpha",
+            "mbp-a",
+            cache.path().to_path_buf(),
+            3_000,
+            false,
+        )
+        .unwrap();
+        scoped.now_ms = 3_000;
+        let scoped_out = execute(&cli(&["search", "tantivy", "--json"]), scoped)
+            .await
+            .unwrap();
+        let scoped_json: serde_json::Value = serde_json::from_str(&scoped_out).unwrap();
+        let scoped_hits = scoped_json["hits"].as_array().unwrap();
+        assert_eq!(scoped_hits.len(), 1);
+        assert_eq!(scoped_hits[0]["project_id"], "alpha");
+
+        // Global search sees both, with provenance on every hit.
+        let mut global = Context::new(
+            Arc::clone(&bucket),
+            "acme",
+            "alpha",
+            "mbp-a",
+            cache.path().to_path_buf(),
+            3_000,
+            false,
+        )
+        .unwrap();
+        global.now_ms = 3_000;
+        let global_out = execute(&cli(&["search", "tantivy", "--global", "--json"]), global)
+            .await
+            .unwrap();
+        let global_json: serde_json::Value = serde_json::from_str(&global_out).unwrap();
+        let hits = global_json["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 2, "{global_json}");
+        let projects: std::collections::BTreeSet<&str> = hits
+            .iter()
+            .map(|hit| hit["project_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            projects,
+            std::collections::BTreeSet::from(["alpha", "beta"])
+        );
+        for hit in hits {
+            assert_eq!(hit["workspace_id"], "acme");
+            assert_eq!(hit["path"], "notes/engine.md");
+        }
     }
 
     #[tokio::test]

@@ -244,6 +244,18 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
     );
     client.call_tool(12, "memory_handoff_done", serde_json::json!({"id": id}));
 
+    // Global search reaches every project in the workspace.
+    let global = client.call_tool(
+        20,
+        "memory_search",
+        serde_json::json!({"query": "tantivy", "global": true}),
+    );
+    let global_text = tool_text(&global);
+    assert!(
+        global_text.contains("\"project_id\""),
+        "global hits must carry provenance: {global_text}"
+    );
+
     // Session retention: a dry run first, then applied.
     let plan = client.call_tool(
         18,

@@ -1399,6 +1399,37 @@ impl ProjectStore {
         Ok(newest_first)
     }
 
+    /// List the projects of a workspace that have ever committed.
+    ///
+    /// Projects are discovered from their commit points: a project directory
+    /// whose manifest never landed is not a project yet.
+    ///
+    /// # Errors
+    /// Propagates listing failures.
+    pub async fn list_projects(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<ProjectId>, StoreError> {
+        let prefix = format!("{}/ws/{workspace_id}/proj", self.layout.root_prefix());
+        let listed = self.cas.list(&prefix).await?;
+        let mut projects = Vec::new();
+        for (key, _) in listed {
+            let Some(rest) = key.strip_prefix(&format!("{prefix}/")) else {
+                continue;
+            };
+            let Some(project) = rest.strip_suffix("/manifest.json") else {
+                continue;
+            };
+            if project.contains('/') || project.is_empty() {
+                continue;
+            }
+            projects.push(ProjectId::new(project)?);
+        }
+        projects.sort();
+        projects.dedup();
+        Ok(projects)
+    }
+
     /// Write one advisory commit record. Create-if-absent, so a replay of the
     /// same sequence is a no-op rather than a mismatch.
     async fn write_commit_record(

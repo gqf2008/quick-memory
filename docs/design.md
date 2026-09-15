@@ -294,6 +294,20 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
+## 6.13 全局检索（跨项目）
+
+agent 常常只知道"我以前做过类似的事"，不知道在哪个项目。`--global` 解决这个：
+
+```bash
+qm search "tantivy" --global          # 当前 workspace 下所有项目
+```
+
+- 项目发现靠提交点：列出 `v1/ws/<ws>/proj/*/manifest.json`——没有 manifest 的目录还不是项目。
+- 每个项目**各自检索**（自己的 catalog、自己的权威过滤），然后把"每项目一份结果列表"
+  再用同一套 RRF 融合一次。这样排序靠的是"跨项目的共识"，而不是不可比的原始分数。
+- 命中带 `workspace_id` / `project_id` 出处；范围检索与全局检索共用同一条过滤与缓存路径。
+- MCP：`memory_search { global: true }`。
+
 ## 6.12 观测保留：压缩会话链（而不是删段）
 
 原始观测会无限增长，但**会话链是 `prev` 链接起来的**——删中间一段会直接断链。所以保留策略是

@@ -53,6 +53,9 @@ pub struct SearchArgs {
     /// Maximum hits to return.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Search every project in the workspace instead of just this one.
+    #[serde(default)]
+    pub global: Option<bool>,
 }
 
 /// Arguments for `memory_write_page`.
@@ -256,7 +259,9 @@ impl MemoryServer {
                        questions about prior work, decisions, or conventions. \
                        Returns compiled pages with a fused rank score; every hit \
                        has been checked against the authoritative manifest, so \
-                       superseded and deleted content never appears."
+                       superseded and deleted content never appears. Pass
+                       global=true to search every project in the workspace;
+                       hits then carry their workspace and project."
     )]
     async fn memory_search(
         &self,
@@ -265,6 +270,7 @@ impl MemoryServer {
         self.dispatch(Command::Search {
             query: args.query,
             limit: args.limit.unwrap_or(10),
+            global: args.global.unwrap_or(false),
         })
         .await
     }

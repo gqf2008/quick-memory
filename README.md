@@ -41,6 +41,7 @@ cargo run -p qm-cli --bin qm -- consolidate --session sess-1          # --compil
 # LLM 编译（可选）：设置 QM_LLM_BASE_URL / QM_LLM_API_KEY / QM_LLM_MODEL；失败自动回落 rules
 cargo run -p qm-cli --bin qm -- publish   # 增量：只发布本机上次发布后变化的页面
 cargo run -p qm-cli --bin qm -- search "suite" --json
+cargo run -p qm-cli --bin qm -- search "suite" --global          # 跨项目检索
 cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
 cargo run -p qm-cli --bin qm -- compact-session --session sess-1 --keep-last 50   # 观测保留（dry run）
 

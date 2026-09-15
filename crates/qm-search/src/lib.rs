@@ -77,6 +77,12 @@ impl PageDoc {
 /// A single search hit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hit {
+    /// Workspace the hit belongs to.
+    #[serde(default)]
+    pub workspace_id: String,
+    /// Project the hit belongs to.
+    #[serde(default)]
+    pub project_id: String,
     /// Page path.
     pub path: String,
     /// Page version id.
@@ -272,6 +278,8 @@ pub fn search_stream(
         .context("running query")?;
     let path_field = s.get_field("path").expect("path field");
     let page_field = s.get_field("page_id").expect("page_id field");
+    let workspace_field = s.get_field("workspace_id").expect("workspace_id field");
+    let project_field = s.get_field("project_id").expect("project_id field");
     let mut hits = Vec::with_capacity(top.len());
     for (score, addr) in top {
         let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
@@ -282,6 +290,8 @@ pub fn search_stream(
                 .to_string()
         };
         hits.push(Hit {
+            workspace_id: get(workspace_field),
+            project_id: get(project_field),
             path: get(path_field),
             page_id: get(page_field),
             title: get(title),
@@ -478,6 +488,68 @@ pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
             .then_with(|| a.page_id.cmp(&b.page_id))
     });
     fused
+}
+
+/// Search several projects of one workspace and fuse the results.
+///
+/// Each project is searched independently (its own catalog, its own authority
+/// check) and the per-project lists are fused with the same RRF used inside a
+/// project, so a global query ranks by agreement across projects rather than by
+/// raw scores that are not comparable between them.
+///
+/// # Errors
+/// Propagates each project's search failures.
+pub async fn search_workspace(
+    store: &dyn ObjectStore,
+    project_store: &ProjectStore,
+    workspace_id: &WorkspaceId,
+    projects: &[ProjectId],
+    cache_root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<SearchOutcome> {
+    let mut lists = Vec::new();
+    let mut splits_searched = 0usize;
+    let mut candidates = 0usize;
+    let mut filtered_out = 0usize;
+    let mut stream_candidates = std::collections::BTreeMap::new();
+    for project_id in projects {
+        let project_cache = cache_root.join(format!("{workspace_id}-{project_id}"));
+        let outcome = search_project(
+            store,
+            project_store,
+            workspace_id,
+            project_id,
+            &project_cache,
+            query,
+            limit,
+        )
+        .await?;
+        splits_searched += outcome.splits_searched;
+        candidates += outcome.candidates;
+        filtered_out += outcome.filtered_out;
+        for (stream, count) in outcome.stream_candidates {
+            *stream_candidates.entry(stream).or_insert(0) += count;
+        }
+        if !outcome.hits.is_empty() {
+            lists.push(outcome.hits);
+        }
+    }
+    let streams_active: Vec<String> = stream_candidates
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(stream, _)| stream.clone())
+        .collect();
+    let mut hits = fuse_rrf(lists, 60.0);
+    hits.truncate(limit);
+    Ok(SearchOutcome {
+        hits,
+        splits_searched,
+        candidates,
+        filtered_out,
+        streams_active,
+        stream_candidates,
+    })
 }
 
 /// What a project search did.
