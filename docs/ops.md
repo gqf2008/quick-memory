@@ -174,7 +174,11 @@ Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `desig
 另有 Linux 1.95 源码/测试套件验证（2026-09-16，`main @ b817f42`）：`rust:1.95-bookworm` 容器
 （`linux/arm64`）接收排除 `target/` 与 `.git/` 的源码，`cargo test --workspace` exit 0，
 `233 passed / 0 failed / 0 ignored`，宿主工作树测试前后保持干净；这次没有在容器内跑 MinIO/S3/真桶
-端到端链路，Windows 仍未验证。仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、
+端到端链路。另有 Windows GNU 目标编译验证（2026-09-16，`main @ 41dec72`）：安装
+`x86_64-pc-windows-gnu` target，使用 `x86_64-w64-mingw32-gcc` linker 运行
+`cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`，exit 0（见 `design.md` §10.7）；
+这仅覆盖 Windows target 的编译，未在 Windows 上运行 tests/runtime，也未跑 Windows 真桶。仍未验证的是
+**R2 特有行为**（PUT 返回 version、GET 不返回）、
 **ACL/签名/区域/一致性/配额/延迟/错误 XML 变体**，
 以及**在真 R2 上跑一遍向量闭环与跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project`
 必填，两者必须传同一组唯一值）；此外，**向量链的真 provider 仍未验证**（当前 vector 证据使用本地

@@ -549,11 +549,15 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
    要写新形态的人显式设置开关。
 5. **该压测没有在真桶上验证**：本工作项的持续竞争断言全部跑在 `InMemory` 上，MinIO 的 current-head
    复验也没有覆盖这套持续竞争；桶的 listing/写入与真实 RTT 仍未端到端。
-6. **Linux 1.95 源码/测试套件已验证，Windows 仍未验证**：2026-09-16 在 `b817f42` 上用
-   `rust:1.95-bookworm`（`linux/arm64`）容器，对排除 `target/` 与 `.git/` 的源码运行
-   `cargo test --workspace`，exit 0（`233 passed / 0 failed / 0 ignored`）；测试前后宿主工作树
-   `git status --porcelain` 均为空。Windows 仍未验证。该容器没有跑 MinIO/S3/真桶端到端链路，
-   所以这不证明 Linux 上的对象存储链路；真 R2 与真 provider 也仍未验证。
+6. **Linux 1.95 源码/测试套件已验证，Windows GNU 目标编译已验证，Windows 运行时仍未验证**：
+   2026-09-16 在 `b817f42` 上用 `rust:1.95-bookworm`（`linux/arm64`）容器，对排除 `target/` 与
+   `.git/` 的源码运行 `cargo test --workspace`，exit 0（`233 passed / 0 failed / 0 ignored`）；
+   测试前后宿主工作树 `git status --porcelain` 均为空。另在 2026-09-16 的 `41dec72` 上安装
+   `x86_64-pc-windows-gnu` target，使用 `x86_64-w64-mingw32-gcc` linker 运行
+   `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`，exit 0（§10.7）。
+   这只证明 Windows GNU 目标编译；没有在 Windows 上运行 tests/runtime，也没有跑 Windows 真桶。
+   该容器没有跑 MinIO/S3/真桶端到端链路，所以这不证明 Linux 上的对象存储链路；真 R2 与真
+   provider 也仍未验证。
 
 ## 6.6 采集与编译（S4 已实现）
 
@@ -1202,13 +1206,34 @@ GET 不返回 version、ACL/凭据边界、服务端签名拒绝、区域/一致
 工作树的 `git status --porcelain` 均为空。
 
 边界：这只证明 Linux 1.95 上源码/测试套件可编译并通过；本次没有在容器内跑 MinIO/S3/真桶
-端到端链路。Windows 仍未验证；真 R2、真 provider 仍未验证。
+端到端链路。Windows 目标的编译证据见 §10.7，但那不是 Windows 运行时/测试或真桶验证；
+真 R2、真 provider 仍未验证。
+
+## 10.7 Windows GNU 目标编译验证（2026-09-16 @ 41dec72）
+
+2026-09-16 在 `41dec7264515ae9f52abc9645a9b1e6fd1887eaf` 上安装 Rust target
+`x86_64-pc-windows-gnu`（`rustup target add` 报 `rust-std ... is up to date`），并用
+`x86_64-w64-mingw32-gcc` 作为 GNU linker 跑：
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+  cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+```
+
+退出码为 0。`cargo check` 编译 workspace 与 all-targets（包括测试 target 的编译检查），输出
+`Finished dev profile [unoptimized + debuginfo] target(s) in 28.13s`。本机工具链为
+`rustc 1.95.0` / `cargo 1.95.0`，linker 为 `x86_64-w64-mingw32-gcc 16.2.0`。
+
+边界：这是 Windows GNU **目标编译**证据，不是 Windows 运行时测试；没有在 Windows 上执行
+tests/runtime，没有运行 Windows 真桶、R2 或真 provider，也不把它们写成已验证。
 
 ## 11. 实证结论（截至本次提交）
 
-已在本仓库验证（离线，`cargo test`）；另有 2026-09-16 在 `c9006a0` 上完成的 MinIO current-head 复验，
-以及 2026-09-16 在 `b817f42` 上完成的 Linux 1.95 源码/测试套件复验（§10.6）。MinIO 是真实
-S3-compatible HTTP 后端，不是 R2；Linux 复验没有跑真桶端到端。
+已在本仓库验证（离线，`cargo test`）；另有 2026-09-16 在 `c9006a0` 上完成的 MinIO current-head 复验、
+2026-09-16 在 `b817f42` 上完成的 Linux 1.95 源码/测试套件复验（§10.6），以及 2026-09-16 在
+`41dec72` 上完成的 Windows GNU 目标编译验证（§10.7）。MinIO 是真实 S3-compatible HTTP 后端，
+不是 R2；Linux 复验没有跑真桶端到端；Windows 目标编译也不是 Windows 运行时或真桶验证。
 
 **S0**
 
