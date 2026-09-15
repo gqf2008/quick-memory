@@ -152,6 +152,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_restore",
         "memory_log",
         "memory_compact_session",
+        "memory_verify",
         "memory_handoff_open",
         "memory_handoff_list",
         "memory_handoff_claim",
@@ -280,6 +281,17 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
     assert!(
         applied_text.contains("segments") || applied_text.contains("applied"),
         "{applied_text}"
+    );
+
+    // Integrity check over the wire.
+    let verified = client.call_tool(21, "memory_verify", serde_json::json!({}));
+    let verified_text = tool_text(&verified);
+    let verified_json: serde_json::Value = serde_json::from_str(&verified_text)
+        .unwrap_or_else(|error| panic!("verify must be JSON: {error}: {verified_text}"));
+    assert_eq!(
+        verified_json["problems"].as_array().map(Vec::len),
+        Some(0),
+        "{verified_json}"
     );
 
     // History and restore over the wire: the older body comes back as a new

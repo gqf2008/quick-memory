@@ -61,6 +61,16 @@ qm compact          # 拿不到租约会返回 "another machine holds the compac
   按分片内容哈希命名；命中缓存就不再访问桶。缓存可以随时删除。
 - 多机共用一台机器时**不要**让不同 `QM_WRITER` 共用一个缓存目录（watermark 会互相覆盖）。
 
+## 完整性自检
+
+```bash
+qm verify                 # 当前项目：后端契约 + manifest/链/catalog 自洽性
+qm verify --global        # 整个 workspace
+qm verify --global --strict   # 有问题就非零退出（可用于定时巡检）
+```
+
+只读、不修。报告会逐个列出问题（类型 + 对象键 + 细节），而不是只报第一个。
+
 ## 失败模式
 
 | 失败 | 影响 | 处理 |

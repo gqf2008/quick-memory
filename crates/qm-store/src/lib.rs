@@ -147,6 +147,7 @@ impl From<OsError> for StoreError {
 
 mod gc;
 mod project;
+mod verify;
 
 pub use gc::GcOutcome;
 pub use project::{
@@ -154,6 +155,7 @@ pub use project::{
     LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome, ReplaceCatalogOutcome,
     RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
 };
+pub use verify::{Problem, VerifyReport};
 
 /// Serialize a value for an object body.
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Bytes, StoreError> {

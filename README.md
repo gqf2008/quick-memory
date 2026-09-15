@@ -27,7 +27,7 @@ crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
 crates/qm-cli     `qm` 命令行（agent 入口）
-crates/qm-mcp     `qm-mcp` MCP stdio 服务器（17 个 memory_* 工具）
+crates/qm-mcp     `qm-mcp` MCP stdio 服务器（19 个 memory_* 工具）
 ```
 
 ## 命令行
@@ -42,6 +42,7 @@ cargo run -p qm-cli --bin qm -- consolidate --session sess-1          # --compil
 cargo run -p qm-cli --bin qm -- publish   # 增量：只发布本机上次发布后变化的页面
 cargo run -p qm-cli --bin qm -- search "suite" --json
 cargo run -p qm-cli --bin qm -- search "suite" --global          # 跨项目检索
+cargo run -p qm-cli --bin qm -- verify        # 桶完整性自检（只读）
 cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
 cargo run -p qm-cli --bin qm -- compact-session --session sess-1 --keep-last 50   # 观测保留（dry run）
 

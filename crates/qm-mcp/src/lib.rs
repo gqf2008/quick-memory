@@ -129,6 +129,14 @@ pub struct CompactSessionArgs {
     pub apply: Option<bool>,
 }
 
+/// Arguments for `memory_verify`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VerifyArgs {
+    /// Check every project in the workspace.
+    #[serde(default)]
+    pub global: Option<bool>,
+}
+
 /// Arguments for `memory_log`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
@@ -474,6 +482,25 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Handoff {
             action: HandoffAction::Done { id: args.id },
+        })
+        .await
+    }
+
+    /// Check the bucket's integrity.
+    #[tool(
+        description = "Check that the bucket's authoritative state is internally \
+                       consistent: the backend honours conditional writes, every \
+                       page version the manifest names exists and hashes \
+                       correctly, every session chain walks, and every split the \
+                       catalog names is present. Read-only; reports problems."
+    )]
+    async fn memory_verify(
+        &self,
+        Parameters(args): Parameters<VerifyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Verify {
+            global: args.global.unwrap_or(false),
+            strict: false,
         })
         .await
     }

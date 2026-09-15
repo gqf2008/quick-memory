@@ -219,9 +219,10 @@ qm sessions
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- 17 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
+- 19 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
   publish / compact / sessions / status / history / restore / log /
-  handoff_open / handoff_list / handoff_claim / handoff_done`，沿用 ai-memory 的命名习惯。
+  handoff_open / handoff_list / handoff_claim / handoff_done / verify /
+  compact_session`，沿用 ai-memory 的命名习惯。
 - **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
 - 协议层有真实回环测试：拉起 `qm-mcp` 二进制，走 `initialize → tools/list → tools/call`，
   断言工具齐全且都有描述与 inputSchema，跑通 capture → consolidate → publish → search，
@@ -293,6 +294,19 @@ echo "rolled back the index change" | qm hook --session sess-1
 - **输入有界**：stdin 最多读 256 KiB（解析前的 DoS 闸门），随后仍要过入口的 16 KiB + 脱敏。
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
+
+## 6.15 完整性自检（`qm verify`）
+
+没有服务器可以问"这个桶健康吗"，所以任何一台机器都必须能从对象自己回答。`qm verify` 做三件事：
+
+1. **先验后端契约**：跑一次条件写探针（create-if-absent / 陈旧 ETag 必须被拒）。不支持条件写的后端不是"不健康"，
+   而是**不能用**——越早知道越好。
+2. **再验权威状态**：manifest 点到的每个页面版本必须存在且自洽、每条 supersession 链必须走通、
+   每个会话 head 的段链必须走通、catalog 引用的每个分片必须有对象。
+3. **报告全部问题而不是第一个**：运维要的是损伤的形状，不是一个症状。`--strict` 才把问题变成非零退出。
+
+只读，不修任何东西。zero problems 的含义是"manifest 与 catalog 点到的都存在且自洽"，
+不是"数据就是你想写的内容"。MCP 对应 `memory_verify`。
 
 ## 6.14 召回评测：把"检索好不好"变成数字
 
@@ -424,7 +438,7 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
 - `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（17 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（19 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 

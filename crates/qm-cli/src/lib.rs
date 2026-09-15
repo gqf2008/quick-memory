@@ -170,6 +170,15 @@ pub enum Command {
         #[command(subcommand)]
         action: HandoffAction,
     },
+    /// Check that the bucket's authoritative state is internally consistent.
+    Verify {
+        /// Check every project in the workspace.
+        #[arg(long, default_value_t = false)]
+        global: bool,
+        /// Exit non-zero when anything is inconsistent.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
     /// Reclaim unreachable objects (dry run unless `--apply`).
     Gc {
         /// Actually delete instead of reporting.
@@ -884,6 +893,103 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 })
             }
         },
+        Command::Verify { global, strict } => {
+            // First prove the backend itself honours the contract everything
+            // else rests on: a store without conditional writes is not
+            // "unhealthy", it is unusable, and that is worth knowing up front.
+            let mut problems = Vec::new();
+            let cas = qm_store::CasStore::new(std::sync::Arc::clone(&ctx.bucket), "");
+            let probe_key = format!("qm-verify/{}-{}", ctx.workspace, ctx.writer);
+            match qm_store::verify_conditional_writes(&cas, &probe_key).await {
+                Ok(report) => {
+                    let _ = cas.delete(&probe_key).await;
+                    if !report.all_passed() {
+                        problems.push(qm_store::Problem {
+                            kind: "cas".into(),
+                            subject: probe_key.clone(),
+                            detail: report.render(),
+                        });
+                    }
+                }
+                Err(error) => problems.push(qm_store::Problem {
+                    kind: "cas".into(),
+                    subject: probe_key.clone(),
+                    detail: error.to_string(),
+                }),
+            }
+
+            let projects: Vec<ProjectId> = if *global {
+                ctx.project
+                    .list_projects(&ctx.workspace)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+            } else {
+                vec![ctx.project_id.clone()]
+            };
+            let mut reports = Vec::new();
+            let mut pages = 0usize;
+            let mut sessions = 0usize;
+            let mut splits = 0usize;
+            for project_id in &projects {
+                let report = ctx
+                    .project
+                    .verify_project(&ctx.workspace, project_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                pages += report.pages;
+                sessions += report.sessions;
+                splits += report.splits;
+                for problem in &report.problems {
+                    problems.push(qm_store::Problem {
+                        subject: format!("{project_id}/{}", problem.subject),
+                        ..problem.clone()
+                    });
+                }
+                reports.push((project_id.clone(), report.manifest_seq));
+            }
+
+            let text = if ctx.json {
+                serde_json::json!({
+                    "projects": reports
+                        .iter()
+                        .map(|(project, seq)| serde_json::json!({
+                            "project": project.to_string(),
+                            "manifest_seq": seq,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "pages": pages,
+                    "sessions": sessions,
+                    "splits": splits,
+                    "problems": problems,
+                })
+                .to_string()
+            } else if problems.is_empty() {
+                format!(
+                    "verified {} project(s): {} page(s), {} session(s), {} split(s), no problems",
+                    projects.len(),
+                    pages,
+                    sessions,
+                    splits
+                )
+            } else {
+                let mut out = format!(
+                    "{} problem(s) across {} project(s):",
+                    problems.len(),
+                    projects.len()
+                );
+                for problem in &problems {
+                    out.push_str(&format!(
+                        "\n  [{}] {}: {}",
+                        problem.kind, problem.subject, problem.detail
+                    ));
+                }
+                out
+            };
+            if *strict && !problems.is_empty() {
+                bail!("{text}");
+            }
+            Ok(text)
+        }
         Command::Gc { apply, grace_ms } => {
             let outcome = ctx
                 .project
@@ -1657,6 +1763,69 @@ mod tests {
         .await
         .expect_err("restoring a version that does not exist must fail");
         assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn verify_reports_a_healthy_scope_and_a_missing_object() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/raft.md",
+                "--body",
+                "leader election",
+            ]),
+            Context {
+                now_ms: 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 2_000;
+        let healthy = execute(&cli(&["verify"]), ctx).await.unwrap();
+        assert!(healthy.contains("no problems"), "{healthy}");
+
+        // Remove the object the manifest points at.
+        let key = {
+            let ctx = context(Arc::clone(&bucket), &cache);
+            let path = PagePath::new("notes/raft.md").unwrap();
+            let entry = ctx
+                .project
+                .load(&ctx.workspace, &ctx.project_id)
+                .await
+                .unwrap()
+                .manifest
+                .head(&path)
+                .unwrap()
+                .page_id
+                .clone();
+            ctx.project
+                .layout()
+                .page_version(&ctx.workspace, &ctx.project_id, &path, &entry)
+        };
+        {
+            let cas = qm_store::CasStore::new(Arc::clone(&bucket), "");
+            cas.delete(&key).await.unwrap();
+        }
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 3_000;
+        let broken = execute(&cli(&["verify"]), ctx).await.unwrap();
+        assert!(broken.contains("page_version"), "{broken}");
+
+        // Strict mode turns the same finding into a non-zero exit.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 4_000;
+        let strict = execute(&cli(&["verify", "--strict"]), ctx)
+            .await
+            .expect_err("strict verification of a broken scope must fail");
+        assert!(strict.to_string().contains("page_version"), "{strict}");
     }
 
     #[tokio::test]
