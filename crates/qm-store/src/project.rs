@@ -30,18 +30,20 @@ use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
 /// Upper bound on how far back `page_history` will walk a supersession chain.
 const MAX_HISTORY_DEPTH: usize = 100_000;
 
-/// How many commit records [`ProjectStore::read_commit_log`] keeps in flight at
-/// once.
+/// How many object reads one listing fan-out keeps in flight at once.
 ///
-/// The log is read whole and sorted afterwards, so this bounds *overlap*, not
-/// how much is read: a project with N commits still fetches N objects, but the
-/// store layer never has more than this many requests open. On a bucket where
-/// each read costs a round trip that turns the read's latency from `N * RTT`
-/// into roughly `ceil(N / K) * RTT`, without turning a large project into one
-/// unbounded fan-out. 16 is enough to hide most of one round trip behind the
-/// others while staying small next to what the records cost (a few hundred
-/// bytes each).
-const COMMIT_LOG_READ_CONCURRENCY: usize = 16;
+/// The three list-and-read fan-outs behind a digest — the commit log, the
+/// session heads, and the handoff objects — each read one object per listed key
+/// and read them whole. Sorting afterwards is what orders the answer, so this
+/// bounds *overlap*, not how much is read: a scope with N objects still fetches
+/// N objects, but the store layer never has more than this many requests open.
+/// On a bucket where each read costs a round trip that turns the read's latency
+/// from `N * RTT` into roughly `ceil(N / K) * RTT`, without turning a large
+/// scope into one unbounded fan-out. 16 is enough to hide most of one round
+/// trip behind the others while staying small next to what the objects cost (a
+/// few hundred bytes each), and one number for all three keeps the read cost of
+/// a digest from depending on which section it is measuring.
+const CONCURRENT_READ_LIMIT: usize = 16;
 
 /// Largest manifest body the single-object commit point will ship.
 ///
@@ -1932,7 +1934,7 @@ impl ProjectStore {
                 .await;
                 (key, outcome)
             })
-            .buffer_unordered(COMMIT_LOG_READ_CONCURRENCY);
+            .buffer_unordered(CONCURRENT_READ_LIMIT);
         // A failing read is collected rather than returned on the spot: the
         // failure to report is the smallest failing key below, not whichever
         // failure the bucket happened to hand back first. That keeps the rest of
@@ -3767,8 +3769,8 @@ mod tests {
         );
         let max = counter.max_in_flight();
         assert!(
-            max <= COMMIT_LOG_READ_CONCURRENCY,
-            "at most {COMMIT_LOG_READ_CONCURRENCY} reads may be in flight, saw {max}"
+            max <= CONCURRENT_READ_LIMIT,
+            "at most {CONCURRENT_READ_LIMIT} reads may be in flight, saw {max}"
         );
         assert_eq!(
             max, 16,
