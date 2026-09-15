@@ -649,17 +649,21 @@ impl ProjectStore {
         since_ms: i64,
         limit: usize,
     ) -> Result<Digest, StoreError> {
-        // The log is already newest-first by sequence, so filtering to the
-        // window and keeping its head is "the latest `limit` records in range"
-        // — no second sort, and no chance of the two orders disagreeing.
+        // Window first, then order by time: `at_ms` is the caller's clock, so
+        // under skew the sequence order and the time order can disagree, and
+        // the contract here is the time order. `seq` breaks ties, which keeps
+        // the order total even for two commits that share a millisecond — two
+        // machines reading the same log must agree on the order, not merely on
+        // the set.
         let log = self
             .read_commit_log(workspace_id, project_id, usize::MAX)
             .await?;
-        let pages: Vec<CommitRecord> = log
+        let mut pages: Vec<CommitRecord> = log
             .into_iter()
             .filter(|record| record.at_ms >= since_ms)
-            .take(limit)
             .collect();
+        pages.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| b.seq.cmp(&a.seq)));
+        pages.truncate(limit);
 
         let mut sessions = Vec::new();
         for session_id in self.list_sessions(workspace_id, project_id).await? {
@@ -3461,5 +3465,55 @@ mod tests {
         let virgin = machine(&untouched);
         let digest = virgin.digest(&ws(), &proj(), 0, 20).await.unwrap();
         assert!(digest.is_empty(), "{digest:?}");
+    }
+
+    /// The pages section is ordered by *commit time*, not by sequence.
+    ///
+    /// The two only agree while every machine's clock agrees, and `at_ms` is
+    /// caller-supplied. So a commit that landed second but carries an earlier
+    /// clock must sort second — and the limit must keep the time-newest end of
+    /// the window, not the sequence-newest.
+    #[tokio::test]
+    async fn digest_orders_pages_by_time_not_by_sequence() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+
+        // Sequence 1 carries the later clock; sequence 2 carries the earlier.
+        store
+            .commit_page(request("mbp-1", "notes/late-clock.md", "a", 5_000))
+            .await
+            .unwrap();
+        store
+            .commit_page(request("mbp-1", "notes/early-clock.md", "b", 1_000))
+            .await
+            .unwrap();
+
+        // The log really is sequence-ordered, so this test is not vacuous:
+        // a sequence-ordered digest would return the opposite order below.
+        let log = store
+            .read_commit_log(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        let log_paths: Vec<&str> = log.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            log_paths,
+            vec!["notes/early-clock.md", "notes/late-clock.md"]
+        );
+
+        let digest = store.digest(&ws(), &proj(), 0, 20).await.unwrap();
+        let paths: Vec<&str> = digest
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["notes/late-clock.md", "notes/early-clock.md"],
+            "pages must be ordered by time, newest first"
+        );
+
+        let capped = store.digest(&ws(), &proj(), 0, 1).await.unwrap();
+        assert_eq!(capped.pages.len(), 1);
+        assert_eq!(capped.pages[0].path.as_str(), "notes/late-clock.md");
     }
 }
