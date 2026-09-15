@@ -938,8 +938,11 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
 - **A**：轮换 = 换 `S3_ACCESS_KEY_ENV_NAMES` / `S3_SECRET_KEY_ENV_NAMES` 里的值，每台机器
   各自更新；吊销 = 在桶侧吊销该 key。**隔离**取决于后端能否做到「每机一把 bucket-scoped
   key」——本仓库对此**没有证据**，S3/R2 的 IAM 细节是外部事实。本节沿用既有口径
-  「token 只能按桶授权」，于是**泄露半径 = 整个桶**：`qm gc` 要跨 scope 删、
-  `qm verify --global` 要跨 scope 读。
+  「token 只能按桶授权」，于是**泄露半径 = 整个桶**：凭据覆盖的是整桶、不区分 scope，而机器
+  可以被指向任意 scope——`qm gc` 每次只作用在**一个** workspace/project（`gc_orphans` 只在
+  `KeyLayout::scope_prefix` 上 list），`qm verify --global` / `qm search --global` 的
+  `--global` 是「这个 workspace 里的每个 project」。凭据里没有东西能把这台机器限制在
+  「它真正需要的那几个 scope」上。
 - **B / C1**：机器上**不再有桶凭据**，泄露一台机器不泄露桶；吊销是收回网关凭据，粒度可以
   做到「每机 / 每个 scope」。代价是**网关成为新的高价值目标**——这是把风险搬家，不是消灭。
 - **C2**：介于两者之间，泄露半径收窄到某个 `scope_prefix`；但短时凭据需要签发与刷新流程
@@ -978,8 +981,9 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
 
 - **`build_bucket_from_env` / `build_bucket_from`**：目前签名的形状是「端点 + 桶 + 静态 key
   对」。换 B/C 时要么让网关**说 S3 协议**（机器上 `QM_S3_*` 的形状不变，只有端点变成网关
-  URL），要么加一种新的鉴权模式。`build_bucket_from` 是**唯一**的注入缝，改它不会碰到
-  CLI/MCP 的调用点。
+  URL），要么加一种新的鉴权模式。`build_bucket_from` 是**唯一构建桶客户端**的注入缝，改它
+  不会碰到 CLI/MCP 的调用点；但环境解析不止这一处——`bucket_identity_from`（发布 watermark
+  的身份）与 `manifest_format_from` 是同一形状的另两个缝，凭据形状一变要一起看。
 - **`bucket_identity_from`（= `endpoint \0 bucket`）→ 发布 watermark**：端点是
   `QM_CACHE_DIR` 下 publish watermark 键的一部分（`ops.md`「发布与缓存」：换桶要配独立
   cache dir）。**如果网关换掉了机器看到的端点，bucket identity 就变了**，于是切换后每台机器
@@ -1017,8 +1021,8 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
 
 - **否决 A（即选 C1/B）的代价**：多一个组件、写路径多一跳、网关成为新的高价值目标，
   还要一套凭据签发/刷新流程。换来的是「泄露一台机器 ≠ 泄露全桶」与提交点上的可验证归因。
-- **否决 B（即不把读放进网关）的代价**：放弃「读也有统一鉴权与限流」。换来的是离线性
-  ——那是本项目最核心的生命线（§1）。
+- **否决 B（= 不把读放进网关；这么一改它就退化成 C1）的代价**：放弃「读也有统一鉴权与
+  限流」，换来的是离线性——那是本项目最核心的生命线（§1）。
 - **若最终选 A**，必须接受：`writer_id` **永远**只是自述（§9.3.4），并且 `ops.md`「失败模式」
   里那行「凭据泄露 → 全桶可读写」就是终局口径；唯一的缓解是轮换与桶侧最小权限，
   而「后端能否做到每机一把 bucket-scoped key」本仓库**没有证据**。
@@ -1034,8 +1038,9 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
    manifest / catalog / WAL 的任何状态（硬约束 #1）。
 2. **每机 token 的发放与轮换流程**：机器注册 → 签发机器凭据 → 轮换 / 吊销；明确
    「网关不可用时写路径降级到 §6.9 的 spool」，而不是报错失败。
-3. **`build_bucket_from` 的接缝改造**：它是唯一的注入缝；同一改动要覆盖
-   `qm-probe` 的 `S3Config::from_env`（今天两份解析不共享）。
+3. **`build_bucket_from` 的接缝改造**：它是**唯一构建桶客户端**的注入缝（环境解析另有
+   `bucket_identity_from` 与 `manifest_format_from` 两个同形状的缝，见第 4 条）；同一改动
+   要覆盖 `qm-probe` 的 `S3Config::from_env`（今天两份解析不共享）。
 4. **`bucket_identity_from` 的端点迁移决定**：网关 URL 是否参与 identity；若参与，
    切换那天要预期一次全量发布（§9.3.6）。
 5. **探针怎么验证**：给 `qm-probe` 的 stub 加鉴权（401/403 + 带 `WWW-Authenticate` 的
@@ -1053,7 +1058,9 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
 
 1. 先确认后端的前缀级 ACL 能力（同样是外部事实，本仓库无证据）。
 2. 定短时凭据的时长与刷新：`qm publish` / `qm compact` 是长时间任务，中途过期要有明确行为。
-3. 见 C1 的第 3、5 条（接缝与探针）。
+3. `--global` 类命令（`qm verify --global`、`qm search --global`）要一次持有多个 scope 的
+   凭据，所以网关的签发接口要能**一次给一组**，而不是一次一个。
+4. 见 C1 的第 3、5 条（接缝与探针）。
 
 ### 9.7 落地前必须实测（S0）
 
