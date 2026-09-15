@@ -325,6 +325,7 @@ mod tests {
             entities: Vec::new(),
             links: Vec::new(),
             embedding: None,
+            embedding_identity: None,
         }];
         super::super::build_index(build.path(), &docs).unwrap();
 

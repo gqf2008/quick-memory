@@ -36,6 +36,25 @@ const ENV_MODEL: &str = "QM_EMBEDDING_MODEL";
 /// `Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>`.
 pub type EmbedFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
 
+/// Which embedder produced a vector: provider family, model and width.
+///
+/// A split's vectors are only comparable to a query vector produced by the
+/// *same* embedder. Width is the coarse half of that check (a mismatch is
+/// caught when two vectors are compared), but two models of equal width
+/// produce unrelated coordinates, so the identity travels with the vectors
+/// and is compared before they are used. Deliberately serde-free: the crate is
+/// a provider boundary, and how a split *records* this belongs to the search
+/// crate that owns the on-disk split format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedderIdentity {
+    /// Provider family, e.g. `openai-compatible` or `deterministic`.
+    pub provider: String,
+    /// Model name as the provider knows it.
+    pub model: String,
+    /// Width of every vector the embedder produces.
+    pub dim: usize,
+}
+
 /// A provider that turns text into fixed-width vectors.
 ///
 /// `dyn`-safe on purpose: the read path will hold a `Box<dyn Embedder>` chosen
@@ -43,6 +62,14 @@ pub type EmbedFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + 
 pub trait Embedder: Send + Sync {
     /// Width of every vector this embedder returns.
     fn dim(&self) -> usize;
+
+    /// Who this embedder is: provider family, model and width.
+    ///
+    /// Required rather than defaulted on purpose. A default would let a new
+    /// implementation claim an identity it did not earn, and the whole point
+    /// of recording provenance is that a mismatch is visible instead of
+    /// silently comparing vectors from two different models.
+    fn identity(&self) -> EmbedderIdentity;
 
     /// Embed a batch. The returned vector must have exactly one row per input,
     /// each row exactly [`Embedder::dim`] wide.
@@ -71,6 +98,17 @@ impl DeterministicEmbedder {
 impl Embedder for DeterministicEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn identity(&self) -> EmbedderIdentity {
+        EmbedderIdentity {
+            provider: "deterministic".to_string(),
+            // The model is the expansion scheme, not a service model name: any
+            // change to `hash_vector` changes every stored vector and must be
+            // recorded as a different model.
+            model: "sha256-v1".to_string(),
+            dim: self.dim,
+        }
     }
 
     fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a> {
@@ -179,6 +217,14 @@ impl Embedder for OpenAiCompatEmbedder {
         self.dim
     }
 
+    fn identity(&self) -> EmbedderIdentity {
+        EmbedderIdentity {
+            provider: "openai-compatible".to_string(),
+            model: self.model.clone(),
+            dim: self.dim,
+        }
+    }
+
     fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a> {
         Box::pin(async move {
             // An empty batch is zero vectors, not a request that must answer
@@ -279,6 +325,32 @@ mod tests {
             }
         }
         assert_ne!(first[0], first[1], "distinct texts must differ");
+    }
+
+    /// The identity is what makes two equal-width models distinguishable, so
+    /// each provider must name itself and the model it actually calls.
+    #[test]
+    fn each_provider_reports_its_own_identity() {
+        let deterministic = DeterministicEmbedder::new(8).identity();
+        assert_eq!(deterministic.provider, "deterministic");
+        assert_eq!(deterministic.model, "sha256-v1");
+        assert_eq!(deterministic.dim, 8);
+
+        // The model name is the configured one, not a placeholder: swapping
+        // models is exactly the case the identity exists to catch.
+        let openai = OpenAiCompatEmbedder::new("http://x", "k", "text-embedding-3-small", 1536)
+            .unwrap()
+            .identity();
+        assert_eq!(openai.provider, "openai-compatible");
+        assert_eq!(openai.model, "text-embedding-3-small");
+        assert_eq!(openai.dim, 1536);
+
+        // Same width, different model: equal dims must not imply equality.
+        let other = OpenAiCompatEmbedder::new("http://x", "k", "text-embedding-3-large", 1536)
+            .unwrap()
+            .identity();
+        assert_eq!(openai.dim, other.dim);
+        assert_ne!(openai, other);
     }
 
     #[tokio::test]

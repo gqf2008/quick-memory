@@ -58,6 +58,15 @@ pub struct PageDoc {
     /// a corpus written before this field existed must not become unparseable.
     #[serde(default)]
     pub embedding: Option<Vec<f32>>,
+    /// Which embedder produced [`PageDoc::embedding`], when one did.
+    ///
+    /// `None` is the normal state for a batch built without a provider, and
+    /// for documents constructed before this field existed: `serde(default)`
+    /// keeps them readable. A batch is embedded by one embedder at a time, so
+    /// every vector in a split carries the same identity, and it is the
+    /// *split* that records it — see [`EmbeddingIdentity`].
+    #[serde(default)]
+    pub embedding_identity: Option<EmbeddingIdentity>,
 }
 
 impl PageDoc {
@@ -80,8 +89,10 @@ impl PageDoc {
             entities: entities::extract(&page.body).entities,
             links: entities::extract(&page.body).links,
             // The embedding is not a function of the page alone — it needs a
-            // provider — so it is filled in by whoever builds the split.
+            // provider — so it is filled in by whoever builds the split, and
+            // so is the identity of that provider.
             embedding: None,
+            embedding_identity: None,
         }
     }
 
@@ -90,6 +101,58 @@ impl PageDoc {
     pub fn with_embedding(mut self, embedding: Option<Vec<f32>>) -> Self {
         self.embedding = embedding;
         self
+    }
+
+    /// Record which embedder produced this document's embedding.
+    #[must_use]
+    pub fn with_embedding_identity(mut self, identity: Option<EmbeddingIdentity>) -> Self {
+        self.embedding_identity = identity;
+        self
+    }
+}
+
+/// Name of the file a split carries to state which embedder built its vectors.
+///
+/// It lives *inside* the split directory rather than in the catalog, so a
+/// reader picks it up with the same materialisation that fetches the index.
+/// That keeps the catalog schema untouched and gives the compatibility rule
+/// for free: a split published before this file existed simply says nothing
+/// about its provenance, and is never treated as a mismatch.
+const SPLIT_IDENTITY_FILE: &str = "embedding-identity.json";
+
+/// Which embedder produced a split's vectors.
+///
+/// A vector is only comparable to a query vector from the *same* embedder.
+/// Width alone does not say that: two models of equal width — the common case
+/// when swapping a provider or a model revision — produce unrelated
+/// coordinates, so comparing them succeeds numerically and answers with a
+/// ranking that has no meaning. Recording the identity on the split is what
+/// makes that state visible instead of silent.
+///
+/// Every field carries `#[serde(default)]` so a partially written or older
+/// record still parses; the record as a whole is optional, because a split
+/// built before this existed, or built without a provider, has nothing to
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingIdentity {
+    /// Provider family, e.g. `openai-compatible` or `deterministic`.
+    #[serde(default)]
+    pub provider: String,
+    /// Model name as the provider knows it.
+    #[serde(default)]
+    pub model: String,
+    /// Width of every vector in the split.
+    #[serde(default)]
+    pub dim: usize,
+}
+
+impl From<qm_llm::EmbedderIdentity> for EmbeddingIdentity {
+    fn from(identity: qm_llm::EmbedderIdentity) -> Self {
+        Self {
+            provider: identity.provider,
+            model: identity.model,
+            dim: identity.dim,
+        }
     }
 }
 
@@ -192,6 +255,13 @@ pub fn build_index(dir: &Path, docs: &[PageDoc]) -> Result<()> {
         writer.add_document(document)?;
     }
     writer.commit().context("committing index")?;
+    // The split's provenance is written next to its index, so uploading,
+    // hashing and materialising the split carry the record with the vectors it
+    // describes. A batch with no vectors writes nothing: a keyword-only bucket
+    // stays byte-identical to one published before this existed.
+    if let Some(identity) = batch_identity(docs) {
+        write_split_identity(dir, &identity)?;
+    }
     Ok(())
 }
 
@@ -224,13 +294,106 @@ pub async fn attach_embeddings(
     let Some(embedder) = embedder else {
         return Ok(docs);
     };
+    // The identity is part of the batch, not of a single document: one call
+    // embeds everything, and a split is the unit a reader opens. Stamping it
+    // here means the vector and its provenance cannot drift apart.
+    let identity = EmbeddingIdentity::from(embedder.identity());
     let texts: Vec<String> = docs.iter().map(embedding_text).collect();
     let vectors = vector::embed_texts(embedder, &texts).await?;
     Ok(docs
         .into_iter()
         .zip(vectors)
-        .map(|(doc, vector)| doc.with_embedding(Some(vector)))
+        .map(|(doc, vector)| {
+            doc.with_embedding(Some(vector))
+                .with_embedding_identity(Some(identity.clone()))
+        })
         .collect())
+}
+
+/// The embedder identity a batch of documents agrees on, if any.
+///
+/// `None` is the answer for a batch with no vectors: a split with no vector
+/// column has no provenance to state. Documents are embedded in one batch by
+/// one embedder, so the first record speaks for the split.
+fn batch_identity(docs: &[PageDoc]) -> Option<EmbeddingIdentity> {
+    docs.iter().find_map(|doc| doc.embedding_identity.clone())
+}
+
+/// Write a split's embedder identity into its index directory.
+///
+/// Called while the split is being built, before it is hashed and uploaded, so
+/// the record is part of the split's bytes: a reader cannot materialise the
+/// vectors without also materialising who produced them.
+///
+/// # Errors
+/// Fails when the record cannot be encoded or written.
+fn write_split_identity(dir: &Path, identity: &EmbeddingIdentity) -> Result<()> {
+    let path = dir.join(SPLIT_IDENTITY_FILE);
+    let encoded =
+        serde_json::to_vec_pretty(identity).context("encoding a split's embedding identity")?;
+    std::fs::write(&path, encoded).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a split's embedder identity, if it recorded one.
+///
+/// `Ok(None)` is the compatible answer, not a failure: a split published
+/// before this record existed — or built without a provider — carries no file,
+/// and callers must not turn "no record" into "a different embedder". A record
+/// that exists but cannot be parsed *is* a failure: provenance that is present
+/// yet unreadable must not degrade into "unjudged".
+///
+/// # Errors
+/// Fails when the file exists but cannot be read or parsed.
+fn read_split_identity(dir: &Path) -> Result<Option<EmbeddingIdentity>> {
+    let path = dir.join(SPLIT_IDENTITY_FILE);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let identity = serde_json::from_slice(&raw)
+        .with_context(|| format!("{} is not a valid embedding identity", path.display()))?;
+    Ok(Some(identity))
+}
+
+/// Refuse to compare a query vector against vectors from a different model.
+///
+/// This is the half `vector::cosine` cannot see. A *width* change is already
+/// fail-closed with its own precise message ("query has 8, stored value has
+/// 4"), so this guard is deliberately about `(provider, model)` — the case
+/// where two unrelated coordinate systems happen to have the same shape. Their
+/// cosine would be a number between -1 and 1 that means nothing, and the
+/// ranking built from it would look perfectly normal, so the mismatch is an
+/// error naming both identities rather than a warning or a filtered split.
+///
+/// The recorded width is still reported, and is part of what a split states
+/// about itself; for the dimension itself this leans on the width check, so a
+/// pure dimension change keeps reporting its own, narrower cause.
+///
+/// # Errors
+/// Fails when the split records a provider or model that differs from
+/// `current`.
+fn ensure_split_model_matches(
+    dir: &Path,
+    split_prefix: &str,
+    current: &EmbeddingIdentity,
+) -> Result<()> {
+    let Some(recorded) = read_split_identity(dir)? else {
+        return Ok(());
+    };
+    if recorded.provider == current.provider && recorded.model == current.model {
+        return Ok(());
+    }
+    bail!(
+        "the split {split_prefix} was indexed with provider '{}', model '{}', dim {}, but this machine would query with provider '{}', model '{}', dim {}; embeddings from two models are not comparable, so the vector stream is refused rather than ranked — re-embed the index by running `qm compact` with the current provider",
+        recorded.provider,
+        recorded.model,
+        recorded.dim,
+        current.provider,
+        current.model,
+        current.dim,
+    )
 }
 
 /// Upload every file of a local index to `prefix`, returning the object keys.
@@ -1188,6 +1351,16 @@ pub async fn search_project_tuned(
     // mix split generations without failing a search.
     if let Some(embedder) = embedder.filter(|_| tuning.vector_search && tuning.vector_weight > 0.0)
     {
+        // Before any vector is compared: a split whose vectors came from a
+        // different embedder would score against the query and return a
+        // meaningless ranking, so it is refused by name. The check sits inside
+        // the vector branch on purpose — a caller that disabled the stream
+        // with `--no-vector` is not comparing vectors, so it is not at risk,
+        // and legacy splits with no record are not judged at all.
+        let current = EmbeddingIdentity::from(embedder.identity());
+        for (dir, split) in dirs.iter().zip(&loaded.catalog.splits) {
+            ensure_split_model_matches(dir, &split.prefix, &current)?;
+        }
         let query_vector = vector::embed_one(embedder, query).await?;
         for dir in &dirs {
             let hits = vector::search_vector(dir, &query_vector, "vector", limit)?;
@@ -1332,6 +1505,7 @@ mod tests {
                 entities: Vec::new(),
                 links: Vec::new(),
                 embedding: None,
+                embedding_identity: None,
             },
             PageDoc {
                 workspace_id: "acme".into(),
@@ -1344,6 +1518,7 @@ mod tests {
                 entities: Vec::new(),
                 links: Vec::new(),
                 embedding: None,
+                embedding_identity: None,
             },
         ]
     }
@@ -2420,6 +2595,7 @@ mod tests {
                         entities: Vec::new(),
                         links: Vec::new(),
                         embedding: None,
+                        embedding_identity: None,
                     };
                     if keep_declared {
                         doc.entities = entities::extract(&doc.body).entities;
@@ -2517,6 +2693,7 @@ mod tests {
     /// wrong answer is expressible on purpose (see `answer`).
     struct FakeEmbedder {
         dim: usize,
+        model: String,
         answers: std::collections::HashMap<String, Vec<Vec<f32>>>,
         default: Vec<f32>,
     }
@@ -2526,9 +2703,18 @@ mod tests {
             assert_eq!(default.len(), dim);
             Self {
                 dim,
+                model: "fake-model".to_string(),
                 answers: std::collections::HashMap::new(),
                 default,
             }
+        }
+
+        /// Name the model this fake stands in for. Two fakes with the same
+        /// width and different models are the case the split identity exists
+        /// to separate.
+        fn model(mut self, model: &str) -> Self {
+            self.model = model.to_string();
+            self
         }
 
         /// Answer `text` with exactly these rows — as many, and as wide, as
@@ -2542,6 +2728,14 @@ mod tests {
     impl Embedder for FakeEmbedder {
         fn dim(&self) -> usize {
             self.dim
+        }
+
+        fn identity(&self) -> qm_llm::EmbedderIdentity {
+            qm_llm::EmbedderIdentity {
+                provider: "fake".to_string(),
+                model: self.model.clone(),
+                dim: self.dim,
+            }
         }
 
         fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a> {
@@ -3179,6 +3373,261 @@ mod tests {
                 .iter()
                 .any(|hit| hit.path == PARAPHRASE.0 && hit.streams.contains(&"vector".to_string())),
             "the rebuilt split must still carry embeddings: {outcome:?}"
+        );
+    }
+
+    /// The published split states which embedder built its vectors, and a
+    /// model change at the *same* width is refused by name.
+    ///
+    /// Two models of equal width produce unrelated coordinates, so the vector
+    /// stream would otherwise compare them, succeed numerically, and answer
+    /// with a ranking that carries no meaning. Recording the identity on the
+    /// split is what turns that into an error — this is the regression that
+    /// record exists for.
+    #[tokio::test]
+    async fn a_same_width_model_change_is_refused_by_name() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let first = FakeEmbedder::new(4, orthogonal())
+            .model("model-a")
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(KEYWORD.1, KEYWORD.2), vec![orthogonal()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()]);
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&first),
+        )
+        .await;
+
+        // Premise 1: the split really holds vectors, so what follows is about
+        // comparability, not about an empty vector column.
+        let matched =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&first)).await;
+        assert!(
+            matched
+                .stream_candidates
+                .get("vector")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the split must really hold embeddings: {matched:?}"
+        );
+
+        // Premise 2: the split records the builder's identity — provider,
+        // model and width — so the record is a fact about the split rather
+        // than a constant the reader could have assumed.
+        let prefix = reader(&bucket)
+            .load_catalog(&workspace, &project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits[0]
+            .prefix
+            .clone();
+        let materialised = TempDir::new().unwrap();
+        materialize(&bucket, &prefix, materialised.path())
+            .await
+            .unwrap();
+        let recorded = read_split_identity(materialised.path())
+            .unwrap()
+            .expect("a split built with a provider records its identity");
+        assert_eq!(recorded.provider, "fake");
+        assert_eq!(recorded.model, "model-a");
+        assert_eq!(recorded.dim, 4);
+
+        // Conclusion: same width, different model, refused and named.
+        let second = FakeEmbedder::new(4, orthogonal())
+            .model("model-b")
+            .answer(QUERY, vec![query_vector()]);
+        let error =
+            search_with_embedder_result(&bucket, &workspace, &project_id, QUERY, Some(&second))
+                .await
+                .expect_err("a same-width model change must not be ranked");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("model-a") && message.contains("model-b"),
+            "the failure must name both models: {message}"
+        );
+        assert!(
+            message.contains("dim 4"),
+            "the failure must name the width: {message}"
+        );
+        assert!(
+            message.contains(&prefix),
+            "the failure must name the split it refused: {message}"
+        );
+    }
+
+    /// A split published before the identity record existed says nothing about
+    /// its provenance, and "no record" must never be read as "a different
+    /// embedder": an existing corpus has to stay searchable.
+    #[tokio::test]
+    async fn a_split_without_a_recorded_identity_is_not_judged() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let project = reader(&bucket);
+        let writer = WriterId::new("mbp-a").unwrap();
+        let embedded = FakeEmbedder::new(4, orthogonal())
+            .model("model-a")
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(KEYWORD.1, KEYWORD.2), vec![orthogonal()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()]);
+
+        let mut docs = Vec::new();
+        for (index, (path, title, body)) in corpus().iter().enumerate() {
+            let page_path = PagePath::new(*path).unwrap();
+            let now_ms = index as i64 + 1;
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: page_path.clone(),
+                    title: (*title).to_string(),
+                    body: (*body).to_string(),
+                    writer_id: writer.clone(),
+                    now_ms,
+                })
+                .await
+                .unwrap();
+            let page = project
+                .read_page(&workspace, &project_id, &page_path)
+                .await
+                .unwrap()
+                .unwrap();
+            docs.push(PageDoc::from_version(
+                &workspace,
+                &project_id,
+                &page,
+                now_ms,
+            ));
+        }
+        // Vectors, but no record of who produced them: exactly the shape a
+        // split published before this feature has.
+        let docs: Vec<PageDoc> = attach_embeddings(docs, Some(&embedded))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|doc| doc.with_embedding_identity(None))
+            .collect();
+        publish_split_index(
+            &bucket,
+            &project,
+            &workspace,
+            &project_id,
+            &writer,
+            1,
+            &docs,
+            &build_root.path().join("legacy"),
+            1,
+        )
+        .await
+        .unwrap();
+
+        // Premise: vectors present, record absent.
+        let prefix = project
+            .load_catalog(&workspace, &project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits[0]
+            .prefix
+            .clone();
+        let materialised = TempDir::new().unwrap();
+        materialize(&bucket, &prefix, materialised.path())
+            .await
+            .unwrap();
+        assert!(
+            !materialised.path().join(SPLIT_IDENTITY_FILE).exists(),
+            "the legacy split must carry no identity record"
+        );
+        let matched =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&embedded)).await;
+        assert!(
+            matched
+                .stream_candidates
+                .get("vector")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the legacy split must still hold vectors: {matched:?}"
+        );
+
+        // Conclusion: a different model neither matches nor mismatches; the
+        // reader has no claim to judge, so the search proceeds as before.
+        let other = FakeEmbedder::new(4, orthogonal()).model("model-b");
+        let outcome =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&other)).await;
+        assert_eq!(
+            outcome.splits_searched, 1,
+            "a split with no recorded identity must not be refused: {outcome:?}"
+        );
+    }
+
+    /// The guard guards a comparison. A caller with no provider, or one that
+    /// turned the vector stream off, is not comparing vectors, so a recorded
+    /// identity must not turn into an error for them.
+    #[tokio::test]
+    async fn the_identity_guard_only_applies_to_a_live_vector_stream() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let first = FakeEmbedder::new(4, orthogonal())
+            .model("model-a")
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(KEYWORD.1, KEYWORD.2), vec![orthogonal()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()]);
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&first),
+        )
+        .await;
+
+        // No provider configured: the vector stream does not run at all.
+        let outcome = search_with_embedder(&bucket, &workspace, &project_id, QUERY, None).await;
+        assert_eq!(
+            outcome.stream_candidates.get("vector"),
+            None,
+            "no provider means no vector stream: {outcome:?}"
+        );
+
+        // A different model, but the caller turned the stream off: the vectors
+        // are never compared, so there is nothing to refuse.
+        let tuning = SearchTuning {
+            now_ms: 0,
+            vector_search: false,
+            ..Default::default()
+        };
+        let second = FakeEmbedder::new(4, orthogonal()).model("model-b");
+        let outcome = search_project_tuned(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            QUERY,
+            10,
+            &tuning,
+            Some(&second),
+        )
+        .await
+        .expect("a disabled vector stream cannot mismatch");
+        assert_eq!(
+            outcome.stream_candidates.get("vector"),
+            None,
+            "the disabled stream must not have run: {outcome:?}"
         );
     }
 

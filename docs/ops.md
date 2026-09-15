@@ -55,16 +55,29 @@ qm compact          # 拿不到租约会返回 "another machine holds the compac
 
 ## 嵌入向量与换模型
 
-向量是**派生的**，跟着分片走：桶里只要存在带向量的分片，读方就会用
-`QM_EMBEDDING_DIM` 去解释它们——**宽度不符是硬失败，不是静默跳过**。
+向量是**派生的**，跟着分片走，而且分片会记录**是谁生成了这些向量**：
+每个用 provider 建出的分片都带一份 `embedding-identity.json`，内容是
+`{provider, model, dim}`。它写在分片目录里，因此和向量一起上传、一起哈希、一起被读者
+材料化——读者不可能只拿到向量而拿不到它的来源。读路径据此比对：
 
-- 症状：换了不同维度的 `QM_EMBEDDING_MODEL`（或改了 `QM_EMBEDDING_DIM`）却没有重新嵌入，
-  **每一次搜索都会 fail-closed 报错**：
+- **`(provider, model)` 不一致 → 硬失败并点名两边身份**。这是宽度看不出的一半：
+  换模型但宽度不变（很常见）时，两种模型的坐标本无关，余弦照样算得出 -1..1 的数字，
+  排序看起来完全正常却毫无意义。报错形如
+  `the split <prefix> was indexed with provider 'openai-compatible', model 'model-a', dim 768, but this machine would query with provider 'openai-compatible', model 'model-b', dim 768`。
+- **宽度不一致 → 仍然由余弦的宽度守卫硬失败**，文案是它自己那句更窄的
   `cannot compare embeddings of different widths: query has 8, stored value has 4`。
-  这是刻意的：拿两种模型的距离做比较，会给出看起来正常、实则无意义的排序。
+  两者都是 fail-closed，只是各自报最具体的原因。
+- **旧分片（没有 `embedding-identity.json`）不判定**：向量出现之前发布的分片没有这份记录，
+  "没记录"绝不等于"不是同一个模型"，否则升级会直接把既有桶搜挂。未配置 provider 时这一路
+  根本不跑，比对也就无从发生。
+
+- 症状（宽度）：换了不同维度的 `QM_EMBEDDING_MODEL`（或改了 `QM_EMBEDDING_DIM`）却没有重新嵌入，
+  **每一次搜索都会 fail-closed 报错**（上面那句宽度文案）。这是刻意的：拿两种模型的距离做比较，
+  会给出看起来正常、实则无意义的排序。
+- 症状（同宽度换模型）：报错改成点名两边 `provider/model/dim`，同样每次搜索都失败。
 - **`qm publish` 修不了这个问题**：发布是**追加**（`publish_split` → `catalog.push_split`），
   它只把新世代的向量作为**新分片**加进 catalog，旧世代分片仍留在目录里，
-  于是"8 维查询 vs 4 维存量"照样硬失败。
+  于是"8 维查询 vs 4 维存量"照样硬失败；同宽度换模型同理，旧分片依旧带着旧身份留在目录里。
   （watermark 只记 `{manifest_seq, embedded}`，没有 model/dim，换模型时不会归零。）
   `publish` 只在**首次启用 provider**（既有分片根本没有向量列）时是无害且有效的。
 - **换模型/换维度后的必需动作是 `qm compact`**：它从权威页面整库重建，

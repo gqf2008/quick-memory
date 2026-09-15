@@ -138,6 +138,14 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
 - **分片里存的是向量**：每个文档一个 `embedding` 字节快速字段，值是 f32 小端拼接（不做
   f32→文本→f32 的往返，那是有损的）。`PageDoc.embedding` 为 `Option` 且带 `serde(default)`，
   所以向量出现之前发布的 JSONL 文档仍然可解析。
+- **分片记录向量的身份**：每个用 provider 建出的分片都带一份
+  `embedding-identity.json`（`{provider, model, dim}`，字段全部 `serde(default)`）。它写在
+  分片目录里，所以和向量一起上传、哈希、材料化——读者拿不到向量而漏掉它的来源。搜索时先
+  比对 `(provider, model)`：**同宽度换模型**以前只会静默给出无意义排序，现在 fail-closed 报错
+  并点名两边的 provider/model/dim；**宽度变化**仍由余弦的宽度守卫报出那句更窄的
+  `cannot compare embeddings of different widths`；**没有记录的老分片不判定**（"没记录"不等于
+  "不是同一个模型"，否则升级会搜挂既有桶）。compact 同样重写这份记录，所以它是分片级事实，
+  不是一次 publish 的临时状态。
 - **查询向量来自同一个 provider**：`QM_EMBEDDING_BASE_URL` / `_API_KEY` / `_MODEL`（宽度由
   `QM_EMBEDDING_DIM` 给，默认 1536）。**未配置不是错误**：publish 不写向量、search 不跑这一路，
   其余行为完全不变。配置了但调用失败/宽度不符/条数不符则是**硬失败**——静默补零或截断会让
