@@ -199,6 +199,10 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Consolidate {
             session: args.session,
+            // `auto` picks the LLM when QM_LLM_* is configured and falls back
+            // to the rule renderer otherwise; the tool never fails for lack of
+            // a model.
+            compiler: "auto".to_string(),
         })
         .await
     }

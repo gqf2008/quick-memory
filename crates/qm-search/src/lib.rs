@@ -574,6 +574,7 @@ pub async fn search_project(
     })
 }
 
+pub mod compile;
 pub mod consolidate;
 pub mod quickwit_split;
 
@@ -1106,8 +1107,8 @@ mod tests {
         assert!(page.body.contains("tantivy splits"), "{}", page.body);
         assert!(page.body.contains("published the catalog"), "{}", page.body);
         assert!(
-            page.body.contains("Compiled from 3 observations"),
-            "{}",
+            crate::compile::fingerprint_of(&page.body).is_some(),
+            "the page must record the chain it was compiled from: {}",
             page.body
         );
 

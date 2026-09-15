@@ -174,7 +174,11 @@ GitHub 资产在本机被限速（73.9MB 只稳定拿到约 1MB），因此这�
 
 **编译**（`consolidate_session`）：
 
-- 渲染是**确定性函数**：同样的链永远渲染出同样的页面。这让任何机器都能重跑，也让"没变化就不写"可判定。
+- 编译器**可插拔**：`CompilerChoice::Rules`（确定性渲染，永远是地板）或 `CompilerChoice::Llm`
+  （OpenAI 兼容 `/chat/completions`，`QM_LLM_BASE_URL/API_KEY/MODEL`）。**LLM 失败一律回落到 rules 并标记
+  `used_fallback`**——丢掉页面比丢掉文采严重得多。
+- **幂等由链指纹决定，不由正文决定**：页面里嵌 `<!-- qm:compiled <sha256> -->`，指纹覆盖观测 id 序列。
+  链没变就不再写版本——否则一个每次措辞都不同的 LLM 会产生无限版本。链变了才重编译。
 - 链没变时**不追加版本**（`already_up_to_date`）。
 - 用租约保护（`consolidate/<ws>/<proj>/<sid>`），拿不到就 `skipped`——和压缩一样是可放弃作业。
 - 输出走的是普通页面提交路径（`commit_page`），因此自动获得 supersession 链、索引发布与权威过滤；

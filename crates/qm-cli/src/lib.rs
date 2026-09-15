@@ -20,7 +20,7 @@ use qm_core::{
     HandoffState, MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId, WorkspaceId,
     WriterId,
 };
-use qm_search::consolidate::consolidate_session;
+use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
 use qm_search::{PageDoc, compact_project, publish_split_index, search_project};
 use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
@@ -105,6 +105,10 @@ pub enum Command {
         /// Session id.
         #[arg(long)]
         session: String,
+        /// Compiler: `auto` (LLM when QM_LLM_BASE_URL is set, else rules),
+        /// `rules`, or `llm` (which falls back to rules on failure).
+        #[arg(long, default_value = "auto")]
+        compiler: String,
     },
     /// List the sessions of the project.
     Sessions,
@@ -359,16 +363,34 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             })
         }
-        Command::Consolidate { session } => {
+        Command::Consolidate { session, compiler } => {
             let session_id = SessionId::new(session)?;
-            let outcome = consolidate_session(
+            let choice = match compiler.as_str() {
+                "auto" => {
+                    if std::env::var("QM_LLM_BASE_URL")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        CompilerChoice::Llm
+                    } else {
+                        CompilerChoice::Rules
+                    }
+                }
+                "rules" => CompilerChoice::Rules,
+                "llm" => CompilerChoice::Llm,
+                other => bail!("unknown compiler {other:?}: use auto, rules or llm"),
+            };
+            let outcome = consolidate_session_with(
+                choice,
                 &ctx.project,
-                &ctx.workspace,
-                &ctx.project_id,
-                &session_id,
-                &ctx.writer,
-                ctx.now_ms,
-                60_000,
+                qm_search::consolidate::ConsolidationRequest {
+                    workspace_id: &ctx.workspace,
+                    project_id: &ctx.project_id,
+                    session_id: &session_id,
+                    consolidator: &ctx.writer,
+                    now_ms: ctx.now_ms,
+                    lease_ttl_ms: 60_000,
+                },
             )
             .await?;
             Ok(if ctx.json {
@@ -378,6 +400,8 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "page_id": outcome.page_id,
                     "observations": outcome.observations,
                     "segments": outcome.segments,
+                    "compiler": outcome.compiler,
+                    "used_fallback": outcome.used_fallback,
                 })
                 .to_string()
             } else if outcome.skipped {
@@ -389,8 +413,15 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             } else {
                 format!(
-                    "compiled {} observation(s) from {} segment(s)",
-                    outcome.observations, outcome.segments
+                    "compiled {} observation(s) from {} segment(s) with {}{}",
+                    outcome.observations,
+                    outcome.segments,
+                    outcome.compiler,
+                    if outcome.used_fallback {
+                        " (fell back from the llm)"
+                    } else {
+                        ""
+                    }
                 )
             })
         }

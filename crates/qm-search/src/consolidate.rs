@@ -2,24 +2,29 @@
 //!
 //! This is the "compile, not retrieve" half of the design: capture appends raw
 //! events, and consolidation turns the ones that matter into a durable page
-//! that later searches can find. Compilation is a plain function of the
-//! observation chain, so the same chain always renders the same page — which is
-//! what lets it be re-run by any machine.
+//! that later searches can find.
 //!
-//! Consolidation is optional work and is guarded by a lease, for the same
-//! reason compaction is: two machines may try it, and one of them should simply
-//! walk away.
+//! Compilation is guarded in three ways. It runs under a lease, so two machines
+//! do not compile the same session at once. It is a function of the chain's
+//! *fingerprint*, not of the body, so a nondeterministic compiler (an LLM) does
+//! not cause a new version every time it runs. And a compiler failure falls back
+//! to the rule renderer, because losing the page is worse than losing polish.
 
 use anyhow::{Context, Result};
 use qm_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId};
 use qm_store::{CommitPageRequest, ProjectStore};
+
+use crate::compile::{
+    OpenAiCompatCompiler, RuleCompiler, SessionCompiler, chain_fingerprint, fingerprint_of,
+    with_fingerprint,
+};
 
 /// What a consolidation did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsolidateOutcome {
     /// True when another machine held the lease or there was nothing to compile.
     pub skipped: bool,
-    /// True when the rendered page already matched the committed one.
+    /// True when the chain fingerprint already matched the committed page.
     pub already_up_to_date: bool,
     /// Committed page version, when this run produced one.
     pub page_id: Option<String>,
@@ -29,58 +34,64 @@ pub struct ConsolidateOutcome {
     pub segments: usize,
     /// Manifest sequence after the commit (unchanged when nothing was written).
     pub manifest_seq: u64,
+    /// Which compiler produced the body.
+    pub compiler: &'static str,
+    /// True when the configured compiler failed and the rules were used.
+    pub used_fallback: bool,
 }
 
-/// Render a session's observations as markdown.
-///
-/// Deliberately deterministic and boring: no clock, no model, no ordering
-/// freedom. An LLM pass can rewrite the body later through the normal commit
-/// path; this renderer is the floor the system always has.
-#[must_use]
-pub fn render_session_page(session_id: &SessionId, observations: &[Observation]) -> String {
-    let mut body = format!(
-        "# Session {session_id}\n\nCompiled from {} observation{}.\n",
-        observations.len(),
-        if observations.len() == 1 { "" } else { "s" }
-    );
-    for observation in observations {
-        body.push_str(&format!(
-            "\n- [{}] {} ({}) {}",
-            observation.created_at_ms, observation.kind, observation.actor, observation.text
-        ));
-    }
-    body.push('\n');
-    body
+/// Which compiler to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerChoice {
+    /// The deterministic renderer.
+    Rules,
+    /// An OpenAI-compatible LLM, falling back to rules on failure.
+    Llm,
 }
 
-/// Compile a session's observations into `sessions/<session_id>.md`.
+/// One consolidation target.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsolidationRequest<'a> {
+    /// Workspace scope.
+    pub workspace_id: &'a WorkspaceId,
+    /// Project scope.
+    pub project_id: &'a ProjectId,
+    /// Session to compile.
+    pub session_id: &'a SessionId,
+    /// Machine doing the work.
+    pub consolidator: &'a WriterId,
+    /// Timestamp recorded on the commit.
+    pub now_ms: i64,
+    /// How long the consolidation lease stays valid.
+    pub lease_ttl_ms: i64,
+}
+
+/// Compile a session's observations into `sessions/<session_id>.md` with the
+/// chosen compiler.
 ///
 /// # Errors
 /// Propagates chain reads and the page commit. A lease held elsewhere is not an
 /// error; it is reported as `skipped`.
-pub async fn consolidate_session(
+pub async fn consolidate_session_with(
+    choice: CompilerChoice,
     project_store: &ProjectStore,
-    workspace_id: &WorkspaceId,
-    project_id: &ProjectId,
-    session_id: &SessionId,
-    consolidator: &WriterId,
-    now_ms: i64,
-    lease_ttl_ms: i64,
+    request: ConsolidationRequest<'_>,
 ) -> Result<ConsolidateOutcome> {
+    let ConsolidationRequest {
+        workspace_id,
+        project_id,
+        session_id,
+        consolidator,
+        now_ms,
+        lease_ttl_ms,
+    } = request;
     let scope = format!("consolidate/{workspace_id}/{project_id}/{session_id}");
     let Some(lease) = project_store
         .acquire_lease(&scope, consolidator, now_ms, lease_ttl_ms)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?
     else {
-        return Ok(ConsolidateOutcome {
-            skipped: true,
-            already_up_to_date: false,
-            page_id: None,
-            observations: 0,
-            segments: 0,
-            manifest_seq: 0,
-        });
+        return Ok(skipped_outcome(0, 0, 0));
     };
 
     let chain = project_store
@@ -103,25 +114,19 @@ pub async fn consolidate_session(
             .release(project_store, now_ms)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        return Ok(ConsolidateOutcome {
-            skipped: true,
-            already_up_to_date: false,
-            page_id: None,
-            observations: 0,
-            segments: chain.len(),
-            manifest_seq,
-        });
+        return Ok(skipped_outcome(0, chain.len(), manifest_seq));
     }
 
     let path = PagePath::new(format!("sessions/{session_id}.md"))?;
-    let body = render_session_page(session_id, &observations);
+    let fingerprint = chain_fingerprint(&observations);
 
-    // Re-running over an unchanged chain must not append a version.
+    // Idempotency keyed on the chain, not the prose: an LLM that words the page
+    // differently each run must not create a version each run.
     if let Some(current) = project_store
         .read_page(workspace_id, project_id, &path)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?
-        && current.body == body
+        && fingerprint_of(&current.body).as_deref() == Some(fingerprint.as_str())
     {
         lease
             .release(project_store, now_ms)
@@ -134,8 +139,43 @@ pub async fn consolidate_session(
             observations: observations.len(),
             segments: chain.len(),
             manifest_seq,
+            compiler: "unchanged",
+            used_fallback: false,
         });
     }
+
+    let rules = RuleCompiler;
+    let (body, compiler, used_fallback) = match choice {
+        CompilerChoice::Rules => (
+            rules
+                .compile(session_id, &observations)
+                .await
+                .context("rule compiler failed")?,
+            rules.name(),
+            false,
+        ),
+        CompilerChoice::Llm => match OpenAiCompatCompiler::from_env()? {
+            Some(llm) => match llm.compile(session_id, &observations).await {
+                Ok(body) if !body.trim().is_empty() => (body, llm.name(), false),
+                Ok(_) | Err(_) => (
+                    rules
+                        .compile(session_id, &observations)
+                        .await
+                        .context("rule compiler failed")?,
+                    rules.name(),
+                    true,
+                ),
+            },
+            None => (
+                rules
+                    .compile(session_id, &observations)
+                    .await
+                    .context("rule compiler failed")?,
+                rules.name(),
+                false,
+            ),
+        },
+    };
 
     let outcome = project_store
         .commit_page(CommitPageRequest {
@@ -143,7 +183,7 @@ pub async fn consolidate_session(
             project_id: project_id.clone(),
             path,
             title: format!("Session {session_id}"),
-            body,
+            body: with_fingerprint(session_id, &fingerprint, &body),
             writer_id: consolidator.clone(),
             now_ms,
         })
@@ -161,29 +201,69 @@ pub async fn consolidate_session(
         observations: observations.len(),
         segments: chain.len(),
         manifest_seq: outcome.manifest_seq,
+        compiler,
+        used_fallback,
     })
 }
 
-/// Convenience wrapper used by tests and probes.
+/// Compile with the deterministic renderer.
 ///
 /// # Errors
 /// Propagates consolidation failures.
-pub async fn consolidate_and_context(
+pub async fn consolidate_session(
     project_store: &ProjectStore,
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     session_id: &SessionId,
     consolidator: &WriterId,
+    now_ms: i64,
+    lease_ttl_ms: i64,
 ) -> Result<ConsolidateOutcome> {
-    consolidate_session(
+    consolidate_session_with(
+        CompilerChoice::Rules,
         project_store,
-        workspace_id,
-        project_id,
-        session_id,
-        consolidator,
-        0,
-        60_000,
+        ConsolidationRequest {
+            workspace_id,
+            project_id,
+            session_id,
+            consolidator,
+            now_ms,
+            lease_ttl_ms,
+        },
     )
     .await
-    .context("consolidating session")
+}
+
+fn skipped_outcome(observations: usize, segments: usize, manifest_seq: u64) -> ConsolidateOutcome {
+    ConsolidateOutcome {
+        skipped: true,
+        already_up_to_date: false,
+        page_id: None,
+        observations,
+        segments,
+        manifest_seq,
+        compiler: "none",
+        used_fallback: false,
+    }
+}
+
+/// Render a session's observations as markdown with the rule compiler.
+///
+/// Kept as a free function because it is the documented floor: the shape of a
+/// compiled page must be reproducible without a model.
+#[must_use]
+pub fn render_session_page(session_id: &SessionId, observations: &[Observation]) -> String {
+    let mut body = format!(
+        "# Session {session_id}\n\nCompiled from {} observation{}.\n",
+        observations.len(),
+        if observations.len() == 1 { "" } else { "s" }
+    );
+    for observation in observations {
+        body.push_str(&format!(
+            "\n- [{}] {} ({}) {}",
+            observation.created_at_ms, observation.kind, observation.actor, observation.text
+        ));
+    }
+    body.push('\n');
+    body
 }

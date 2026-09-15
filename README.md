@@ -36,7 +36,8 @@ export QM_S3_ENDPOINT=... QM_S3_BUCKET=... QM_S3_ACCESS_KEY_ID=... QM_S3_SECRET_
 export QM_WORKSPACE=acme QM_PROJECT=ai-memory QM_WRITER=mbp-1   # 可选
 
 cargo run -p qm-cli --bin qm -- capture --session sess-1 --text "ran the suite"
-cargo run -p qm-cli --bin qm -- consolidate --session sess-1
+cargo run -p qm-cli --bin qm -- consolidate --session sess-1          # --compiler auto|rules|llm
+# LLM 编译（可选）：设置 QM_LLM_BASE_URL / QM_LLM_API_KEY / QM_LLM_MODEL；失败自动回落 rules
 cargo run -p qm-cli --bin qm -- publish
 cargo run -p qm-cli --bin qm -- search "suite" --json
 cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
