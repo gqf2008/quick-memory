@@ -1,0 +1,44 @@
+version = 1
+
+# The gates this repository already enforces locally, run by the walgit CI
+# runner on every branch and tag. They are dependency-light and complete in
+# about a minute, so there is no reason to tier them.
+claim_ttl = "30m"
+timeout = "45m"
+max_attempts = 1
+
+[[task]]
+name = "fmt"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo fmt --all -- --check"
+timeout = "10m"
+env_allow = ["CARGO_HOME", "RUSTUP_HOME", "PATH", "HOME", "RUSTC_WRAPPER"]
+
+[[task]]
+name = "test"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo test --workspace"
+timeout = "30m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "PATH",
+  "HOME",
+  "CARGO_TARGET_DIR",
+  "CARGO_NET_GIT_FETCH_WITH_CLI",
+  "RUSTC_WRAPPER",
+]
+
+[[task]]
+name = "clippy"
+refs = ["refs/heads/*", "refs/tags/v*"]
+command = "cargo clippy --workspace --all-targets -- -D warnings"
+timeout = "30m"
+env_allow = [
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "PATH",
+  "HOME",
+  "CARGO_TARGET_DIR",
+  "RUSTC_WRAPPER",
+]

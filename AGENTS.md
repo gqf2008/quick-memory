@@ -47,6 +47,21 @@ crates/qm-search  split upload/materialise + in-process tantivy search
 crates/qm-probe   S0 probe binaries
 ```
 
+## Collaboration topology
+
+- **walgit is the source of truth**: `origin` is
+  `http://127.0.0.1:8081/gqf2008/quick-memory.git`. Daily work pushes there.
+- **GitHub is a release mirror**: `gqf2008/quick-memory` is fed by the walgit
+  mirror loop every 60s (heads + tags only; `refs/collab/*` stays on walgit).
+  Never push to GitHub by hand — releases are a tag pushed to `origin`, which
+  the mirror carries over, then `gh release create <tag> --generate-notes`.
+- **Work is recorded in walgit collab**, not only in git: issue threads, status,
+  patches, reviews and merges live in `refs/collab/*` and drive the board. See
+  the `walgit` skill for the entry schema; a change with no collab entry has no
+  collaboration record.
+- `.walgit/board.toml` declares the board lanes and `.walgit/ci.toml` declares
+  the gates the walgit CI runner executes (fmt, test, clippy).
+
 ## Commands
 
 ```bash

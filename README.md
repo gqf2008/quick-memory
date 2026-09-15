@@ -2,6 +2,9 @@
 
 多机共享的 agent 长期记忆：**权威数据在 S3/R2，搜索索引是可重建的派生层，任何一台机器都能独立搜全量**。
 
+> 主仓在 **walgit**（`http://127.0.0.1:8081/gqf2008/quick-memory.git`），GitHub 仅作为发版镜像；
+> 日常 push 走 `origin`，不要手动推 GitHub。
+
 设计见 [`docs/design.md`](docs/design.md)；上手见 [`docs/quickstart.md`](docs/quickstart.md)；
 运维见 [`docs/ops.md`](docs/ops.md)。
 

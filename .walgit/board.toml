@@ -1,0 +1,40 @@
+# quick-memory work-unit board. Move cards by appending signed `status`
+# entries, never by editing this file.
+version = 1
+
+[sort]
+by = "ts"
+direction = "desc"
+
+[[column]]
+name = "open"
+status = "open"
+
+[[column]]
+name = "in-progress"
+status = "in-progress"
+
+[[column]]
+name = "needs-review"
+status = "needs-review"
+
+[[column]]
+name = "blocked"
+status = "blocked"
+
+[[column]]
+name = "needs-human"
+status = "needs-human"
+
+[[column]]
+name = "closed"
+status = "closed"
+
+# A patch that fails review or merge policy is worth surfacing on its own.
+[[column]]
+name = "merge-blocked"
+merge = "blocked"
+
+[[column]]
+name = "unverified"
+unverified = true
