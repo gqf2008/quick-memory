@@ -2002,9 +2002,18 @@ impl ProjectStore {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
 
     use super::*;
 
@@ -2022,6 +2031,201 @@ mod tests {
             max_attempts: 500,
             base_delay: Duration::ZERO,
         })
+    }
+
+    /// A backend that counts reads and how many of them overlapped.
+    ///
+    /// `read_commit_log` reaches the bucket through `CasStore::read`, which is
+    /// `ObjectStore::get` followed by `bytes()`. Counting `get_opts` therefore
+    /// counts exactly the reads the store layer issues, and a `digest` over a
+    /// scope with no sessions and no handoffs reads nothing else: both of those
+    /// are *listed* first and only read once they exist.
+    ///
+    /// Each call holds its counter across a yield. `InMemory` alone finishes
+    /// every read inside a single poll, so "one at a time" and "sixteen at a
+    /// time" would look identical even when the caller really does overlap
+    /// them; a real bucket suspends on the round trip, and the yield is the
+    /// stand-in for that. No wall-clock threshold enters the assertions.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        reads: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemory::new(),
+                reads: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            })
+        }
+
+        /// Reads issued since the last [`Self::reset`].
+        fn reads(&self) -> usize {
+            self.reads.load(AtomicOrdering::SeqCst)
+        }
+
+        /// The most reads in flight at once since the last [`Self::reset`].
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(AtomicOrdering::SeqCst)
+        }
+
+        /// Forget what has been observed, so a test can time one call.
+        fn reset(&self) {
+            self.reads.store(0, AtomicOrdering::SeqCst);
+            self.max_in_flight.store(0, AtomicOrdering::SeqCst);
+        }
+    }
+
+    /// The commit sequence encoded in a key like
+    /// `…/commits/00000000000000000123.json`.
+    ///
+    /// Anything that is not a commit record answers zero, so only the log reads
+    /// below get the stagger.
+    fn commit_seq_in(location: &str) -> usize {
+        location
+            .rsplit('/')
+            .next()
+            .and_then(|last| last.strip_suffix(".json"))
+            .and_then(|seq| seq.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    /// `ObjectStore` is declared with `#[async_trait]`, which rewrites every
+    /// async method into one returning a boxed future — and the crate does not
+    /// re-export the attribute. So the delegating methods below are written in
+    /// the shape that macro produces, which is also why they ignore the
+    /// generated lifetime plumbing.
+    impl ObjectStore for CountingStore {
+        fn put_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.put_opts(location, payload, opts).await })
+        }
+
+        fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            opts: PutMultipartOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = object_store::Result<Box<dyn MultipartUpload>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.put_multipart_opts(location, opts).await })
+        }
+
+        fn get_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+            options: GetOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<GetResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
+                self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+                // Stagger the reads so the oldest commits come back first —
+                // the reverse of the answer. A real bucket hands completions
+                // back in whatever order it likes; this makes that disorder
+                // deterministic, which is what keeps the ordering assertions
+                // below load-bearing rather than satisfied by luck.
+                for _ in 0..=commit_seq_in(location.as_ref()) {
+                    tokio::task::yield_now().await;
+                }
+                let out = self.inner.get_opts(location, options).await;
+                self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                out
+            })
+        }
+
+        fn delete<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 Path,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.delete(location).await })
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            prefix: Option<&'life1 Path>,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<ListResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.list_with_delimiter(prefix).await })
+        }
+
+        fn copy<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 Path,
+            to: &'life2 Path,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.copy(from, to).await })
+        }
+
+        fn copy_if_not_exists<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 Path,
+            to: &'life2 Path,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.copy_if_not_exists(from, to).await })
+        }
     }
 
     fn request(writer: &str, path: &str, body: &str, now_ms: i64) -> CommitPageRequest {
@@ -3376,6 +3580,99 @@ mod tests {
         // A cap of zero is a legal request, not an error.
         let none = store.digest(&ws(), &proj(), 0, 0).await.unwrap();
         assert!(none.pages.is_empty());
+    }
+
+    /// `digest` reads the whole commit log, so the read bound is the only thing
+    /// standing between a long log and one serial round trip per commit — and
+    /// bounding the read must not move the window or the ordering. This pins
+    /// all three at once: how many objects are read, how many reads overlap,
+    /// and the answer that comes out.
+    #[tokio::test]
+    async fn digest_reads_the_commit_log_with_bounded_overlap() {
+        const COMMITS: i64 = 200;
+
+        let counter = CountingStore::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=COMMITS {
+            // The last two commits share a millisecond on purpose: the order
+            // has to fall back to `seq`, which is exactly the guarantee a
+            // two-machine clock skew leans on. (`at_ms` is the caller's clock.)
+            let at = if index == COMMITS {
+                (COMMITS - 1) * 1_000
+            } else {
+                index * 1_000
+            };
+            store
+                .commit_page(request("mbp-1", &format!("notes/n{index}.md"), "body", at))
+                .await
+                .unwrap();
+        }
+
+        // Premise before conclusion: the commits really are there, so a read
+        // count below cannot be explained away by an empty log.
+        let log = store
+            .read_commit_log(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            log.len(),
+            COMMITS as usize,
+            "the premise: every commit exists"
+        );
+
+        // One `digest`, nothing else, so every read it issues is its own.
+        counter.reset();
+        let digest = store.digest(&ws(), &proj(), 0, 5).await.unwrap();
+
+        assert_eq!(
+            counter.reads(),
+            COMMITS as usize,
+            "the log is still read whole: the bound is on overlap, not on how many \
+             objects are fetched"
+        );
+        let max = counter.max_in_flight();
+        assert!(
+            max <= COMMIT_LOG_READ_CONCURRENCY,
+            "at most {COMMIT_LOG_READ_CONCURRENCY} reads may be in flight, saw {max}"
+        );
+        assert_eq!(
+            max, 16,
+            "the commit log is read concurrently, not one at a time; changing the \
+             bound is a deliberate edit to this line, not a silent one"
+        );
+
+        // Reading out of order is invisible in the answer: still newest first,
+        // still capped per section.
+        let paths: Vec<&str> = digest
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "notes/n200.md",
+                "notes/n199.md",
+                "notes/n198.md",
+                "notes/n197.md",
+                "notes/n196.md",
+            ]
+        );
+
+        // The window is still the window: reading concurrently may not leak a
+        // commit from before `since_ms`, even though the reads that find it are
+        // the very ones now issued in parallel.
+        let windowed = store.digest(&ws(), &proj(), 197_500, 5).await.unwrap();
+        let windowed_paths: Vec<&str> = windowed
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(
+            windowed_paths,
+            vec!["notes/n200.md", "notes/n199.md", "notes/n198.md"]
+        );
     }
 
     /// A deleted page must show up as a deletion. Dropping it would let a
