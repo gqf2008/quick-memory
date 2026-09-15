@@ -18,6 +18,8 @@ quick-memory 没有常驻服务：运维对象是**一个桶**和**每台机器�
 
 - 可达性分析决定生死：manifest、每条 live page 的**整条 supersession 链**、tombstone 删掉的那一版、
   当前 catalog 及其引用的分片、每个会话 head 与其可达段、以及 **commit log**（时间线）都算"活"。
+  分片形态下，提交点命名的**每一个分片**、以及它 `predecessor` 指向的 archive 也算"活"
+  （漏掉前者会回收掉 manifest 还在指的对象；漏掉后者会让回滚失去备份）。
 - 其余对象（输掉 CAS 的孤儿段、发布失败的孤儿分片、被新 generation 取代的旧 catalog）
   在**宽限期**之后才回收。
 - `--grace-ms` 默认 1 小时，保护"还在上传的机器"和"刚钉住某个 catalog 的读者"。
@@ -125,6 +127,10 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 ```
 
 导出不含历史链与 commit log —— 它给的是内容，不是考古现场。要完整的历史请依赖桶的持久性与版本控制。
+
+`qm migrate-manifest` 是**形态**迁移（整份 <-> 分片），不是数据搬迁：见「manifest 的存储形态」。
+跨桶搬家的边界同样要注意：**换桶请配独立 `QM_CACHE_DIR`**（见「发布与缓存」），
+并且新桶要从 `--to 2` 还是 `--to 1` 开始，由那边第一次提交的开关决定。
 
 ## 验证状态
 
@@ -294,9 +300,76 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 ### 离上限还有多远
 
 现在没有直接报 manifest 字节数的命令；`qm status --json` 给出 `pages` 与 `tombstones`，
-把两者之和乘以上表的 B/path 即可估算。**达到上限的出路**：scope 是 project 级的，把一个 project
-的内容拆成两个是最直接的解法；真正的解法是按 path 前缀分片 manifest，设计见 `design.md` §6.21
-（**未实现**）。
+把两者之和乘以上表的 B/path 即可估算。**达到上限的出路**有两条：把一个 project 的内容拆成两个
+（scope 是 project 级的，拆开立即可用），或者切到分片形态（下一节），把这条上限变成**每片**的。
+
+## manifest 的存储形态（format 1 / format 2）
+
+一个 scope 的提交点有两种形态，由 `QM_MANIFEST_FORMAT` 决定**写**哪一种，默认 `1`：
+
+| | format 1（默认） | format 2（opt-in） |
+|---|---|---|
+| 提交点 | 一个对象 `manifest.json`，装下全部 path | `manifest.json` 只装**布局**（一组指向分片的引用） |
+| 每次提交移动多少 | 整个 project | 一条 path 所在的那**一片** |
+| `MANIFEST_MAX_BYTES`（1 MiB）约束谁 | 整份对象 | **单片** |
+| `status` 里的 `manifest_format` | `1`，`manifest_shards: 0` | `2`，`manifest_shards: N` |
+
+**读不看这个开关**：读路径按对象自己的形态判别分派，所以一台从不设置它的机器照样能正确读一个
+format 2 的 scope。`qm status --json` 报的是**存储形态**（不是开关的值），迁移前后要看它。
+
+### 什么时候切
+
+- 撞到「manifest 的规模上限」（上面那节）：4 319/3 441 条 path 量级，或者提交开始变得很重
+  （每次提交都要重写整个对象，写放大随 project 线性增长）。
+- 还没撞上限时**不要切**：两种形态的读语义相同，但分片多了一次对象读（根指针 + 1 片），
+  迁移也是一次真实提交。
+
+### 怎么迁移
+
+```bash
+qm status --json | grep manifest_format   # 先看现在是什么形态
+qm migrate-manifest --json                # format 1 -> format 2
+qm status --json | grep manifest_format   # 确认已经切了
+```
+
+- **幂等**：重复跑是 no-op（`already_there: true`），不写任何对象。
+- **可中断/可续跑**：中断只会留下孤儿分片（可复用），提交点要么还是旧的、要么已经指向新的一代；
+  再跑一次补齐。
+- **可回滚**：`qm migrate-manifest --to 1`。
+- **迁移不删除旧对象**：旧 body 被复制到 `manifest/archive/<hash>.json` 并记进根指针的
+  `predecessor`。`qm verify` 会检查这个 archive 还在、且 hash 对得上。
+
+### 怎么回滚
+
+```bash
+qm migrate-manifest --to 1 --json
+```
+
+回滚是**再写一次整份 manifest**：把当前分片 reassemble 成整份形态再 CAS，**不是**把指针换回
+archive。差的这一点是有意的：从 archive 恢复会静默丢掉迁移之后的所有提交。archive 与分片都留在
+桶里（`gc` 把它们算作 live），所以回滚不销毁任何东西，可以来回切。
+
+回滚会被整份形态的上限拒绝——如果 scope 已经长到超过 1 MiB，它只能留在分片形态（或者拆 project）。
+
+### 切形态时会发生什么
+
+两个方向的形态错配都**被拒绝**，报文指向 `qm migrate-manifest`：
+
+- 用 format 2 写一个已有内容的 format 1 scope：拒绝（新根指针只会命名这一次写的片，
+  已有 path 会全部消失）。
+- 用 format 1 写一个 format 2 scope：拒绝（会静默把 scope 的形态翻回去）。**只能读**。
+
+拒绝发生在写出任何对象之前，所以被拒的写是干净的空操作。一台机器的默认设置不会让 scope 换形态：
+换形态只有 `qm migrate-manifest` 一条路。
+
+### 仍然没做到的
+
+- 分片数固定 256、单片 1 MiB ⇒ 单 scope 上限约 **1.1×10⁶** 条 path（**外推，未实测**），再往上要分层。
+- `search` 的可见性校验仍读**全部**分片（设计里说的"只读候选命中的片"没做）。
+- 迁移的最后一次 CAS 会与并发写者互相冲突，靠重试收敛，没有"迁移中"状态位。
+- 真 S3/R2 上未验证：这套断言全部跑在 `InMemory` 上。
+
+详见 `design.md` §6.21。
 
 ## 空输出：`--limit 0` 的两种口径
 

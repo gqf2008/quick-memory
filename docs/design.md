@@ -332,95 +332,147 @@ hits=1
 - manifest 目前是单对象（含全部 path 的当前版本），因此有规模上限。这个上限现在是**实测 + 守卫**：
   约 243 B/path、提交点上限 1 MiB（`MANIFEST_MAX_BYTES`）对应 4 319 条 path，越界时
   `commit_page` 返回 `StoreError::ManifestTooLarge` 并在**写出任何对象之前**拒绝（数字与复跑命令
-  见 `ops.md`「manifest 的规模上限」）。按 path 前缀分片 manifest 的设计见 §6.21，**未实现**。
+  见 `ops.md`「manifest 的规模上限」）。按 path 哈希分片 manifest（**format 2**）见 §6.21：
+  已经实现，`QM_MANIFEST_FORMAT=2` 打开，默认关（默认路径与上面这段逐字节相同）。
 - **本机文件系统不是可用后端**：`object_store` 的 local 后端不支持条件写，探针会在预检阶段直接拒绝
   （这正是"本地文件不能当对象存储语义模型"的可执行证据）。
 
-## 6.21 按 path 前缀分片 manifest（设计，未实现）
+## 6.21 按 path 哈希分片 manifest（已实现：format 2，opt-in）
 
 ### 为什么需要
 
-`manifest.json` 现在是**一个对象**：`Manifest::pages` 与 `Manifest::tombstones` 装下 scope 全部
+`manifest.json` 原来是**一个对象**：`Manifest::pages` 与 `Manifest::tombstones` 装下 scope 全部
 path 的当前版本，所以每次提交都重写整个对象。实测（数字与复跑命令见 `ops.md`「manifest 的规模
 上限」）：path 31 B / title 40 B 的形状下约 **243 B/path**，提交点上限 `MANIFEST_MAX_BYTES`（1 MiB）
-对应 **4 319** 条 path，每条都重写过则 **3 441** 条。越界时 `ProjectStore::commit_page` 现在
-返回 `StoreError::ManifestTooLarge` 并**拒绝**提交，而不是继续长——拒绝是安全的，但它的解法是
-运维把内容拆到第二个 project，而不是让一个 scope 撑到十万级 path。
+对应 **4 319** 条 path，每条都重写过则 **3 441** 条。越界时 `ProjectStore::commit_page` 返回
+`StoreError::ManifestTooLarge` 并**拒绝**提交，而不是继续长——拒绝是安全的，但它的解法过去只有
+"把内容拆到第二个 project"。
 
-### 提交点：根指针仍然是唯一提交点
+format 2 是第二个解法：**把全部 path 换成一份布局**，于是提交点只随分片数增长（有界），而每次
+提交只移动它要改的那一片。
 
-**硬约束 #3 不放松**：一个 scope 仍然只有**一个** CAS 提交点（§3「权威层」的原话是"唯一提交点是
-每个 project 的 `manifest.json`"），只是它从"装全部数据的对象"变成"只装指针的对象"：
+### 开关：读按存储形态，写按配置
+
+`QM_MANIFEST_FORMAT=1|2`，默认 **1**（整份对象，与 format 2 之前逐字节一致：`format` 字段在
+整份形态下不落盘）。这个开关**只决定写**：
+
+- **读**永远按对象自己的 `format` 判别分派，不看开关。所以一台从不设置它的机器照样能正确读一个
+  format 2 的 scope；一台设置了 2 的机器也能读 format 1 的 scope。这是"向后兼容读"的实现方式，
+  也是为什么没有"用开关回滚读"这条路——回滚是一次真实的写（见下）。
+- **写**必须与 scope 已经存储的形态一致，两个方向都被拒绝（见「形态守卫」）。
+
+`qm status` 报的是**存储形态**（`manifest_format` / `manifest_shards`），不是开关的值。
+
+### 对象布局
 
 ```
-manifest/root.json                      # 唯一提交点，可变对象，CAS
+manifest.json                        # 唯一提交点；可变对象，CAS；`format: 2`
   schema, format, workspace_id, project_id, seq, updated_at_ms
-  shards: [ { key, content_hash, path_count, min_path, max_path } ]
-  predecessor                       # 迁移前那一代的 key 与 seq，供回滚
+  shards: [ { shard, key, content_hash, path_count } ]
+  predecessor: { format, seq, key, content_hash } | null
 
-manifest/shards/<content_hash>.json     # 不可变分片，内容寻址
-  pages: { <path>: PageEntry }, tombstones: { <path>: Tombstone }
+manifest/shards/<content_hash>.json  # 不可变分片，内容寻址
+  schema, format, workspace_id, project_id, shard, pages, tombstones
+
+manifest/archive/<content_hash>.json # 迁移前那一份整份对象，只增不删
 ```
 
-- **一次提交 = 一次 CAS**：改一个 path 只需要写**它所在的那一片**（新分片对象，内容寻址），
-  再 CAS 根指针把该片指向新 key。根指针的 `seq` 仍然"每次成功 CAS 恰好 +1"，`Manifest::next_seq`
-  的语义不变，硬约束 #5 的"能证明覆盖到哪个时间点"仍然由它承载。
-- **分片不可变、且内容寻址**：像页面对象一样，所以"对象已上传、根指针 CAS 未提交"只留下孤儿，
-  和今天一样不会留下半真。
-- **根指针是唯一读到"当前状态"的地方**：读者拿到某一代 `shards` 列表就拿到一个一致快照；
-  分片不原地改写，所以不存在"读到一半另一半变了"。
-- **新增 `format` 判别字段**：今天的 `Manifest` 只有 `schema: u32`（`MANIFEST_SCHEMA`），一个数字
-  不足以区分"单对象/分片"两种形态，所以根指针要带明确的形态判别；读路径按它分派。
+- **一次提交 = 一次 CAS**：写新分片（不可变、内容寻址），再 CAS 根指针。根指针的 `seq` 仍然
+  "每次成功 CAS 恰好 +1"，`Manifest::next_seq` 的语义不变。
+- **分片不可变**：输掉 CAS 的尝试留下孤儿分片，和今天的孤儿页面对象一样，不会留下半真。
+- **根指针是唯一读到"当前状态"的地方**：拿到某一代 `shards` 就是拿到一致快照。
+- **`format` 是判别字段**：一个 body 只有两种合法读法，判别读不出来就**拒绝**而不是猜。这条是
+  必需的，不是装饰——根指针按整份 manifest 去读会解码失败，而"解码失败"远好于"读出一个空
+  project"。
 
-### 读路径怎么拼
+### 切分：path 的 SHA-256 首字节，固定 256 片
 
-| 操作 | 需要读什么 |
-|---|---|
-| `commit_page` / `delete_page` | 根指针 + **它要改的那一片**（写新片，CAS 根指针） |
-| `read_page` / `read_page_version` | 根指针 + 按 path 定位的那一片 |
-| `search` 的可见性校验（`Manifest::is_current`） | 根指针 + 候选命中的片（不做这个优化就是全部片） |
-| `recent_pages`、`digest` 的页面段 | 根指针 + **全部分片**（要全局按时间排序） |
-| `verify` 的权威层检查 | 根指针 + 全部分片 |
-| 切分依据 | 稳定的 path 前缀哈希（不按目录——目录数量本身无界） |
+`manifest_shard_index(path) = sha256(path)[0]`，取值 `0..=255`（`MANIFEST_SHARD_COUNT`）。
 
-搜索是唯一有真实优化空间的地方：它已经在候选集上做可见性校验，所以可以只读候选命中的片；
-不这么做，搜索会退化成"每次读全部片"，而搜索是读路径上最热的操作。
+- **只依赖 path**：分片是内容寻址且不可变的，如果索引依赖"scope 里有多少 path"或写入顺序，
+  加一条 path 就会让别的 path 换片、连带重写每一片经过的分片。只依赖 path 就没有这个问题：
+  一条 path 的分片在它的一生里不变。
+- **固定片数而不是"每 N 条一片"**：根指针的大小由片数封顶（最坏 256 条引用），而不是随内容
+  无限增长。代价是单 scope 的 path 上限变成"256 × 单片容量"，见「仍然没做到什么」。
+- 只**物化非空分片**：几条 path 的 scope 只写几个对象，不是 256 个。
 
-### 缓存、ETag/CAS 怎么变
+### 读路径怎么拼（实现状态）
 
-- **CAS 语义一字不改**：根指针仍用 ETag / `If-Match` 提交，冲突处理（重读、重算 `supersedes` 与
-  `page_id`、重试）不变。
-- **ETag 粒度变了**：现在 ETag 覆盖"全部 path"，之后只覆盖"分片布局"。两台机器改**不同片**仍会
-  冲突，因为两者都要写根指针——这是刻意的：牺牲一点并行度，换"永远只有一个提交点"。要消除这个
-  冲突就得引入两阶段提交或分片级独立指针，那会破坏硬约束 #3，不在本设计内。
-- **本地缓存**：分片对象内容寻址，可以像索引分片一样按 `content_hash` 做缓存键；根指针**不进
-  内容缓存**（可变对象，进缓存就会读到旧快照）。当前没有 manifest 缓存，所以这条落地时是新增。
+| 操作 | 读什么 | 证据 |
+|---|---|---|
+| `commit_page` / `delete_page` | 根指针 + **目标那一片** | 插桩断言：一次按 path 的提交读 2 个对象（根 + 片） |
+| `read_page` | 根指针 + 1 片 + 指向的版本对象 | 插桩断言按对象的 **key 集合**比较，不是只比条数 |
+| `page_history` / `read_page_versions` | 根指针 + 1 片，然后沿 WAL 走链 | 同上 |
+| `recent_pages` | 根指针 + **全部分片** | 全局按时间排序需要看全 |
+| `digest` 的页面段 | 只读 commit log，不读 manifest | 与形态无关 |
+| `verify` 的权威层检查 | 根指针 + 全部分片 + 每片的 archive 校验 | 报告 `shards` 与 predecessor 问题 |
+| `gc` 的可达性 | 根指针 + 全部分片（一次读全，然后逐 path 走链时不再重读） | 分片与 archive 都进 live 集合 |
+| `search` 的可见性校验 | 根指针 + **全部分片** | **未做**的优化：设计上可以只读候选命中的片 |
 
-### 旧单对象 → 分片的迁移（幂等、可中断、可回滚）
+### 上限
 
-1. **迁移本身就是一次普通提交**：读旧 `manifest.json`，按 path 前缀切 K 片、各写一个分片对象，
-   再 CAS 根指针为分片形态，并把旧 manifest 的 key 与 `seq` 记进 `predecessor`。**旧对象不删。**
-2. **幂等**：分片内容寻址，重复迁移写出同样的键与字节；根指针已是分片形态时再迁移是 no-op。
-3. **可中断**：中断只留孤儿分片对象（可复用），根指针要么还是旧的、要么已指向新的一代——两者
-   都自洽，没有"迁移到一半"的第三种状态。
-4. **可回滚**：读路径按 `format` 分派，所以两种形态可以同时被读；回滚 = 再 CAS 一次根指针，
-   写回单对象形态并指回 `predecessor` 里的旧对象。旧对象从未被改写，回滚只是指针操作
-   （这正是"迁移不删旧对象"的原因）。
-5. **守卫怎么配合**：分片落地后 `MANIFEST_MAX_BYTES` 只约束**单片**大小；根指针自身随分片数线性
-   增长（每片几十字节），它的上限是另一件事（分片数），本工作项**没有量过**。
+- `MANIFEST_MAX_BYTES`（1 MiB）在 format 2 下按**单片**生效：约束的是"一次提交要移动多少字节"，
+  而一次分片提交移动的是一片，不是整个 project。两条 path 各自 600 KB 时，整份 write 会被拒绝，
+  分片 write 各自通过（`two_shards_can_hold_what_one_whole_manifest_cannot`）。
+- 根指针有独立上限 `MANIFEST_ROOT_MAX_BYTES`（64 KiB）。最坏形状（256 片、key 与 hash 取最长、
+  `path_count` 取 `usize::MAX`）实测远低于它，由
+  `a_root_with_every_shard_fits_under_its_ceiling` 钉住并打印。
+- 两者都**在写出任何对象之前**判定：被拒绝的提交不留下页面对象、WAL 记录或孤儿分片
+  （测试比较拒绝前后的桶内对象集合）。
 
-### 为什么不在本工作项实现
+### 迁移与回滚
 
-- **提交点语义需要拍板**：上面这套（根指针 + 内容寻址分片）只是一种选择。至少还有两种同样合理
-  的形态——(a) 每片各带独立 CAS 指针、放弃全局 `seq`；(b) 换成 LSM 式的多层 manifest。三者的读
-  路径、冲突语义、迁移成本都不同，而 `seq` 是硬约束 #5 的载体，改它需要一个明确的决定，不是这次
-  顺手能定的。
-- **这是协议变更，需要独立工作项**：它同时动 `qm-core`（`Manifest` 的形态）、`qm-store`（提交与读
-  路径）、`qm-cli` / `qm-mcp`（`status` 等观测面），外加一个真实的迁移工具与回滚演练，远超本项
-  写集（`qm-core` / `qm-store` / 文档）。
-- **本项该做的部分已经完成**：把上限从注释变成实测数字（`ops.md`），把"近上限"从静默继续变成
-  显式拒绝（`MANIFEST_MAX_BYTES` + `StoreError::ManifestTooLarge`，拒绝先于任何写入），并留下这份
-  设计。**上限可见、越界会响；分片本体留给下一个工作项。**
+```bash
+qm migrate-manifest              # format 1 -> format 2（默认）
+qm migrate-manifest --json       # from/to/shards/already_there/archive/manifest_seq
+qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
+```
+
+迁移的四个性质，以及它们各自靠什么成立：
+
+1. **幂等**：分片键是内容哈希、根指针由它们确定，所以重复迁移写出同样的键与字节；提交点已是根
+   指针时直接返回 `already_there`，连一片都不读。
+2. **可中断/可续跑**：分片、archive、根指针都在那**一次** CAS 之前写完。在 CAS 之前任何时刻中断，
+   提交点还是原来那份整份对象，留下的是孤儿分片；再跑一次复用它们（测试注入一次 CAS 失败，
+   断言提交点仍是整份形态、scope 照常可读、续跑后对象数不再增长）。
+3. **可回滚**：迁移**不删除**旧对象——它先把旧 body 复制到 `manifest/archive/<hash>.json`，再把
+   `predecessor` 指向它。回滚是**再写一次**整份 manifest：把当前分片 materialize 成整份形态，
+   走一次 CAS（不是"把指针换回旧对象"）。
+   这一点是刻意的：从 archive 恢复会静默丢掉迁移之后的所有提交，materialize 不会。
+   archive 与分片都留在桶里（`gc` 也把它们算成 live）。
+4. **迁移期间不阻塞读**：读按 `format` 分派，所以整份与分片两种形态同时可读。写竞争由 CAS 重试
+   兜住（迁移与写者互不协调，见下）。
+
+一个**从未提交过**的 scope 没有整份对象可转换：迁移会写一个空根指针，把形态**声明**下来
+（`create`，不会覆盖期间落地的提交）。反之，一个 scope 也可以在 `QM_MANIFEST_FORMAT=2` 下由第一次
+提交**出生即分片**：这种根指针没有 `predecessor`，也没有 archive。
+
+### 形态守卫（两个方向都拒绝）
+
+| 写入形态 | scope 存储形态 | 结果 |
+|---|---|---|
+| 1 | 1 | 正常，与 format 2 之前逐字节相同 |
+| 2 | 2 | 正常 |
+| 2 | 1（已有内容） | **拒绝** `ManifestFormMismatch`：新根指针只会命名这一次写的片，scope 里已有的 path 会全部从 project 消失 |
+| 1 | 2 | **拒绝** `ManifestFormMismatch`：materialize 再写整份不会丢 path，但会**静默换掉** scope 的形态（一台用默认设置偶然写一次就会翻转），下一次分片写又要被拒 |
+| 2 | 无提交点 | 允许：没有东西可丢，第一次提交可以出生即分片 |
+
+报文直接给出出路（`qm migrate-manifest` 或"用存储形态写"），并且拒绝发生在写出任何对象之前。
+
+### 仍然没做到什么
+
+1. **单 scope 的 path 上限只是变成了另一个上限**：256 片 × 每片 1 MiB ≈ 243 B/path ⇒ 约
+   **1.1×10⁶** 条 path（**外推，没有实测**，也没有分层结构）。再往上需要分片分层或按 path 范围
+   再切一层，本工作项不做。
+2. **`search` 的可见性校验仍读全部分片**：设计表里写的"只读候选命中的片"没有实现。搜索是读路径
+   上最热的操作，这一项的成本随片数线性增长（片数有 256 的上限）。
+3. **迁移不是在线免竞争的**：迁移的最后一次 CAS 会与并发写者互相冲突，靠双方重试收敛，没有
+   "迁移期间暂停写"的协调机制，也没有"迁移中"的状态位。
+4. **出生即分片的 scope 没有 archive**，因此没有"字节级回到迁移前"的东西——它本来就没有迁移前。
+5. **format 1 的写者不能写 format 2 的 scope**（只能读）。混合部署时，升级顺序是先升读侧、
+   要写新形态的人显式设置开关。
+6. **真 S3/R2 未验证**：本工作项全部断言跑在 `InMemory` 上，桶的 listing/写入与真实 RTT 未端到端。
+7. **跨平台未验证**：只在 macOS 本机跑过。
 
 ## 6.6 采集与编译（S4 已实现）
 
@@ -463,7 +515,8 @@ qm write-page --path notes/raft.md --body "leader election"
 qm read-page  --path notes/raft.md
 qm delete-page --path notes/raft.md
 qm compact                             # 租约保护的全量重建
-qm status                              # pages / tombstones / splits / sessions
+qm status                              # pages / tombstones / manifest 形态 / splits / sessions
+qm migrate-manifest                    # manifest 整份 <-> 分片（--to 1 回滚）
 qm sessions
 ```
 
@@ -836,7 +889,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 回收：可达性分析 + 宽限期 + dry-run 默认；live 页面、历史链、会话链在回收后仍可读。
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
-- `qm` CLI 26 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
+- `qm` CLI 28 个顶层子命令可用（含 `handoff` 的 4 个子动作）；命令逻辑在内存桶上做了端到端测试（无需凭据）。
 - MCP stdio 服务器已实现并通过协议级回环测试（25 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
@@ -871,6 +924,13 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 一台"从未见过当前状态"的机器（全新句柄、只共享桶）能读到最新版本并继续提交第 4 个版本。
 - 模拟"上传后崩溃"：重试复用同一页面对象，不报错、不产生重复版本。
 - 同 key 已存在但内容不同 → `Corrupt` 失败关闭。
+- **format 2（分片 manifest，opt-in）**：同一条写入序列在整份与分片两种形态下，
+  `read_page` / `page_history` / `version_at` / `recent_pages` / `digest` / `is_current` 逐条相同
+  （表驱动比较，含被删 path 与从未存在的 path）。插桩断言按 path 的读只取"根指针 + 1 片"，
+  而 recency listing 取"根指针 + 全部分片"。并发提交仍只一个 CAS 赢：输掉的那次留下孤儿分片，
+  `seq` 不被消耗（三个成功 CAS 拿到 1/2/3，无空洞）。迁移幂等、可中断续跑、可回滚
+  （回滚 materialize 当前状态，不丢迁移之后的写入）；两个方向的形态错配都在写出任何对象之前被拒。
+  见 §6.21。
 - 多机场景探针 `manifest-probe`（先做 CAS 预检，再跑场景并全量复核）；local 后端在预检阶段被明确拒绝。
   WAL 那一项按**覆盖**判：每个已提交版本都必须能在 WAL 里找到（按 page id 做集合包含），
   **不是**条数相等——`read_wal` 返回的是桶里有的集合，丢失 CAS 的尝试会留下 manifest 从不指向的记录
