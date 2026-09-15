@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Parser;
-use qm_cli::{Cli, Context as CommandContext, build_bucket_from_env, execute};
+use qm_cli::{
+    Cli, Context as CommandContext, bucket_identity_from_env, build_bucket_from_env, execute,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,6 +25,10 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join(format!("qm-cache-{}", cli.writer)));
     let bucket = build_bucket_from_env()?;
+    // Local caches record facts about a bucket, so their keys have to name it:
+    // the same cache directory is otherwise reused across buckets, and a
+    // watermark that describes one bucket silently suppresses a publish into
+    // another.
     let ctx = CommandContext::new(
         bucket,
         &cli.workspace,
@@ -31,7 +37,8 @@ async fn main() -> Result<()> {
         cache_dir,
         now_ms,
         cli.json,
-    )?;
+    )?
+    .with_bucket_identity(bucket_identity_from_env());
     let output = execute(&cli, ctx).await?;
     println!("{output}");
     Ok(())

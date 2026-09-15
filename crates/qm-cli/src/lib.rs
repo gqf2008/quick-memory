@@ -386,6 +386,31 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
     Ok(Arc::new(builder.build().context("building S3 client")?))
 }
 
+/// Identity of the bucket named by the environment.
+///
+/// Derived from the same endpoint and bucket name [`build_bucket_from_env`]
+/// builds its client from, so a cache key can never describe a different
+/// bucket than the one being written to. Returns an empty string when nothing
+/// names a bucket, which callers read as "unknown"; calling this after
+/// `build_bucket_from_env` succeeded means that cannot happen.
+#[must_use]
+pub fn bucket_identity_from_env() -> String {
+    fn env_first(names: &[&str]) -> Option<String> {
+        names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+
+    let endpoint = env_first(&["QM_S3_ENDPOINT", "R2_ENDPOINT"]).unwrap_or_default();
+    let bucket = env_first(&["QM_S3_BUCKET", "R2_BUCKET"]).unwrap_or_default();
+    if endpoint.is_empty() && bucket.is_empty() {
+        return String::new();
+    }
+    format!("{endpoint}\u{0}{bucket}")
+}
+
 /// Flatten every control character to a space.
 ///
 /// A single record is a single line in this CLI's output, and titles, paths and
@@ -465,6 +490,15 @@ pub struct Context {
     pub writer: WriterId,
     /// Cache directory for materialised splits.
     pub cache_dir: PathBuf,
+    /// Which bucket this context points at, for cache keys that must not be
+    /// shared across buckets.
+    ///
+    /// Every cache key that records a fact *about a bucket* has to name that
+    /// bucket, or the same cache pointed at a second bucket will answer for
+    /// the first one. An empty value means "unknown": cache keys then fall
+    /// back to naming the scope alone, which is only correct for a machine
+    /// that never talks to more than one bucket.
+    pub bucket_identity: String,
     /// Where hook events are spooled when the bucket cannot be reached.
     pub spool_dir: PathBuf,
     /// Timestamp recorded on this command's writes.
@@ -493,6 +527,7 @@ impl Context {
         Ok(Self {
             project: ProjectStore::new(Arc::clone(&bucket), "v1"),
             bucket,
+            bucket_identity: String::new(),
             spool_dir,
             workspace: WorkspaceId::new(workspace)?,
             project_id: ProjectId::new(project)?,
@@ -501,6 +536,18 @@ impl Context {
             now_ms,
             json,
         })
+    }
+
+    /// Declare which bucket this context points at.
+    ///
+    /// Callers that know the endpoint and bucket name should set this; the
+    /// default is "unknown", which keeps cache keys scoped to the project and
+    /// machine only. Any string is accepted — it is hashed into the filename —
+    /// but it must distinguish two buckets that share a cache directory.
+    #[must_use]
+    pub fn with_bucket_identity(mut self, identity: impl Into<String>) -> Self {
+        self.bucket_identity = identity.into();
+        self
     }
 
     fn page(&self, path: &str) -> Result<PagePath> {
@@ -839,12 +886,24 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             } else {
                 watermark.manifest_seq
             };
+            // A watermark is only meaningful for a bucket that actually
+            // holds what this machine published. Point the same cache at a
+            // bucket nobody has built here and the sequence numbers claim
+            // "done" for an index that does not exist; an empty catalog
+            // therefore wins over the watermark, and the publish is full.
+            let catalog = ctx
+                .project
+                .load_catalog(&ctx.workspace, &ctx.project_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let bucket_has_no_splits = catalog.catalog.splits.is_empty();
+            let since = if bucket_has_no_splits { 0 } else { watermark };
             let mut docs = Vec::new();
             for (path, entry) in &loaded.manifest.pages {
                 // Only what changed since this machine last published. Without
                 // the watermark (a fresh cache) everything is republished,
                 // which is wasteful but never wrong.
-                if entry.seq <= watermark {
+                if entry.seq <= since {
                     continue;
                 }
                 let page_path = PagePath::new(path)?;
@@ -890,6 +949,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             )
             .await?;
             write_watermark(&watermark_path, loaded.manifest.seq, embedded)?;
+            // Say why the whole project went in: to a reader comparing against
+            // the previous split set, an unexplained full publish looks like a
+            // regression rather than the recovery it is.
+            let because = if bucket_has_no_splits {
+                "; the bucket held no splits, so this was a full publish"
+            } else {
+                ""
+            };
             Ok(if ctx.json {
                 serde_json::json!({
                     "generation": outcome.generation,
@@ -897,13 +964,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "pages": docs.len(),
                     "manifest_seq": loaded.manifest.seq,
                     "embedded": embedded,
+                    "full_publish": bucket_has_no_splits,
                 })
                 .to_string()
             } else if outcome.already_present {
-                format!("split already published ({} pages)", docs.len())
+                format!("split already published ({} pages){because}", docs.len())
             } else {
                 format!(
-                    "published {} page(s) as one split (generation {})",
+                    "published {} page(s) as one split (generation {}){because}",
                     docs.len(),
                     outcome.generation
                 )
@@ -1858,10 +1926,34 @@ struct PublishWatermark {
     embedded: bool,
 }
 
+/// Reduce a bucket identity to a filename-safe tag.
+///
+/// Endpoints are URLs and bucket names carry dots, so the identity is hashed
+/// instead of embedded: it has to survive as a path segment on every
+/// filesystem. FNV-1a is enough for a cache key — this is not a security
+/// boundary — and it costs no dependency for one 8-byte digest.
+fn bucket_identity_tag(identity: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in identity.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn publish_watermark_path(ctx: &Context) -> PathBuf {
-    ctx.cache_dir.join(format!(
-        "publish-{}-{}-{}.json",
+    let scope = format!(
+        "publish-{}-{}-{}",
         ctx.workspace, ctx.project_id, ctx.writer
+    );
+    if ctx.bucket_identity.is_empty() {
+        // Unknown bucket: keep the pre-existing scope-only name so a cache
+        // written before bucket identities existed is still found.
+        return ctx.cache_dir.join(format!("{scope}.json"));
+    }
+    ctx.cache_dir.join(format!(
+        "{scope}-{}.json",
+        bucket_identity_tag(&ctx.bucket_identity)
     ))
 }
 
@@ -2157,6 +2249,30 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    /// A context pinned to one bucket identity.
+    ///
+    /// `context` keeps the "unknown bucket" default, which is the behaviour a
+    /// single-bucket machine has always had; tests that model two buckets have
+    /// to name them.
+    fn context_on(
+        bucket: Arc<dyn ObjectStore>,
+        cache: &TempDir,
+        writer: &str,
+        bucket_identity: &str,
+    ) -> Context {
+        Context::new(
+            bucket,
+            "acme",
+            "ai-memory",
+            writer,
+            cache.path().to_path_buf(),
+            1_000,
+            false,
+        )
+        .unwrap()
+        .with_bucket_identity(bucket_identity)
     }
 
     fn cli(args: &[&str]) -> Cli {
@@ -3075,6 +3191,230 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(catalog.catalog.splits.len(), 2);
+    }
+
+    /// The watermark records what *this machine* published into *one bucket*.
+    /// Sharing a cache directory must not let one bucket's position suppress a
+    /// publish into another: the second bucket's index stays empty and search
+    /// then answers from nothing, with no error anywhere.
+    #[tokio::test]
+    async fn publish_watermarks_are_scoped_to_the_bucket() {
+        let bucket_a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bucket_b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        // Bucket B is not empty: another machine already published there. That
+        // is what makes the empty-catalog fallback insufficient on its own —
+        // only keying the watermark by bucket fixes this case.
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/from-b.md",
+                "--body",
+                "written on another machine",
+            ]),
+            Context {
+                now_ms: 1_000,
+                ..context_on(Arc::clone(&bucket_b), &cache, "mbp-b", "bucket-b")
+            },
+        )
+        .await
+        .unwrap();
+        let on_b = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 1_000,
+                ..context_on(Arc::clone(&bucket_b), &cache, "mbp-b", "bucket-b")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(on_b.contains("published 1 page(s)"), "{on_b}");
+
+        // The same machine, same scope, same cache directory, bucket A.
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/only-a.md",
+                "--body",
+                "only in bucket a",
+            ]),
+            Context {
+                now_ms: 2_000,
+                ..context_on(Arc::clone(&bucket_a), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+        let a_first = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 2_000,
+                ..context_on(Arc::clone(&bucket_a), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(a_first.contains("published 1 page(s)"), "{a_first}");
+
+        // ... and now the same machine and cache directory against bucket B.
+        let b_from_a = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 3_000,
+                ..context_on(Arc::clone(&bucket_b), &cache, "mbp-a", "bucket-b")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            b_from_a.contains("published 1 page(s)"),
+            "switching buckets must publish, not report up to date: {b_from_a}"
+        );
+        // Bucket B *had* splits, so this is the bucket-scoped watermark doing
+        // the work rather than the empty-catalog fallback.
+        assert!(!b_from_a.contains("held no splits"), "{b_from_a}");
+
+        // What was published is really searchable in bucket B.
+        let found = execute(
+            &cli(&["search", "written on another machine", "--json"]),
+            Context {
+                now_ms: 4_000,
+                ..context_on(Arc::clone(&bucket_b), &cache, "mbp-a", "bucket-b")
+            },
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&found).unwrap();
+        assert_eq!(json["splits_searched"], 2, "{found}");
+        assert_eq!(json["hits"].as_array().unwrap().len(), 1, "{found}");
+
+        // Back on bucket A with nothing new: the incremental behaviour is
+        // intact, per bucket.
+        let a_second = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 5_000,
+                ..context_on(Arc::clone(&bucket_a), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(a_second.contains("nothing to publish"), "{a_second}");
+        assert!(a_second.contains("seq 1"), "{a_second}");
+    }
+
+    /// A watermark is a claim about a bucket, and the claim can be wrong: a
+    /// bucket whose index was never built here holds no splits at all, so
+    /// "up to date" would leave search answering from an empty index while the
+    /// manifest holds pages.
+    #[tokio::test]
+    async fn a_watermark_without_any_splits_in_the_bucket_publishes_anyway() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/one.md",
+                "--body",
+                "the only page",
+            ]),
+            Context {
+                now_ms: 1_000,
+                ..context_on(Arc::clone(&bucket), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+
+        // This machine believes it published through seq 1 while the bucket
+        // holds no splits: the state a wiped index prefix, a fresh bucket or a
+        // cache copied between machines leaves behind.
+        let ctx = context_on(Arc::clone(&bucket), &cache, "mbp-a", "bucket-a");
+        write_watermark(&publish_watermark_path(&ctx), 1, false).unwrap();
+        let catalog = ctx
+            .project
+            .load_catalog(&ctx.workspace, &ctx.project_id)
+            .await
+            .unwrap();
+        assert!(
+            catalog.catalog.splits.is_empty(),
+            "the premise: the bucket holds no splits"
+        );
+
+        let out = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 2_000,
+                ..context_on(Arc::clone(&bucket), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("published 1 page(s)"), "{out}");
+        assert!(
+            out.contains("held no splits"),
+            "a full publish has to say why: {out}"
+        );
+
+        // Once the bucket has an index, the fallback stops firing: this is
+        // still an incremental publish, not a rebuild on every call.
+        let again = execute(
+            &cli(&["publish"]),
+            Context {
+                now_ms: 3_000,
+                ..context_on(Arc::clone(&bucket), &cache, "mbp-a", "bucket-a")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(again.contains("nothing to publish"), "{again}");
+    }
+
+    /// Two buckets must not share a watermark key, and an endpoint must not
+    /// reach the filesystem as a path separator or a Windows-hostile colon.
+    #[test]
+    fn the_watermark_key_names_the_bucket_and_stays_filename_safe() {
+        let cache = TempDir::new().unwrap();
+        let ctx = |identity: &str| {
+            Context::new(
+                Arc::new(InMemory::new()),
+                "acme",
+                "ai-memory",
+                "mbp-a",
+                cache.path().to_path_buf(),
+                1_000,
+                false,
+            )
+            .unwrap()
+            .with_bucket_identity(identity)
+        };
+
+        let endpoint = "https://acct.r2.cloudflarestorage.com";
+        let a = publish_watermark_path(&ctx(&format!("{endpoint}/bucket-a")));
+        let b = publish_watermark_path(&ctx(&format!("{endpoint}/bucket-b")));
+        assert_ne!(a, b, "two buckets must not share a watermark");
+        for path in [&a, &b] {
+            assert_eq!(
+                path.parent().unwrap(),
+                cache.path(),
+                "the key stays one path segment: {}",
+                path.display()
+            );
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(!name.contains(':'), "{name}");
+            assert!(name.starts_with("publish-acme-ai-memory-mbp-a-"), "{name}");
+        }
+        // An unknown identity keeps the pre-existing scope-only name, so a
+        // cache written before buckets were named is still found.
+        assert_eq!(
+            publish_watermark_path(&ctx("")),
+            cache.path().join("publish-acme-ai-memory-mbp-a.json")
+        );
     }
 
     #[tokio::test]
