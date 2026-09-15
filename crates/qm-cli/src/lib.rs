@@ -338,10 +338,11 @@ const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET
 
 /// Read a value out of the process environment.
 ///
-/// The single place this crate touches the environment: [`build_bucket_from`]
-/// and [`bucket_identity_from_env`] both take this as their lookup, so the
-/// client and the watermark identity cannot end up consulting different name
-/// tables.
+/// The one place this crate reads the **bucket** environment — `QM_SPOOL_DIR`,
+/// `QM_LLM_BASE_URL` and `QM_SESSION` are read at their own call sites.
+/// [`build_bucket_from`] and [`bucket_identity_from_env`] both take this as
+/// their lookup, so the client and the watermark identity cannot end up
+/// consulting different name tables.
 fn env_lookup() -> impl FnMut(&str) -> Option<String> {
     |name: &str| std::env::var(name).ok()
 }
@@ -3884,10 +3885,13 @@ mod tests {
     /// endpoint/bucket names, or a watermark can name a bucket the client never
     /// writes to.
     ///
-    /// Pinning the four tables alone is not enough: that stays green if
-    /// `build_bucket_from_env` grows its own copy of the name list. So drive
-    /// both paths through the lookup seam and compare the names each one asks
-    /// for, rather than the tables they were written against.
+    /// Pinning the four tables alone is not enough, and neither is this test
+    /// on its own: it drives the lookup seam, so it stays green if
+    /// `build_bucket_from_env` stops delegating and grows its own copy of the
+    /// name list. What it covers is that both paths resolve their names through
+    /// the same constant; what covers the production entry point is
+    /// `tests/cli_entry_conformance.rs`, which runs the real binary, together
+    /// with the one-line delegation in `build_bucket_from_env`.
     #[test]
     fn bucket_identity_and_client_share_the_same_environment_names() {
         assert_eq!(S3_ENDPOINT_ENV_NAMES, &["QM_S3_ENDPOINT", "R2_ENDPOINT"]);
@@ -3902,8 +3906,9 @@ mod tests {
         );
 
         // Answer every name the client walks, so it gets past all four
-        // `require`s and the test sees the whole table it consults. The client
-        // is expected to reject the dummy endpoint; only the questions matter.
+        // `require`s and the test sees the whole table it consults. The builder
+        // does not dial the endpoint, so whether it returns `Ok` or `Err` here
+        // is irrelevant: only the questions it asked are load-bearing.
         let mut client_asked: Vec<String> = Vec::new();
         let _ = build_bucket_from(|name| {
             client_asked.push(name.to_string());

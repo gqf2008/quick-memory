@@ -173,14 +173,17 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 
 | 命令 | `--limit 0` 的人类可读输出 |
 |---|---|
-| `qm recent --limit 0`（列表类） | **空串**（零行） |
+| `qm recent --limit 0`（列表类） | **空串**（零数据行） |
 | `qm digest --limit 0`（报告类） | `no entries shown: --limit 0 caps every digest section` |
 
 判据是输出的**形状**，不是输出的**内容**：
 
 - **列表类**（`qm recent`）输出的是"每行一条记录"的结果集。
-  要零条就是零行，调用方可以直接当空集消费（管道、脚本、`wc -l`），不必先剥掉一句散文。
+  要零条就是零**数据行**，不必先剥掉一句散文。
   它**不会**因此说 `no pages`——"你要了零条"和"这个项目是空的"是两回事。
+  注意命令本身仍会输出一个换行（`main` 无条件 `println!`），所以
+  `qm recent --limit 0 | wc -l` 得的是 **1**，不是 0；要拿可以整段消费的空集，
+  用 `qm recent --limit 0 --json`（输出 `[]`）。
 - **报告类**（`qm digest`）输出的是**固定三段**报告，段标题（`pages` / `sessions` /
   `handoffs`）本身就是信息。`--limit` 是**每段**的封顶，`--limit 0` 会把三段一起清空；
   此时若打 `no recent activity`，就把"你要了零条"谎报成"窗口里什么都没有"。
