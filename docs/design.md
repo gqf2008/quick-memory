@@ -82,6 +82,23 @@ CAS 层把两者都归一为"条件未满足"，但**不接受**泛化的后端�
 `qm-store::verify_conditional_writes` 是这套契约的守门检查，包含两个反向步骤（陈旧 ETag 必须被拒、
 已消费的 ETag 必须被拒），并有阳性对照测试（一个"接受一切"的后端必须被该检查报错）。
 
+### 5.1 R2 特有行为：按构造免疫，而不是按经验祈祷
+
+R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD 不返回。CAS 层对此的处理是**规则**而非巧合：
+
+- 对象身份一律取 ETag；`UpdateVersion.version` **永不**由 PUT 响应回填（见 `ObjectVersion::as_update_version`）。
+- 因此"PUT 带 version、GET 不带"不会造成版本比较失败——这正是最初差点写错的地方。
+- 两条回归把它钉住（无需真桶即可运行）：
+  - `an_r2_style_put_only_version_still_commits`：构造一个"PUT 形状"的版本（ETag + 只此一次的 version），
+    用它做条件写必须成功，且后续读回的版本用于下一次更新时只带 ETag；
+  - `a_version_without_etag_fails_closed`：只有 version 没有 ETag 的后端会被拒绝（`MissingEtag`），
+    而不是被当成"版本没变"。
+- 探针会把这一特征直接印出来：`cas-conformance` 第一步同时报告 PUT 返回的 ETag 与 version，
+  在 R2 上会看到 `version=Some(...)`，在 MinIO 上是 `version=None`。
+
+**仍然没有做的**：在真 R2 上跑一次 `cas-conformance`。上面是"按构造 + 回归"级别的证据，
+不是"在 R2 上观测到的证据"，两者不应混为一谈。
+
 ## 6. 索引与检索
 
 **分片发布（每个写入方独立）**

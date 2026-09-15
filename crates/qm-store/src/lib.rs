@@ -544,6 +544,56 @@ mod tests {
         assert!(names.contains(&"consumed-etag-rejected"));
     }
 
+    /// R2 returns a `x-amz-version-id` on PUT that later GET/HEAD calls do not
+    /// repeat. The CAS layer must be immune: it identifies objects by ETag and
+    /// never feeds a PUT-only version back into a conditional write.
+    #[tokio::test]
+    async fn an_r2_style_put_only_version_still_commits() {
+        let store = mem_store();
+        let key = "r2-style";
+        let created = store.create(key, Bytes::from_static(b"v1")).await.unwrap();
+
+        // Shape the version the way R2 hands it back from a PUT: same ETag,
+        // plus a version id that no read will ever repeat.
+        let put_shaped = ObjectVersion::new(
+            created.etag.clone(),
+            Some("some-put-only-version-id".to_string()),
+        );
+        let updated = store
+            .update(key, Bytes::from_static(b"v2"), &put_shaped)
+            .await
+            .expect("a PUT-only version id must not break the next conditional write");
+        assert!(updated.etag.is_some());
+        assert_ne!(
+            updated.etag, created.etag,
+            "the identity must move on write"
+        );
+
+        // And the read-back identity the next writer would use is ETag-only.
+        let (bytes, read_back) = store.read(key).await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"v2"));
+        assert!(read_back.etag.is_some());
+        let update_version = read_back.as_update_version().unwrap();
+        assert_eq!(update_version.e_tag, read_back.etag);
+        assert!(
+            update_version.version.is_none(),
+            "a version id must never be inferred from a PUT"
+        );
+    }
+
+    /// A backend that reports versions but no ETags cannot support CAS, and the
+    /// layer must say so instead of pretending a version is an identity.
+    #[tokio::test]
+    async fn a_version_without_etag_fails_closed() {
+        let store = mem_store();
+        let version_only = ObjectVersion::new(None, Some("version-1".to_string()));
+        let error = store
+            .update("anything", Bytes::from_static(b"v"), &version_only)
+            .await
+            .expect_err("conditional writes require an ETag");
+        assert!(matches!(error, StoreError::MissingEtag), "{error:?}");
+    }
+
     /// A backend that accepts every write. The probe must reject it — this is
     /// the positive control for the checker itself.
     struct PermissiveBackend {
