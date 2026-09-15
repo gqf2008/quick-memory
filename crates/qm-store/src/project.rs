@@ -4744,6 +4744,18 @@ mod tests {
     const MEASURED_BYTES: [usize; 4] = [24_217, 242_019, 2_429_021, 24_389_023];
     /// Every entry rewritten, 10 000 paths.
     const MEASURED_REWRITTEN_BYTES: usize = 3_049_021;
+    /// How far below 10 000 paths the rewritten shape's own marginal is
+    /// measured. Two sizes of the *same* shape, so the number is a marginal and
+    /// not a difference against the fresh row.
+    const REWRITTEN_MARGINAL_STEP: usize = 1_000;
+    /// What one more path costs in the rewritten shape, at 10 000 paths.
+    ///
+    /// `docs/ops.md` prints this in the rewritten row's marginal column. The
+    /// delta against the *fresh* row at the same path count is a different
+    /// number — the per-path price of `supersedes`, pinned at 62 by
+    /// `manifest_bytes_are_accounted_for_field_by_field` — and confusing the
+    /// two is what left that table's number unreproducible.
+    const MEASURED_REWRITTEN_MARGINAL: usize = 305;
     /// Paths that fit in [`MANIFEST_MAX_BYTES`], fresh and all-rewritten.
     const PATHS_AT_CEILING: usize = 4_319;
     const PATHS_AT_CEILING_REWRITTEN: usize = 3_441;
@@ -4776,10 +4788,22 @@ mod tests {
                 sizes[index] / count
             );
         }
+        // The rewritten row's own marginal — one more path of that shape at
+        // that size — measured against the same shape one step below, so the
+        // column in `docs/ops.md` is a number this command produced rather than
+        // one a reader is left to derive.
+        let rewritten_below = manifest_bytes(&manifest_with_paths(
+            MEASURED_PATH_COUNTS[2] - REWRITTEN_MARGINAL_STEP,
+            true,
+        ));
+        let rewritten_marginal = (rewritten - rewritten_below) / REWRITTEN_MARGINAL_STEP;
         println!(
-            "10_000 rewritten,{rewritten},{},{}",
-            (rewritten - sizes[2]) / 10_000,
+            "10_000 rewritten,{rewritten},{rewritten_marginal},{}",
             rewritten / 10_000
+        );
+        assert_eq!(
+            rewritten_marginal, MEASURED_REWRITTEN_MARGINAL,
+            "docs/ops.md quotes this as the rewritten row's marginal B/path"
         );
 
         assert_eq!(
