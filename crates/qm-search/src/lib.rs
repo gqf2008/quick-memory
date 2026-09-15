@@ -777,9 +777,16 @@ pub async fn search_workspace_tuned(
     let mut stream_candidates = std::collections::BTreeMap::new();
     for project_id in projects {
         let project_cache = cache_root.join(format!("{workspace_id}-{project_id}"));
-        // Each project fuses its own streams (vector included) and the
-        // per-project lists are fused again below. The recency prior is still
-        // applied once, after the cross-project fusion.
+        // Each project fuses its own streams and the per-project lists are
+        // fused again below. Neighbour expansion and the vector stream are
+        // deliberately per-project; the recency prior is not, because applying
+        // it here as well would count the same prior once per project. The
+        // caller's remaining knobs are forwarded, so `--no-vector` and
+        // `--no-neighbors` mean the same thing with `--global` as without it.
+        let inner = SearchTuning {
+            recency_half_life_ms: 0,
+            ..*tuning
+        };
         let outcome = search_project_tuned(
             store,
             project_store,
@@ -788,7 +795,7 @@ pub async fn search_workspace_tuned(
             &project_cache,
             query,
             limit,
-            &SearchTuning::default(),
+            &inner,
             embedder,
         )
         .await?;
@@ -3005,6 +3012,83 @@ mod tests {
         assert!(
             format!("{error:#}").contains("not a whole number"),
             "{error:#}"
+        );
+    }
+
+    /// The workspace search fuses one list per project, so the per-project
+    /// knobs have to survive that hop: `--global --no-vector` that quietly ran
+    /// the vector stream anyway would be a flag that does nothing.
+    #[tokio::test]
+    async fn workspace_search_forwards_the_vector_switch_to_each_project() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let embedder = fake_for_corpus();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&embedder),
+        )
+        .await;
+
+        async fn run(
+            bucket: &Arc<dyn ObjectStore>,
+            workspace: &WorkspaceId,
+            project_id: &ProjectId,
+            tuning: SearchTuning,
+            embedder: &dyn Embedder,
+        ) -> SearchOutcome {
+            search_workspace_tuned(
+                bucket.as_ref(),
+                &reader(bucket),
+                workspace,
+                std::slice::from_ref(project_id),
+                TempDir::new().unwrap().path(),
+                QUERY,
+                10,
+                &tuning,
+                Some(embedder),
+            )
+            .await
+            .unwrap()
+        }
+
+        let off = run(
+            &bucket,
+            &workspace,
+            &project_id,
+            SearchTuning {
+                now_ms: 0,
+                vector_search: false,
+                ..Default::default()
+            },
+            &embedder,
+        )
+        .await;
+        assert!(
+            !off.stream_candidates.contains_key("vector"),
+            "the switch must reach the per-project search: {off:?}"
+        );
+
+        // Positive control: the same call with the stream on does run it.
+        let on = run(
+            &bucket,
+            &workspace,
+            &project_id,
+            SearchTuning {
+                now_ms: 0,
+                ..Default::default()
+            },
+            &embedder,
+        )
+        .await;
+        assert!(
+            on.stream_candidates.contains_key("vector"),
+            "the vector stream must be reachable through a workspace search: {on:?}"
         );
     }
 
