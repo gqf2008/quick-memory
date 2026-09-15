@@ -8,6 +8,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+mod model;
+
+pub use model::{MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion, WalEntry, derive_page_id};
+
 /// Version prefix of the object layout. Bumping it is a breaking change.
 pub const KEY_ROOT: &str = "v1";
 
@@ -92,6 +96,16 @@ id_type!(WriterId, "writer");
 id_type!(PageId, "page");
 id_type!(ObservationId, "observation");
 
+impl PageId {
+    /// Construct from a value this crate derived, bypassing validation.
+    ///
+    /// Only for values whose charset is known by construction (a hex digest);
+    /// everything user-supplied goes through `PageId::new`.
+    pub(crate) fn trusted(raw: String) -> Self {
+        Self(raw)
+    }
+}
+
 /// A page path relative to its project, e.g. `notes/raft.md`.
 ///
 /// Rejects traversal, absolute paths, backslashes and control characters: the
@@ -173,7 +187,20 @@ impl KeyLayout {
     /// Per-project commit point: the only object whose CAS makes writes visible.
     #[must_use]
     pub fn manifest(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
-        format!("{}/manifest.pb", self.scope_prefix(ws, proj))
+        format!("{}/manifest.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Committed write-ahead record. The key is the derived event id, so a
+    /// replayed commit writes the same object instead of a duplicate.
+    #[must_use]
+    pub fn wal_entry(&self, ws: &WorkspaceId, proj: &ProjectId, event_id: &str) -> String {
+        format!("{}/wal/{event_id}.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Prefix holding every WAL record of a project.
+    #[must_use]
+    pub fn wal_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/wal", self.scope_prefix(ws, proj))
     }
 
     /// Immutable page body version.
@@ -202,13 +229,16 @@ impl KeyLayout {
     /// CAS head pointing at the current index catalog version.
     #[must_use]
     pub fn catalog_head(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
-        format!("{}/index/head.pb", self.scope_prefix(ws, proj))
+        format!("{}/index/head.json", self.scope_prefix(ws, proj))
     }
 
     /// Immutable index catalog version.
     #[must_use]
     pub fn catalog_version(&self, ws: &WorkspaceId, proj: &ProjectId, seq: u64) -> String {
-        format!("{}/index/catalog/{seq:010}.pb", self.scope_prefix(ws, proj))
+        format!(
+            "{}/index/catalog/{seq:010}.json",
+            self.scope_prefix(ws, proj)
+        )
     }
 
     /// Directory prefix of one writer's split. Every file of the split lives
@@ -299,7 +329,7 @@ mod tests {
         let page = PageId::new("abc").unwrap();
         assert_eq!(
             layout.manifest(&ws(), &proj()),
-            "v1/ws/acme/proj/ai-memory/manifest.pb"
+            "v1/ws/acme/proj/ai-memory/manifest.json"
         );
         assert_eq!(
             layout.page_version(&ws(), &proj(), &path, &page),
@@ -307,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             layout.catalog_version(&ws(), &proj(), 7),
-            "v1/ws/acme/proj/ai-memory/index/catalog/0000000007.pb"
+            "v1/ws/acme/proj/ai-memory/index/catalog/0000000007.json"
         );
         let writer = WriterId::new("mbp-1").unwrap();
         assert_eq!(

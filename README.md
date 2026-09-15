@@ -6,10 +6,11 @@
 
 ## 现状
 
-S0（架构验证）进行中。已经跑通的是**离线可验证的部分**：
+S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**：
 
 - ETag CAS 契约 + 一致性探针（`qm-store`）
 - "另一台机器只有桶访问权也能搜全量"的端到端往返（`qm-search`）
+- 多机并发提交：无覆盖、supersession 链完整、WAL 完整、崩溃重试幂等（`qm-store`）
 
 真 R2 与 Quickwit 的验证需要凭据与二进制，见下。
 
@@ -43,11 +44,17 @@ export QM_S3_FORCE_PATH_STYLE=true      # R2 需要 path-style
 # 1) 条件写一致性：create-if-absent / 陈旧 ETag 必须被拒
 cargo run -p qm-probe --bin cas-conformance
 
-# 2) 跨机器检索：A 构建并上传分片
+# 2) 多机并发提交（先做 CAS 预检，再跑场景并复核）
+cargo run -p qm-probe --bin manifest-probe -- --machines 3 --writes 5
+
+# 3) 跨机器检索：A 构建并上传分片
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 build docs.jsonl
 #    B（另一台机器/另一次运行）只靠桶材料化并查询
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 query "consensus"
 ```
+
+`--local <dir>` 只用于冒烟测试探针本身，**预期会失败**：本机文件系统不支持条件写，
+探针会在预检阶段拒绝它。
 
 `docs.jsonl` 每行一个 `PageDoc`：
 

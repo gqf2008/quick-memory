@@ -22,6 +22,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as OsError, ObjectStore, PutMode, PutPayload, UpdateVersion};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// Identity of an object version, ETag first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +96,15 @@ pub enum StoreError {
     /// The backend returned no version identity for a conditional operation.
     #[error("backend returned no ETag for a conditional operation")]
     MissingEtag,
+    /// Another machine kept winning the commit race for this scope.
+    #[error("commit conflict after {attempts} attempts")]
+    Conflict {
+        /// Attempts made before giving up.
+        attempts: u32,
+    },
+    /// A stored object was unreadable, mismatched, or otherwise inconsistent.
+    #[error("corrupt object: {0}")]
+    Corrupt(String),
     /// Any other backend failure.
     #[error("object store error: {0}")]
     Backend(String),
@@ -108,6 +119,22 @@ impl From<OsError> for StoreError {
             other => Self::Backend(other.to_string()),
         }
     }
+}
+
+mod project;
+
+pub use project::{CommitOutcome, CommitPageRequest, LoadedManifest, ProjectStore, RetryPolicy};
+
+/// Serialize a value for an object body.
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Bytes, StoreError> {
+    serde_json::to_vec(value)
+        .map(Bytes::from)
+        .map_err(|error| StoreError::Corrupt(error.to_string()))
+}
+
+/// Parse an object body.
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &Bytes, key: &str) -> Result<T, StoreError> {
+    serde_json::from_slice(bytes).map_err(|error| StoreError::Corrupt(format!("{key}: {error}")))
 }
 
 /// CAS operations over one object store and one key prefix.

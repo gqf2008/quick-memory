@@ -48,17 +48,20 @@ quick-memory 跑在多机上，这三条全部不可用，因此**索引发布�
 
 ```
 v1/
-├── ws/<ws>/proj/<proj>/
-│   ├── manifest.pb                                  # 唯一提交点（CAS）
-│   ├── pages/<path>/versions/<page_id>.md           # 不可变页面版本
-│   ├── observations/<obs_id>.json                   # 不可变原始观测
-│   ├── index/
-│   │   ├── head.pb                                  # CAS 指针 → 当前 catalog
-│   │   ├── catalog/<generation>.pb                  # 不可变目录版本
-│   │   └── splits/<writer_id>/<seq>/…               # 该写入方发布的分片文件
-│   └── leases/{compact,gc}.pb                       # 可放弃作业的租约
-└── v1/leases/<scope>.pb
+└── ws/<ws>/proj/<proj>/
+    ├── manifest.json                              # 唯一提交点（CAS）
+    ├── wal/<page_id>.json                         # 不可变提交记录
+    ├── pages/<path>/versions/<page_id>.md         # 不可变页面版本
+    ├── observations/<obs_id>.json                 # 不可变原始观测
+    ├── index/
+    │   ├── head.json                              # CAS 指针 → 当前 catalog
+    │   ├── catalog/<generation>.json              # 不可变目录版本
+    │   └── splits/<writer_id>/<seq>/…             # 该写入方发布的分片文件
+    └── leases/{compact,gc}.json                   # 可放弃作业的租约
+v1/leases/<scope>.json
 ```
+
+v1 的编码是 JSON（可读、可调试），扩展名即编码；换编码 = 换根前缀 `v2/`，不做就地格式迁移。
 
 键由 `qm-core` 的 `KeyLayout` 统一派生，标识符与路径在构造时校验一次（拒绝空、`..`、绝对路径、反斜杠、控制字符）。
 
@@ -95,6 +98,30 @@ CAS 层把两者都归一为"条件未满足"，但**不接受**泛化的后端�
 
 **read-your-writes**：本机刚写入但尚未发布分片的内容，由本地尾部（权威对象 + 本地索引）覆盖；
 跨机可见性允许有界滞后，但必须在结果里给出 `covered_until`。
+
+## 6.5 提交协议（S1 已实现）
+
+一次页面写入：
+
+1. 读 `manifest.json`（含版本号）。空 scope 视为 `seq=0` 的空 manifest。
+2. 由 `(path, title, body, supersedes)` 派生 `page_id`（SHA-256），并写入不可变页面对象 `pages/<path>/versions/<page_id>.md`。
+3. 写入不可变 WAL 记录 `wal/<page_id>.json`。
+4. 把新页面写进 manifest，用 `If-Match`（或首次 `If-None-Match: *`）提交。
+5. 冲突 → 重读 manifest、重算 `supersedes` 与 `page_id`、重试。冲突次数上限后返回 `Conflict`。
+
+**WAL 记录只含内容，不含 `seq` 与时间戳**（S1 中被并发测试逼出来的修正）：`seq` 由赢得 CAS 的那次提交分配，
+如果写进 WAL 内容，重试时同一 key 就会写出不同字节，触发"同键不同内容"的 fail-closed。
+代价是 WAL 是**集合而非全序**：全局顺序看 manifest 的 `seq`，单页顺序看 `supersedes` 链。
+将来若需要 as-of 全局时间线，应新增按写入方分区的有序日志，而不是把顺序塞回 WAL 内容。
+
+其它已确定的选择：
+
+- 页面对象与 WAL 记录都用内容寻址的 key：崩溃在"对象已上传、CAS 未提交"之间时，重试**复用**同一对象；
+  如果同 key 已存在但内容不同，直接判 `Corrupt` 失败关闭（内容寻址被破坏比崩溃更值得警惕）。
+- manifest 目前是单对象（含全部 path 的当前版本），因此有规模上限。按 path 前缀分片 manifest 是后续工作，
+  不在 S1 范围；当前实现对该上限没有静默降级。
+- **本机文件系统不是可用后端**：`object_store` 的 local 后端不支持条件写，探针会在预检阶段直接拒绝
+  （这正是"本地文件不能当对象存储语义模型"的可执行证据）。
 
 ## 7. 删除与压缩
 
@@ -133,13 +160,25 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 替换：SQLite（→ CAS 对象 + 派生索引）、git 工作树（→ 不可变版本 + manifest 链）、fs watcher（→ 发布/重建作业）、
 单写者事务（→ 每 scope 一个提交点 + at-least-once 索引 + ack 游标）。
 
-## 11. S0 实证结论（截至本次提交）
+## 11. 实证结论（截至本次提交）
 
 已在本仓库验证（离线，`cargo test`）：
+
+**S0**
 
 - ETag CAS 契约与探针（含阳性对照：接受一切的后端会被探针报错）。
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
+
+**S1（权威层）**
+
+- 4 台机器 × 4 条路径 × 5 个版本 = 80 次提交：`manifest.seq == 80`（没有提交被覆盖），
+  每条链长度 5 且 `supersedes` 逐环相连，WAL 含 80 条互不重复的记录。
+  该测试同时断言**本轮确实发生过 CAS 冲突与重试**（否则它证明不了重试路径）。
+- 一台"从未见过当前状态"的机器（全新句柄、只共享桶）能读到最新版本并继续提交第 4 个版本。
+- 模拟"上传后崩溃"：重试复用同一页面对象，不报错、不产生重复版本。
+- 同 key 已存在但内容不同 → `Corrupt` 失败关闭。
+- 多机场景探针 `manifest-probe`（先做 CAS 预检，再跑场景并全量复核）；local 后端在预检阶段被明确拒绝。
 
 已确认的事实（影响选型）：
 
