@@ -30,7 +30,7 @@ crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
 crates/qm-cli     `qm` 命令行（agent 入口）
-crates/qm-mcp     `qm-mcp` MCP stdio 服务器（25 个 memory_* 工具）
+crates/qm-mcp     `qm-mcp` MCP stdio 服务器（26 个 memory_* 工具）
 ```
 
 ## 命令行
@@ -120,14 +120,14 @@ qm export --to ./exported && qm import --from ./exported
 }
 ```
 
-工具共 **25** 个（`grep -c '#\[tool(' crates/qm-mcp/src/lib.rs`）：
+工具共 **26** 个（`grep -c '#\[tool(' crates/qm-mcp/src/lib.rs`）：
 
 | 分组 | 工具 |
 |---|---|
 | 写入 | `memory_capture` · `memory_consolidate` · `memory_write_page` · `memory_delete_page` |
 | 检索与回顾 | `memory_search` · `memory_recent` · `memory_digest` · `memory_log` |
 | 页面读取 | `memory_read_page` · `memory_history` · `memory_restore` |
-| 索引 | `memory_publish` · `memory_compact` |
+| 索引 | `memory_publish` · `memory_compact` · `memory_maintain` |
 | 会话 | `memory_sessions` · `memory_compact_session` |
 | 交接棒 | `memory_handoff_open` · `memory_handoff_list` · `memory_handoff_claim` · `memory_handoff_done` |
 | 提案与审批 | `memory_propose` · `memory_proposals` · `memory_approve` · `memory_reject` |

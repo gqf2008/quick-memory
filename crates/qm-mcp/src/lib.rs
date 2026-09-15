@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use qm_cli::{Cli, Command, Context as CommandContext, HandoffAction, execute};
+use qm_cli::{Cli, Command, Context as CommandContext, HandoffAction, MaintainFailure, execute};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -203,6 +203,18 @@ pub struct DigestArgs {
     pub limit: Option<usize>,
 }
 
+/// Arguments for `memory_maintain`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MaintainArgs {
+    /// Compiler: `auto` (LLM when QM_LLM_BASE_URL is set, else rules),
+    /// `rules`, or `llm` (which falls back to rules on failure).
+    #[serde(default)]
+    pub compiler: Option<String>,
+    /// Maximum current-scope spooled events to attempt before consolidating.
+    #[serde(default)]
+    pub drain_limit: Option<usize>,
+}
+
 /// Arguments for page-addressed tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PageArgs {
@@ -282,8 +294,8 @@ impl MemoryServer {
         self
     }
 
-    /// Run one command through the shared dispatch and return its JSON.
-    async fn dispatch(&self, command: Command) -> Result<CallToolResult, McpError> {
+    /// Build the shared CLI/context pair for one tool call.
+    fn command_context(&self, command: Command) -> Result<(Cli, CommandContext), McpError> {
         let cli = Cli {
             workspace: self.workspace.clone(),
             project: self.project.clone(),
@@ -304,10 +316,39 @@ impl MemoryServer {
         .map_err(|error| McpError::invalid_params(error.to_string(), None))?
         .with_bucket_identity(self.bucket_identity.clone())
         .with_manifest_format(self.manifest_format);
+        Ok((cli, context))
+    }
+
+    /// Run one command through the shared dispatch and return its JSON.
+    async fn dispatch(&self, command: Command) -> Result<CallToolResult, McpError> {
+        let (cli, context) = self.command_context(command)?;
         let output = execute(&cli, context)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Run `maintain`, preserving its partial-failure report as tool content.
+    ///
+    /// `execute` intentionally returns `MaintainFailure` when the pass did
+    /// some work but one or more sessions or the publish step failed. MCP
+    /// callers need the same complete report the CLI prints, so that case is a
+    /// tool-level error carrying the report rather than an opaque internal
+    /// error.
+    async fn dispatch_maintain(&self, command: Command) -> Result<CallToolResult, McpError> {
+        let (cli, context) = self.command_context(command)?;
+        match execute(&cli, context).await {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<MaintainFailure>() {
+                    Ok(CallToolResult::error(vec![Content::text(
+                        failure.report().to_string(),
+                    )]))
+                } else {
+                    Err(McpError::internal_error(error.to_string(), None))
+                }
+            }
+        }
     }
 }
 
@@ -565,6 +606,26 @@ impl MemoryServer {
         self.dispatch(Command::Compact).await
     }
 
+    /// Drain the spool, consolidate every session, and publish if needed.
+    #[tool(
+        description = "Run one maintenance pass: drain the current scope's hook \
+                       spool, compile every session, and publish changed pages. \
+                       This is the one-shot equivalent of running the CLI \
+                       `qm maintain`; it is not a daemon and does not enter the \
+                       hook fast path. A partial failure is returned as a tool \
+                       error whose content is the complete JSON report."
+    )]
+    async fn memory_maintain(
+        &self,
+        Parameters(args): Parameters<MaintainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch_maintain(Command::Maintain {
+            compiler: args.compiler.unwrap_or_else(|| "auto".to_string()),
+            drain_limit: args.drain_limit.unwrap_or(qm_cli::HOOK_DRAIN_DEFAULT_LIMIT),
+        })
+        .await
+    }
+
     /// Leave a handoff for whoever comes next.
     #[tool(
         description = "Leave a handoff (a baton) for the next session or another \
@@ -747,9 +808,70 @@ impl ServerHandler for MemoryServer {
             .with_instructions(
                 "Shared long-term memory for coding agents, stored in S3/R2. \
                  Capture notable events with memory_capture, compile them with \
-                 memory_consolidate and memory_publish, and search with \
+                 memory_consolidate and memory_publish, run the one-shot \
+                 drain/compile/publish loop with memory_maintain, and search with \
                  memory_search before answering questions about prior work."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use qm_core::{KeyLayout, ProjectId, SessionId, WorkspaceId};
+
+    #[tokio::test]
+    async fn memory_maintain_returns_a_complete_report_as_a_tool_error() {
+        let bucket = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("unit-ws").expect("workspace");
+        let project = ProjectId::new("unit-project").expect("project");
+        let session = SessionId::new("sess-broken").expect("session");
+        let key = KeyLayout::new("v1").session_head(&workspace, &project, &session);
+        bucket
+            .put(&ObjectPath::from(key), b"not-json".to_vec().into())
+            .await
+            .expect("seed corrupt session head");
+
+        let server = MemoryServer::new(
+            bucket,
+            workspace.to_string(),
+            project.to_string(),
+            "unit-writer".to_string(),
+            std::env::temp_dir().join(format!("qm-mcp-unit-{}", std::process::id())),
+        );
+        let result = server
+            .memory_maintain(Parameters(MaintainArgs {
+                compiler: Some("rules".to_string()),
+                drain_limit: Some(10),
+            }))
+            .await
+            .expect("partial failure must be a tool-level result, not a protocol error");
+
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|content| content.text.as_str())
+            .expect("tool error carries report text");
+        let report: serde_json::Value = serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("report must be JSON: {error}: {text}"));
+        assert_eq!(report["failed"], 1, "{report}");
+        assert_eq!(report["failures"][0]["session"], "sess-broken", "{report}");
+        assert!(
+            report["failures"][0]["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{report}"
+        );
+        assert!(
+            report
+                .as_object()
+                .is_some_and(|report| report.contains_key("publish_error")),
+            "{report}"
+        );
     }
 }

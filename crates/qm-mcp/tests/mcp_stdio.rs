@@ -261,6 +261,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_delete_page",
         "memory_publish",
         "memory_compact",
+        "memory_maintain",
         "memory_sessions",
         "memory_status",
         "memory_history",
@@ -284,6 +285,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
             "missing {expected}: {names:?}"
         );
     }
+    assert_eq!(names.len(), 26, "all advertised tools: {names:?}");
     // Every tool must be described well enough for an agent to choose it.
     for tool in listed["result"]["tools"].as_array().unwrap() {
         assert!(
@@ -575,6 +577,76 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
             .as_str()
             .is_some_and(|message| message.contains("portable")),
         "the error must explain the rejection: {bad}"
+    );
+}
+
+/// `memory_maintain` is the one-shot MCP counterpart of `qm maintain`.
+#[test]
+fn mcp_maintain_compiles_publishes_and_is_idempotent() {
+    let cache_dir = std::env::temp_dir().join(format!("qm-mcp-maintain-{}", std::process::id()));
+    std::fs::create_dir_all(&cache_dir).expect("create maintain cache dir");
+    let mut client =
+        Client::start_with(&[("QM_CACHE_DIR", cache_dir.to_str().expect("cache dir"))]);
+    client.handshake();
+
+    let captured = client.call_tool(
+        1,
+        "memory_capture",
+        serde_json::json!({
+            "session": "sess-mcp-maintain",
+            "text": "maintain should compile and publish this observation"
+        }),
+    );
+    assert!(
+        !tool_text(&captured).is_empty(),
+        "capture must return a result"
+    );
+
+    let first = client.call_tool(
+        2,
+        "memory_maintain",
+        serde_json::json!({"compiler": "rules", "drain_limit": 10}),
+    );
+    let first_text = tool_text(&first);
+    let first_json: serde_json::Value = serde_json::from_str(&first_text)
+        .unwrap_or_else(|error| panic!("maintain must return JSON: {error}: {first_text}"));
+    assert_eq!(first_json["consolidated"], 1, "{first_json}");
+    assert_eq!(first_json["published"], true, "{first_json}");
+    assert_eq!(first_json["failed"], 0, "{first_json}");
+    assert_eq!(
+        first_json["publish_error"],
+        serde_json::Value::Null,
+        "{first_json}"
+    );
+
+    let second = client.call_tool(3, "memory_maintain", serde_json::json!({}));
+    let second_text = tool_text(&second);
+    let second_json: serde_json::Value = serde_json::from_str(&second_text)
+        .unwrap_or_else(|error| panic!("second maintain must return JSON: {error}: {second_text}"));
+    assert_eq!(second_json["consolidated"], 0, "{second_json}");
+    assert_eq!(second_json["already_up_to_date"], 1, "{second_json}");
+    assert_eq!(second_json["published"], false, "{second_json}");
+    assert_eq!(
+        second_json["manifest_seq"], first_json["manifest_seq"],
+        "idempotent maintain must not advance the manifest: first={first_json}, second={second_json}"
+    );
+    assert_eq!(
+        second_json["splits"], first_json["splits"],
+        "idempotent maintain must not add splits: first={first_json}, second={second_json}"
+    );
+
+    let searched = client.call_tool(
+        4,
+        "memory_search",
+        serde_json::json!({
+            "query": "maintain should compile",
+            "limit": 5
+        }),
+    );
+    assert!(
+        tool_text(&searched).contains("sessions/sess-mcp-maintain.md"),
+        "maintain must make the page searchable: {}",
+        tool_text(&searched)
     );
 }
 

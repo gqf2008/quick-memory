@@ -585,7 +585,7 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
 ## 6.7 agent 可用面（S5 进行中）
 
 `qm` 是 agent 直接可用的入口，每条命令都是库调用的薄封装——CLI 不引入自己的协议，
-所以 MCP 服务器当前暴露的 25 个 `memory_*` 工具由同一套分发提供。
+所以 MCP 服务器当前暴露的 26 个 `memory_*` 工具由同一套分发提供。
 
 ```bash
 qm capture --session sess-1 --kind tool_use --text "switched to tantivy splits"
@@ -614,11 +614,13 @@ qm sessions
   新增 split，且 `publish_error` 必须为空。连续运行是幂等的，不重复版本或分片。
 - 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
   页面的写/读/删、status/sessions、作用域解析。
+- MCP 的 `memory_maintain` 复用同一个 `qm_cli::execute` 分发；部分失败返回 tool-level error，
+  content 保留完整 JSON report（含 `failures` / `publish_error`），其他错误仍按现有 MCP 错误路径处理。
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- **25 个 `memory_*` 工具**：`capture / consolidate / search / write_page / read_page / delete_page /
-  publish / compact / sessions / status / history / restore / log / recent / digest /
+- **26 个 `memory_*` 工具**：`capture / consolidate / search / write_page / read_page / delete_page /
+  publish / compact / maintain / sessions / status / history / restore / log / recent / digest /
   handoff_open / handoff_list / handoff_claim / handoff_done / verify / compact_session /
   propose / proposals / approve / reject`，沿用 ai-memory 的命名习惯。
 - **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
@@ -729,7 +731,7 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
   相应的测试故意让最旧的提交最先读回来，再断言答案不变。
 - `--since-ms` 与 `--hours` **互斥**而不是按优先级静默取一个；人类输出分 `pages` / `sessions` / `handoffs`
   三段，整窗无活动时输出一句话而不是三个空标题。
-- MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
+- MCP 对应 `memory_digest { since_hours?, limit? }`（共 26 个工具）。MCP 的窗口在**调用时**按墙钟解析，
   而不是按 server 启动时钟——否则长驻 server 的回看窗口会冻在启动那一刻。
 - **S3 协议层的跨进程证据**：`digest-probe` 的 `seed` / `read` 是两个独立进程，`--workspace` /
   `--project` 都是必填项；桩测试用唯一 scope 证明参数确实进入键布局，并证明裸命令会被 Clap 拒绝。`seed` 通过真实
@@ -785,7 +787,7 @@ qm reject  --id <id> --note "not this time"
   中途崩溃只会留下"已批准、id 未知"，**决定不会丢**。
 - 应用走的是普通 `commit_page`：因此仍然 supersede 而非覆盖，历史与回滚照旧可用。
 - 拒绝同样是一次 CAS，只写决定，不碰页面。
-- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 25 个工具）。
+- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 26 个工具）。
 
 ## 6.17 新近度先验：它承诺什么、不承诺什么
 
@@ -1236,7 +1238,7 @@ S3-compatible HTTP 后端，不是 R2；Linux 复验没有跑真桶端到端。
   决策就绪的选项、对照与建议见 §9（**待用户拍板**，本文不构成批准）。
 
 - `qm` CLI 29 个顶层子命令可用（含 `handoff` 的 4 个子动作）；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（25 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（26 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 

@@ -133,10 +133,10 @@ MCP（Codex / Claude Code 等）：
 }
 ```
 
-工具共 **25** 个，完整清单见 [`README.md`](../README.md#mcp-接入)。与检索回顾有关的是
+工具共 **26** 个，完整清单见 [`README.md`](../README.md#mcp-接入)。与检索回顾有关的是
 `memory_search` / `memory_recent` / `memory_digest` / `memory_log`，写入用
 `memory_capture` / `memory_consolidate` / `memory_write_page` / `memory_delete_page` /
-`memory_publish` / `memory_compact`，其余包括 `memory_read_page` / `memory_history` /
+`memory_publish` / `memory_compact` / `memory_maintain`，其余包括 `memory_read_page` / `memory_history` /
 `memory_restore` / `memory_sessions` / `memory_compact_session` / `memory_status` /
 `memory_verify` / `memory_handoff_{open,list,claim,done}` /
 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`。

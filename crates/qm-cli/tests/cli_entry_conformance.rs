@@ -97,6 +97,8 @@ fn documented_cli_and_mcp_counts_match_sources() {
         .unwrap_or_else(|error| panic!("reading README.md: {error}"));
     let design = fs::read_to_string(root.join("docs/design.md"))
         .unwrap_or_else(|error| panic!("reading docs/design.md: {error}"));
+    let quickstart = fs::read_to_string(root.join("docs/quickstart.md"))
+        .unwrap_or_else(|error| panic!("reading docs/quickstart.md: {error}"));
     let source = fs::read_to_string(root.join("crates/qm-mcp/src/lib.rs"))
         .unwrap_or_else(|error| panic!("reading crates/qm-mcp/src/lib.rs: {error}"));
 
@@ -128,6 +130,7 @@ fn documented_cli_and_mcp_counts_match_sources() {
 
     for (label, text, marker) in [
         ("README MCP", readme.as_str(), "** 个（"),
+        ("quickstart MCP", quickstart.as_str(), "** 个，完整清单见"),
         ("design §6.7 MCP", design.as_str(), " 个 `memory_*` 工具"),
         ("design §11 MCP", design.as_str(), " 个工具，与 CLI"),
     ] {
