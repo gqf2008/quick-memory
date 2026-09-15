@@ -16,8 +16,9 @@ use object_store::ObjectStore;
 use qm_core::{
     CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease,
     MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PagePath, PageVersion,
-    ProjectId, SessionHead, SessionId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId,
-    content_hash, derive_handoff_id, derive_page_id, derive_segment_id,
+    ProjectId, Proposal, ProposalState, SessionHead, SessionId, SplitEntry, Tombstone, WalEntry,
+    WorkspaceId, WriterId, content_hash, derive_handoff_id, derive_page_id, derive_proposal_id,
+    derive_segment_id,
 };
 
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -99,6 +100,27 @@ pub struct SessionRewriteOutcome {
     pub already_present: bool,
     /// Attempts consumed, including retries.
     pub attempts: u32,
+}
+
+/// One proposed edit.
+#[derive(Debug, Clone)]
+pub struct ProposalRequest {
+    /// Workspace scope.
+    pub workspace_id: WorkspaceId,
+    /// Project scope.
+    pub project_id: ProjectId,
+    /// Page the edit targets.
+    pub target_path: PagePath,
+    /// Title to write.
+    pub title: String,
+    /// Proposed body.
+    pub body: String,
+    /// Why the change is proposed.
+    pub rationale: String,
+    /// Who proposed it.
+    pub created_by: WriterId,
+    /// Timestamp recorded on the proposal.
+    pub now_ms: i64,
 }
 
 /// One batch of observations to ingest.
@@ -615,6 +637,209 @@ impl ProjectStore {
             handoff.finished_at_ms = Some(now_ms);
             match self.cas.update(&key, encode(&handoff)?, &version).await {
                 Ok(_) => return Ok(handoff),
+                Err(StoreError::Precondition | StoreError::NotFound) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Stage a proposed edit for approval.
+    ///
+    /// Re-proposing identical content is a no-op: the id is derived from what
+    /// would change, so a retry cannot leave two copies of the same request.
+    ///
+    /// # Errors
+    /// Propagates backend failures.
+    pub async fn propose_edit(
+        &self,
+        request: ProposalRequest,
+    ) -> Result<(Proposal, bool), StoreError> {
+        let ProposalRequest {
+            workspace_id,
+            project_id,
+            target_path,
+            title,
+            body,
+            rationale,
+            created_by,
+            now_ms,
+        } = request;
+        let id = derive_proposal_id(&target_path, &title, &body, &rationale, now_ms);
+        let key = self.layout.proposal(&workspace_id, &project_id, &id);
+        let proposal = Proposal {
+            schema: MANIFEST_SCHEMA,
+            id: id.clone(),
+            target_path,
+            title,
+            body,
+            rationale,
+            created_by,
+            created_at_ms: now_ms,
+            state: ProposalState::Pending,
+            decided_by: None,
+            decided_at_ms: None,
+            decision_note: None,
+            applied_page_id: None,
+        };
+        let created = self.create_or_verify(&key, &proposal).await?;
+        Ok((proposal, created))
+    }
+
+    /// Read one proposal.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the id is unknown.
+    pub async fn read_proposal(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+    ) -> Result<(Proposal, ObjectVersion), StoreError> {
+        let key = self.layout.proposal(workspace_id, project_id, id);
+        let (bytes, version) = self.cas.read(&key).await?;
+        let proposal: Proposal = decode(&bytes, &key)?;
+        if proposal.id != id {
+            return Err(StoreError::Corrupt(format!(
+                "{key} holds proposal {}",
+                proposal.id
+            )));
+        }
+        Ok((proposal, version))
+    }
+
+    /// List proposals, oldest first.
+    ///
+    /// # Errors
+    /// Propagates listing and decode failures.
+    pub async fn list_proposals(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Proposal>, StoreError> {
+        let prefix = self.layout.proposal_prefix(workspace_id, project_id);
+        let listed = self.cas.list(&prefix).await?;
+        let mut proposals = Vec::with_capacity(listed.len());
+        for (key, _) in listed {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            let (bytes, _) = self.cas.read(&key).await?;
+            proposals.push(decode::<Proposal>(&bytes, &key)?);
+        }
+        proposals.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(proposals)
+    }
+
+    /// Approve a proposal and apply it.
+    ///
+    /// Order matters. The proposal is claimed (`Pending` → `Approved`) *before*
+    /// the page is written, so two machines racing to approve cannot both apply
+    /// it. The applied page id is recorded afterwards, which means a crash in
+    /// between leaves an approved proposal that says "applied, id unknown" —
+    /// the decision is never lost, and re-applying is a deliberate act rather
+    /// than something a retry does silently.
+    ///
+    /// # Errors
+    /// [`StoreError::HandoffNotOpen`]-style refusals are reported as
+    /// [`StoreError::ProposalNotPending`], plus backend failures.
+    pub async fn approve_proposal(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+        decided_by: &WriterId,
+        now_ms: i64,
+    ) -> Result<(Proposal, u64), StoreError> {
+        let key = self.layout.proposal(workspace_id, project_id, id);
+        let mut attempt = 0u32;
+        let claimed = loop {
+            attempt += 1;
+            let (mut proposal, version) = self.read_proposal(workspace_id, project_id, id).await?;
+            if proposal.state != ProposalState::Pending {
+                return Err(StoreError::ProposalNotPending {
+                    id: id.to_string(),
+                    state: proposal.state,
+                });
+            }
+            proposal.state = ProposalState::Approved;
+            proposal.decided_by = Some(decided_by.clone());
+            proposal.decided_at_ms = Some(now_ms);
+            match self.cas.update(&key, encode(&proposal)?, &version).await {
+                Ok(_) => break proposal,
+                Err(StoreError::Precondition | StoreError::NotFound) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        // Apply the edit through the ordinary page path: it supersedes the
+        // current version rather than overwriting it, and it is visible to the
+        // same authority checks as any other write.
+        let outcome = self
+            .commit_page(CommitPageRequest {
+                workspace_id: workspace_id.clone(),
+                project_id: project_id.clone(),
+                path: claimed.target_path.clone(),
+                title: claimed.title.clone(),
+                body: claimed.body.clone(),
+                writer_id: decided_by.clone(),
+                now_ms,
+            })
+            .await?;
+
+        // Best-effort annotation: losing it costs a lookup, not the decision.
+        let mut annotated = claimed.clone();
+        annotated.applied_page_id = Some(outcome.page_id.clone());
+        let _ = match self.read_proposal(workspace_id, project_id, id).await {
+            Ok((_, version)) => self.cas.update(&key, encode(&annotated)?, &version).await,
+            Err(error) => Err(error),
+        };
+        Ok((annotated, outcome.manifest_seq))
+    }
+
+    /// Reject a proposal; the target path is untouched.
+    ///
+    /// # Errors
+    /// [`StoreError::ProposalNotPending`] when it was already decided.
+    pub async fn reject_proposal(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+        decided_by: &WriterId,
+        now_ms: i64,
+        note: Option<String>,
+    ) -> Result<Proposal, StoreError> {
+        let key = self.layout.proposal(workspace_id, project_id, id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let (mut proposal, version) = self.read_proposal(workspace_id, project_id, id).await?;
+            if proposal.state != ProposalState::Pending {
+                return Err(StoreError::ProposalNotPending {
+                    id: id.to_string(),
+                    state: proposal.state,
+                });
+            }
+            proposal.state = ProposalState::Rejected;
+            proposal.decided_by = Some(decided_by.clone());
+            proposal.decided_at_ms = Some(now_ms);
+            proposal.decision_note = note.clone();
+            match self.cas.update(&key, encode(&proposal)?, &version).await {
+                Ok(_) => return Ok(proposal),
                 Err(StoreError::Precondition | StoreError::NotFound) => {
                     if attempt >= self.retry.max_attempts {
                         return Err(StoreError::Conflict { attempts: attempt });
@@ -2125,6 +2350,156 @@ mod tests {
             !sessions.iter().any(|s| s.as_str() == "sess-orphan"),
             "a session without a committed head must stay invisible"
         );
+    }
+
+    #[tokio::test]
+    async fn a_proposal_changes_nothing_until_it_is_approved() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let path = PagePath::new("notes/raft.md").unwrap();
+        let curator = WriterId::new("curator").unwrap();
+
+        // The page exists in its original form.
+        store
+            .commit_page(request("mbp-a", "notes/raft.md", "original body", 1))
+            .await
+            .unwrap();
+
+        let (proposal, created) = store
+            .propose_edit(ProposalRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                target_path: path.clone(),
+                title: "Raft".into(),
+                body: "rewritten body".into(),
+                rationale: "the curator thinks this is clearer".into(),
+                created_by: curator.clone(),
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(proposal.state, ProposalState::Pending);
+
+        // Proposing the same edit twice is a no-op.
+        let (same, created) = store
+            .propose_edit(ProposalRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                target_path: path.clone(),
+                title: "Raft".into(),
+                body: "rewritten body".into(),
+                rationale: "the curator thinks this is clearer".into(),
+                created_by: curator.clone(),
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(same.id, proposal.id);
+        assert_eq!(store.list_proposals(&ws(), &proj()).await.unwrap().len(), 1);
+
+        // The proposal has changed nothing yet.
+        let current = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.body, "original body");
+
+        // Two machines race to approve: exactly one applies the edit.
+        let approver_a = WriterId::new("human-a").unwrap();
+        let approver_b = WriterId::new("human-b").unwrap();
+        let store_a = machine(&bucket);
+        let store_b = machine(&bucket);
+        let id = proposal.id.clone();
+        let (workspace, project_id) = (ws(), proj());
+        let (a, b) = tokio::join!(
+            store_a.approve_proposal(&workspace, &project_id, &id, &approver_a, 20),
+            store_b.approve_proposal(&workspace, &project_id, &id, &approver_b, 21),
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "a proposal must be decided exactly once: {a:?} {b:?}"
+        );
+        let loser = if a.is_err() { a } else { b };
+        assert!(
+            matches!(loser, Err(StoreError::ProposalNotPending { .. })),
+            "{loser:?}"
+        );
+
+        // The edit is live, and the proposal records how it ended.
+        let applied = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.body, "rewritten body");
+        let (decided, _) = store.read_proposal(&ws(), &proj(), &id).await.unwrap();
+        assert_eq!(decided.state, ProposalState::Approved);
+        assert_eq!(decided.applied_page_id.as_ref(), Some(&applied.page_id));
+        assert!(decided.decided_by.is_some());
+
+        // A decided proposal cannot be rejected afterwards.
+        let too_late = store
+            .reject_proposal(&ws(), &proj(), &id, &approver_a, 30, None)
+            .await;
+        assert!(
+            matches!(too_late, Err(StoreError::ProposalNotPending { .. })),
+            "{too_late:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_proposal_leaves_the_page_alone() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let path = PagePath::new("notes/raft.md").unwrap();
+        store
+            .commit_page(request("mbp-a", "notes/raft.md", "original body", 1))
+            .await
+            .unwrap();
+        let (proposal, _) = store
+            .propose_edit(ProposalRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                target_path: path.clone(),
+                title: "Raft".into(),
+                body: "rewritten body".into(),
+                rationale: "bad idea".into(),
+                created_by: WriterId::new("curator").unwrap(),
+                now_ms: 10,
+            })
+            .await
+            .unwrap();
+
+        let rejected = store
+            .reject_proposal(
+                &ws(),
+                &proj(),
+                &proposal.id,
+                &WriterId::new("human").unwrap(),
+                20,
+                Some("not this time".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.state, ProposalState::Rejected);
+        assert_eq!(rejected.decision_note.as_deref(), Some("not this time"));
+        assert!(rejected.applied_page_id.is_none());
+
+        let current = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.body, "original body",
+            "a rejected proposal must not touch the page"
+        );
+        let manifest = store.load(&ws(), &proj()).await.unwrap().manifest;
+        assert_eq!(manifest.seq, 1, "only the original commit happened");
     }
 
     #[tokio::test]

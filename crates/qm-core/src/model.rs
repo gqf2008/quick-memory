@@ -523,6 +523,82 @@ pub struct CommitRecord {
     pub page_id: Option<PageId>,
 }
 
+/// State of a proposed edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalState {
+    /// Waiting for a human or a policy to decide.
+    Pending,
+    /// Approved and applied to the target path.
+    Approved,
+    /// Refused; the target path is untouched.
+    Rejected,
+}
+
+/// A staged edit to a page, waiting for a decision.
+///
+/// The borrowed design's rule is that learning edits go through an approval
+/// gate: an automated curator may *propose* rewriting a page, but nothing
+/// changes until something with authority says so. The proposal is the whole
+/// record of that: what would change, why, who asked, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Content-derived id.
+    pub id: String,
+    /// Page the edit targets.
+    pub target_path: PagePath,
+    /// Title to write.
+    pub title: String,
+    /// Proposed body.
+    pub body: String,
+    /// Why the change is being proposed.
+    pub rationale: String,
+    /// Who proposed it.
+    pub created_by: WriterId,
+    /// When it was proposed, in milliseconds.
+    pub created_at_ms: i64,
+    /// Where it stands.
+    pub state: ProposalState,
+    /// Who decided, if anyone.
+    pub decided_by: Option<WriterId>,
+    /// When it was decided, in milliseconds.
+    pub decided_at_ms: Option<i64>,
+    /// Free-text reason for a rejection.
+    pub decision_note: Option<String>,
+    /// Page version produced by an approval, once it is known.
+    ///
+    /// Written after the decision (and after the page commit) so a crash in
+    /// between leaves an approved proposal that says "applied, id unknown"
+    /// rather than losing the decision.
+    pub applied_page_id: Option<PageId>,
+}
+
+/// Derive a proposal id from its content, so re-proposing the same edit is a
+/// no-op instead of a duplicate.
+#[must_use]
+pub fn derive_proposal_id(
+    target_path: &PagePath,
+    title: &str,
+    body: &str,
+    rationale: &str,
+    created_at_ms: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"quick-memory/proposal/v1\0");
+    hasher.update(target_path.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(title.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(body.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(rationale.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(created_at_ms.to_le_bytes());
+    hex(&hasher.finalize())
+}
+
 /// A lease on an optional, abandonable job (compaction, garbage collection).
 ///
 /// Leases exist so that "only one machine at a time" is expressible without a

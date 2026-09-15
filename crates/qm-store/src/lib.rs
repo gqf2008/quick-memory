@@ -105,6 +105,14 @@ pub enum StoreError {
     /// A stored object was unreadable, mismatched, or otherwise inconsistent.
     #[error("corrupt object: {0}")]
     Corrupt(String),
+    /// The proposal has already been decided.
+    #[error("proposal {id} is not pending (state: {state:?})")]
+    ProposalNotPending {
+        /// Proposal id.
+        id: String,
+        /// State it is in now.
+        state: qm_core::ProposalState,
+    },
     /// The handoff is no longer open (someone else took it, or it is done).
     #[error("handoff {id} is not open (state: {state:?})")]
     HandoffNotOpen {
@@ -152,8 +160,8 @@ mod verify;
 pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
-    LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome, ReplaceCatalogOutcome,
-    RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
+    LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, ProposalRequest, PublishOutcome,
+    ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
 };
 pub use verify::{Problem, VerifyReport};
 

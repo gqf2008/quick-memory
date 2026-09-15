@@ -170,6 +170,42 @@ pub enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Stage a proposed edit for approval.
+    Propose {
+        /// Target page path.
+        #[arg(long)]
+        path: String,
+        /// Title to write.
+        #[arg(long)]
+        title: String,
+        /// Proposed body; reads stdin when omitted.
+        #[arg(long)]
+        body: Option<String>,
+        /// Why the change is proposed.
+        #[arg(long, default_value = "")]
+        rationale: String,
+    },
+    /// List proposals (default: the pending ones).
+    Proposals {
+        /// Filter: `all`, `pending`, `approved`, or `rejected`.
+        #[arg(long, default_value = "pending")]
+        state: String,
+    },
+    /// Approve a proposal and apply it.
+    Approve {
+        /// Proposal id.
+        #[arg(long)]
+        id: String,
+    },
+    /// Reject a proposal.
+    Reject {
+        /// Proposal id.
+        #[arg(long)]
+        id: String,
+        /// Why it was rejected.
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Leave, list, claim, or finish a handoff.
     Handoff {
         #[command(subcommand)]
@@ -837,6 +873,118 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
         Command::HookDrain { limit } => {
             let (drained, kept) = drain_spool(&ctx, *limit).await?;
             Ok(format!("drained {drained} spooled event(s), kept {kept}"))
+        }
+        Command::Propose {
+            path,
+            title,
+            body,
+            rationale,
+        } => {
+            let target = ctx.page(path)?;
+            let body = match body {
+                Some(body) => body.clone(),
+                None => read_stdin()?,
+            };
+            let (proposal, created) = ctx
+                .project
+                .propose_edit(qm_store::ProposalRequest {
+                    workspace_id: ctx.workspace.clone(),
+                    project_id: ctx.project_id.clone(),
+                    target_path: target.clone(),
+                    title: title.clone(),
+                    body: body.clone(),
+                    rationale: rationale.clone(),
+                    created_by: ctx.writer.clone(),
+                    now_ms: ctx.now_ms,
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&proposal)?
+            } else {
+                format!(
+                    "{} proposal {} for {}",
+                    if created { "staged" } else { "already staged" },
+                    &proposal.id[..12.min(proposal.id.len())],
+                    target.as_str()
+                )
+            })
+        }
+        Command::Proposals { state } => {
+            let wanted = match state.as_str() {
+                "all" => None,
+                "pending" => Some(qm_core::ProposalState::Pending),
+                "approved" => Some(qm_core::ProposalState::Approved),
+                "rejected" => Some(qm_core::ProposalState::Rejected),
+                other => bail!("unknown state {other:?}: use all, pending, approved or rejected"),
+            };
+            let proposals = ctx
+                .project
+                .list_proposals(&ctx.workspace, &ctx.project_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let filtered: Vec<&qm_core::Proposal> = proposals
+                .iter()
+                .filter(|proposal| wanted.as_ref().is_none_or(|want| proposal.state == *want))
+                .collect();
+            Ok(if ctx.json {
+                serde_json::to_string(&filtered)?
+            } else if filtered.is_empty() {
+                "no proposals".to_string()
+            } else {
+                filtered
+                    .iter()
+                    .map(|proposal| {
+                        format!(
+                            "{:?}\t{}\t{}\t{}",
+                            proposal.state,
+                            proposal.id,
+                            proposal.target_path.as_str(),
+                            proposal.rationale
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Command::Approve { id } => {
+            let (proposal, seq) = ctx
+                .project
+                .approve_proposal(&ctx.workspace, &ctx.project_id, id, &ctx.writer, ctx.now_ms)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&proposal)?
+            } else {
+                format!(
+                    "approved {} and applied it to {} at seq {seq}",
+                    &proposal.id[..12.min(proposal.id.len())],
+                    proposal.target_path.as_str()
+                )
+            })
+        }
+        Command::Reject { id, note } => {
+            let proposal = ctx
+                .project
+                .reject_proposal(
+                    &ctx.workspace,
+                    &ctx.project_id,
+                    id,
+                    &ctx.writer,
+                    ctx.now_ms,
+                    note.clone(),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&proposal)?
+            } else {
+                format!(
+                    "rejected {} ({})",
+                    &proposal.id[..12.min(proposal.id.len())],
+                    proposal.target_path.as_str()
+                )
+            })
         }
         Command::Handoff { action } => match action {
             HandoffAction::Open { title, body } => {
@@ -2263,6 +2411,94 @@ mod tests {
             assert_eq!(hit["workspace_id"], "acme");
             assert_eq!(hit["path"], "notes/engine.md");
         }
+    }
+
+    #[tokio::test]
+    async fn proposals_gate_every_edit_through_an_approval() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/raft.md",
+                "--body",
+                "original body",
+            ]),
+            Context {
+                now_ms: 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        // A curator stages an edit; nothing changes yet.
+        let staged = execute(
+            &cli(&[
+                "propose",
+                "--path",
+                "notes/raft.md",
+                "--title",
+                "Raft",
+                "--body",
+                "rewritten body",
+                "--rationale",
+                "clearer",
+            ]),
+            Context {
+                now_ms: 2_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(staged.contains("staged proposal"), "{staged}");
+        let listed = execute(
+            &cli(&["proposals", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let proposals: Vec<qm_core::Proposal> = serde_json::from_str(&listed).unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].state, qm_core::ProposalState::Pending);
+
+        let unchanged = execute(
+            &cli(&["read-page", "--path", "notes/raft.md"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged, "original body", "a proposal must change nothing");
+
+        // Approval applies it, once.
+        let id = proposals[0].id.clone();
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 3_000;
+        let approved = execute(&cli(&["approve", "--id", &id]), ctx).await.unwrap();
+        assert!(approved.contains("applied"), "{approved}");
+        let applied = execute(
+            &cli(&["read-page", "--path", "notes/raft.md"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, "rewritten body");
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 4_000;
+        let again = execute(&cli(&["approve", "--id", &id]), ctx)
+            .await
+            .expect_err("a decided proposal cannot be approved twice");
+        assert!(again.to_string().contains("not pending"), "{again}");
+
+        // And with nothing pending, the default listing is empty.
+        let pending = execute(&cli(&["proposals"]), context(Arc::clone(&bucket), &cache))
+            .await
+            .unwrap();
+        assert_eq!(pending, "no proposals");
     }
 
     #[tokio::test]

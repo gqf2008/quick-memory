@@ -27,7 +27,7 @@ crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
 crates/qm-cli     `qm` 命令行（agent 入口）
-crates/qm-mcp     `qm-mcp` MCP stdio 服务器（19 个 memory_* 工具）
+crates/qm-mcp     `qm-mcp` MCP stdio 服务器（23 个 memory_* 工具）
 ```
 
 ## 命令行
@@ -57,6 +57,11 @@ cargo run -p qm-cli --bin qm -- hook-drain    # 桶恢复后重投本地 spool
 cargo run -p qm-cli --bin qm -- handoff open --title "finish the rebuild" --body "compaction pending"
 cargo run -p qm-cli --bin qm -- handoff list
 cargo run -p qm-cli --bin qm -- handoff claim --id <id>
+
+# 学习性修改走审批：提案不落盘，批准才生效
+cargo run -p qm-cli --bin qm -- propose --path notes/raft.md --title Raft --body "..." --rationale "clearer"
+cargo run -p qm-cli --bin qm -- proposals
+cargo run -p qm-cli --bin qm -- approve --id <id>
 ```
 
 作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，

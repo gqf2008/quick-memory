@@ -13,9 +13,9 @@ mod scrub;
 
 pub use model::{
     CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, Lease,
-    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PageVersion,
-    SessionHead, SplitEntry, Tombstone, WalEntry, content_hash, derive_handoff_id,
-    derive_observation_id, derive_page_id, derive_segment_id,
+    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PageVersion, Proposal,
+    ProposalState, SessionHead, SplitEntry, Tombstone, WalEntry, content_hash, derive_handoff_id,
+    derive_observation_id, derive_page_id, derive_proposal_id, derive_segment_id,
 };
 pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 
@@ -320,6 +320,18 @@ impl KeyLayout {
             "{}/{session}/segments/{segment_id}.json",
             self.session_prefix(ws, proj)
         )
+    }
+
+    /// Staged-edit proposal; deciding it is a CAS on this key.
+    #[must_use]
+    pub fn proposal(&self, ws: &WorkspaceId, proj: &ProjectId, id: &str) -> String {
+        format!("{}/proposals/{id}.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Prefix holding every proposal of a project.
+    #[must_use]
+    pub fn proposal_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/proposals", self.scope_prefix(ws, proj))
     }
 
     /// Immutable-per-state handoff object; claiming it is a CAS on this key.

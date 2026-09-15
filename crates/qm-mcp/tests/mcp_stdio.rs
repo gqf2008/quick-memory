@@ -153,6 +153,10 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_log",
         "memory_compact_session",
         "memory_verify",
+        "memory_propose",
+        "memory_proposals",
+        "memory_approve",
+        "memory_reject",
         "memory_handoff_open",
         "memory_handoff_list",
         "memory_handoff_claim",
@@ -292,6 +296,47 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         verified_json["problems"].as_array().map(Vec::len),
         Some(0),
         "{verified_json}"
+    );
+
+    // A staged proposal changes nothing until it is approved.
+    let proposed = client.call_tool(
+        22,
+        "memory_propose",
+        serde_json::json!({
+            "path": "notes/staged.md",
+            "title": "Staged",
+            "body": "curated body",
+            "rationale": "clearer"
+        }),
+    );
+    let proposed_text = tool_text(&proposed);
+    let proposal: serde_json::Value = serde_json::from_str(&proposed_text)
+        .unwrap_or_else(|error| panic!("propose must be JSON: {error}: {proposed_text}"));
+    let proposal_id = proposal["id"].as_str().expect("proposal id").to_string();
+    assert_eq!(proposal["state"], "pending", "{proposal}");
+
+    let missing = client.call_tool_raw(
+        23,
+        "memory_read_page",
+        serde_json::json!({"path": "notes/staged.md"}),
+    );
+    assert!(
+        !missing["error"].is_null(),
+        "a pending proposal must not create the page: {missing}"
+    );
+
+    let approved = client.call_tool(24, "memory_approve", serde_json::json!({"id": proposal_id}));
+    let approved_text = tool_text(&approved);
+    assert!(approved_text.contains("approved"), "{approved_text}");
+    let created = client.call_tool(
+        25,
+        "memory_read_page",
+        serde_json::json!({"path": "notes/staged.md"}),
+    );
+    assert!(
+        tool_text(&created).contains("curated body"),
+        "{}",
+        tool_text(&created)
     );
 
     // History and restore over the wire: the older body comes back as a new

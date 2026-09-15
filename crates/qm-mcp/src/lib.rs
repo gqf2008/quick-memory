@@ -129,6 +129,38 @@ pub struct CompactSessionArgs {
     pub apply: Option<bool>,
 }
 
+/// Arguments for `memory_propose`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposeArgs {
+    /// Target page path.
+    pub path: String,
+    /// Title to write.
+    pub title: String,
+    /// Proposed body.
+    pub body: String,
+    /// Why the change is proposed.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Arguments for `memory_proposals`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProposalsArgs {
+    /// Filter: `all`, `pending`, `approved`, or `rejected`.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Arguments for `memory_reject`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RejectArgs {
+    /// Proposal id.
+    pub id: String,
+    /// Why it was rejected.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// Arguments for `memory_verify`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct VerifyArgs {
@@ -485,6 +517,72 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Handoff {
             action: HandoffAction::Done { id: args.id },
+        })
+        .await
+    }
+
+    /// Stage a proposed edit instead of writing it.
+    #[tool(
+        description = "Stage an edit to a page as a proposal instead of writing \
+                       it. Use this for learning-driven rewrites: nothing changes \
+                       until memory_approve applies it, and memory_reject leaves \
+                       the page untouched. Re-proposing identical content is a \
+                       no-op."
+    )]
+    async fn memory_propose(
+        &self,
+        Parameters(args): Parameters<ProposeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Propose {
+            path: args.path,
+            title: args.title,
+            body: Some(args.body),
+            rationale: args.rationale,
+        })
+        .await
+    }
+
+    /// List proposals (default: pending).
+    #[tool(
+        description = "List staged proposals. Defaults to the pending ones; pass \
+                       state \"all\" to include approved and rejected."
+    )]
+    async fn memory_proposals(
+        &self,
+        Parameters(args): Parameters<ProposalsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Proposals {
+            state: args.state.unwrap_or_else(|| "pending".to_string()),
+        })
+        .await
+    }
+
+    /// Approve a proposal and apply it.
+    #[tool(
+        description = "Approve a staged proposal and apply it to its target page. \
+                       The decision is claimed before the page is written, so two \
+                       approvers cannot both apply it; the applied version is \
+                       recorded on the proposal afterwards."
+    )]
+    async fn memory_approve(
+        &self,
+        Parameters(args): Parameters<HandoffIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Approve { id: args.id }).await
+    }
+
+    /// Reject a proposal.
+    #[tool(
+        description = "Reject a staged proposal. The target page is not touched, \
+                       and the decision (with an optional note) is recorded."
+    )]
+    async fn memory_reject(
+        &self,
+        Parameters(args): Parameters<RejectArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Reject {
+            id: args.id,
+            note: args.note,
         })
         .await
     }

@@ -250,7 +250,7 @@ qm sessions
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- 19 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
+- 23 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
   publish / compact / sessions / status / history / restore / log /
   handoff_open / handoff_list / handoff_claim / handoff_done / verify /
   compact_session`，沿用 ai-memory 的命名习惯。
@@ -325,6 +325,27 @@ echo "rolled back the index change" | qm hook --session sess-1
 - **输入有界**：stdin 最多读 256 KiB（解析前的 DoS 闸门），随后仍要过入口的 16 KiB + 脱敏。
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
+
+## 6.18 提案与审批：学习性修改不直接落盘
+
+借来的设计里，自动化（curator/auto-improve）**只能提议**，不能直接改记忆；有权限的才好批准。
+这一条在对象存储上同样便宜：
+
+```bash
+qm propose --path notes/raft.md --title Raft --body "..." --rationale "clearer"
+qm proposals [--state pending|approved|rejected|all]     # 默认只看 pending
+qm approve --id <id>      # 批准并应用
+qm reject  --id <id> --note "not this time"
+```
+
+- 提案是 `proposals/<id>.json`，内容寻址（`(path,title,body,rationale,created_at)` 派生）→ 重复提议同一修改是 **no-op**。
+- **在批准之前，目标页面一点没变**（有测试断言正文与 manifest `seq` 都没动）。
+- 批准的顺序是刻意的：**先 CAS 抢占决定权**（`Pending → Approved`），**再**通过普通页面提交路径应用修改。
+  所以两台机器同时批准只有一个成功，输家收到 `proposal ... is not pending`；应用后的页面 id 事后再写回提案——
+  中途崩溃只会留下"已批准、id 未知"，**决定不会丢**。
+- 应用走的是普通 `commit_page`：因此仍然 supersede 而非覆盖，历史与回滚照旧可用。
+- 拒绝同样是一次 CAS，只写决定，不碰页面。
+- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 23 个工具）。
 
 ## 6.17 新近度先验：它承诺什么、不承诺什么
 
@@ -533,7 +554,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
 - `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（19 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（23 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 
