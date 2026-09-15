@@ -16,21 +16,21 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::{BackoffConfig, ObjectStore, RetryConfig};
 use qm_probe::s3_stub::{Fault, S3Stub, StubOptions};
 use qm_store::{CasStore, ObjectVersion, StoreError, verify_conditional_writes};
 
 const ACCESS_KEY: &str = "stub-access";
 const SECRET_KEY: &str = "stub-secret";
 
-/// Build the same client shape `S3Config::build_store` builds: path style,
-/// signed, HTTP allowed because the endpoint is loopback.
-fn s3_store(endpoint: &str, bucket: &str) -> Arc<dyn ObjectStore> {
-    let store = AmazonS3Builder::new()
+/// The same client shape `S3Config::build_store` builds: path style, signed,
+/// HTTP allowed because the endpoint is loopback.
+fn s3_builder(endpoint: &str, bucket: &str) -> AmazonS3Builder {
+    AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region("auto")
         .with_virtual_hosted_style_request(false)
@@ -38,9 +38,40 @@ fn s3_store(endpoint: &str, bucket: &str) -> Arc<dyn ObjectStore> {
         .with_secret_access_key(SECRET_KEY)
         .with_endpoint(endpoint)
         .with_allow_http(true)
-        .build()
-        .expect("building the S3 client against the stub");
-    Arc::new(store)
+}
+
+fn s3_store(endpoint: &str, bucket: &str) -> Arc<dyn ObjectStore> {
+    Arc::new(
+        s3_builder(endpoint, bucket)
+            .build()
+            .expect("building the S3 client against the stub"),
+    )
+}
+
+/// A client whose retries are cheap, so a test can afford to exhaust them.
+///
+/// The budget is the point: with the default configuration the client makes
+/// eleven attempts with a decorrelated 100 ms+ backoff, which is the right
+/// production posture and the wrong shape for a control that has to fail.
+fn s3_store_with_retry_budget(
+    endpoint: &str,
+    bucket: &str,
+    attempts: usize,
+) -> Arc<dyn ObjectStore> {
+    Arc::new(
+        s3_builder(endpoint, bucket)
+            .with_retry(RetryConfig {
+                backoff: BackoffConfig {
+                    init_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(5),
+                    base: 2.0,
+                },
+                max_retries: attempts - 1,
+                retry_timeout: Duration::from_secs(30),
+            })
+            .build()
+            .expect("building an S3 client with a small retry budget"),
+    )
 }
 
 fn cas(stub: &S3Stub) -> CasStore {
@@ -111,6 +142,38 @@ async fn the_conformance_probe_passes_over_real_http() {
         .filter(|value| value.starts_with("AWS4-HMAC-SHA256"))
         .count();
     assert_eq!(authorized, requests.len(), "every request must be signed");
+
+    // Signed, not merely sent: a conditional header outside `SignedHeaders`
+    // could be rewritten in flight without invalidating the signature, and
+    // only the header list the client signed can rule that out.
+    let mut signed_conditional = 0;
+    for request in &requests {
+        for name in [
+            request.if_match.as_ref().map(|_| "if-match"),
+            request.if_none_match.as_ref().map(|_| "if-none-match"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let headers = request
+                .authorization
+                .as_deref()
+                .and_then(|value| value.split_once("SignedHeaders="))
+                .and_then(|(_, rest)| rest.split(',').next())
+                .unwrap_or_default();
+            assert!(
+                headers.split(';').any(|entry| entry == name),
+                "{name} must be inside SignedHeaders, got {headers:?}: {request:#?}"
+            );
+            signed_conditional += 1;
+        }
+    }
+    // Pinned so the loop above cannot pass by iterating over nothing: the two
+    // creates plus the stale, matching and consumed updates.
+    assert_eq!(
+        signed_conditional, 5,
+        "expected five signed conditional writes: {requests:#?}"
+    );
 
     // HEAD and DELETE are part of the S3 surface the store uses; the probe
     // itself reaches neither.
@@ -476,6 +539,245 @@ fn the_stub_answers_failures_with_s3_error_documents() {
     );
 
     stub.shutdown();
+}
+
+/// A conflict on a conditional write is transient in S3 — the client retries
+/// exactly that write mode — so one must not reach the probe.
+#[tokio::test]
+async fn a_transient_conflict_is_retried_and_the_probe_still_passes() {
+    let stub = S3Stub::start_with(StubOptions::default().with_conditional_put_conflicts(1))
+        .expect("starting the stub");
+
+    let report = verify_conditional_writes(&cas(&stub), "qm-probe/conflict-once")
+        .await
+        .expect("a conditional write the client retried must not fail the probe");
+    assert!(report.all_passed(), "{}", report.render());
+
+    // The probe only passes for the right reason if the injected 409 really
+    // crossed the wire and the client really repeated the same write.
+    let requests = stub.requests();
+    let conflicts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.status == 409)
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "exactly one conflict may be injected: {requests:#?}"
+    );
+    assert_eq!(conflicts[0].method, "PUT", "{conflicts:#?}");
+    let etag = conflicts[0].if_match.clone();
+    assert!(
+        etag.is_some(),
+        "the conflict must land on a conditional write: {conflicts:#?}"
+    );
+
+    // The very next request must be the same conditional write repeated: same
+    // key, same If-Match, and the one that lands. (Asserting a count of two
+    // would also be satisfied by the later replay of that ETag, which is a
+    // different request answering 412.)
+    let conflict_at = requests
+        .iter()
+        .position(|request| request.status == 409)
+        .expect("the injected conflict must be in the log");
+    let retry = &requests[conflict_at + 1];
+    assert_eq!(retry.method, "PUT", "{retry:#?}");
+    assert_eq!(retry.key, conflicts[0].key, "{retry:#?}");
+    assert_eq!(retry.if_match, etag, "{retry:#?}");
+    assert_eq!(retry.status, 200, "{retry:#?}");
+
+    stub.shutdown();
+}
+
+/// The other half of the injection: a bucket that never stops conflicting has
+/// to fail the probe. Without this, "the probe passes with a conflict" would
+/// also be satisfied by a stub that swallowed the 409 instead of sending one.
+#[tokio::test]
+async fn a_bucket_that_never_stops_conflicting_fails_the_probe() {
+    // One attempt plus two retries, instead of the client's default eleven.
+    const ATTEMPTS: usize = 3;
+    let stub =
+        S3Stub::start_with(StubOptions::default().with_conditional_put_conflicts(usize::MAX))
+            .expect("starting the stub");
+    let store = s3_store_with_retry_budget(&stub.endpoint(), stub.bucket(), ATTEMPTS);
+
+    let error = verify_conditional_writes(&CasStore::new(store, ""), "qm-probe/conflict-always")
+        .await
+        .expect_err("a bucket that never stops conflicting must not pass the probe");
+    let rendered = format!("{error}");
+    // The probe stops at the first conditional write whose preconditions held:
+    // the stale-ETag step is refused (412) before the injection, so the
+    // matching update is the one that runs out of attempts.
+    assert!(
+        rendered.contains("matching update failed"),
+        "the write that ran out of retries must be the one that fails:\n{rendered}"
+    );
+
+    let conditional: Vec<_> = stub
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "PUT" && request.if_match.is_some())
+        .collect();
+    assert_eq!(
+        conditional
+            .iter()
+            .filter(|request| request.status == 409)
+            .count(),
+        ATTEMPTS,
+        "every attempt of the conflicted write must be refused, and the client \
+         must use its whole budget before surfacing the failure: {conditional:#?}"
+    );
+
+    stub.shutdown();
+}
+
+/// A conditional read the stub does not model is refused, not answered with an
+/// unconditional `200`: the wrong answer is worse than a missing one, because
+/// a probe built on it would look green for the wrong reason.
+#[test]
+fn conditional_reads_are_refused_rather_than_answered() {
+    let stub = S3Stub::start().expect("starting the stub");
+    let created = raw_request(
+        &stub,
+        "PUT /stub-bucket/probe/conditional HTTP/1.1\r\nif-none-match: *\r\n\
+         content-length: 2\r\n\r\nv1",
+    );
+    assert!(created.starts_with("HTTP/1.1 200 OK"), "{created}");
+
+    for request in [
+        "GET /stub-bucket/probe/conditional HTTP/1.1\r\nif-none-match: *\r\n\r\n",
+        "GET /stub-bucket/probe/conditional HTTP/1.1\r\nif-match: \"whatever\"\r\n\r\n",
+    ] {
+        let response = raw_request(&stub, request);
+        assert!(
+            response.starts_with("HTTP/1.1 501 Not Implemented"),
+            "{response}"
+        );
+        assert!(
+            response.contains("<Code>NotImplemented</Code>"),
+            "a refusal must still explain itself: {response}"
+        );
+        assert!(response.contains("conditional reads"), "{response}");
+    }
+
+    // `HEAD` is refused the same way, minus the body it declines to send.
+    let get = raw_request(
+        &stub,
+        "GET /stub-bucket/probe/conditional HTTP/1.1\r\nif-none-match: *\r\n\r\n",
+    );
+    let head = raw_request(
+        &stub,
+        "HEAD /stub-bucket/probe/conditional HTTP/1.1\r\nif-none-match: *\r\n\r\n",
+    );
+    assert!(head.starts_with("HTTP/1.1 501 Not Implemented"), "{head}");
+    assert_eq!(
+        header_value(&head, "content-length"),
+        header_value(&get, "content-length"),
+        "a HEAD refusal must advertise the body it declines to send"
+    );
+    assert!(
+        head.ends_with("\r\n\r\n"),
+        "a HEAD response carries no body: {head}"
+    );
+
+    // The unconditional read still works, so the refusal is about the
+    // condition and not about the key or the method.
+    let plain = raw_request(&stub, "GET /stub-bucket/probe/conditional HTTP/1.1\r\n\r\n");
+    assert!(plain.starts_with("HTTP/1.1 200 OK"), "{plain}");
+    assert!(plain.ends_with("v1"), "{plain}");
+
+    stub.shutdown();
+}
+
+/// `MaxKeys` is the size the client *asked* for, not the size the stub chose to
+/// serve; a client that trusts the echo must not be told 2 when it asked 1000.
+#[test]
+fn the_list_response_echoes_the_requested_page_size() {
+    let stub =
+        S3Stub::start_with(StubOptions::default().with_page_size(2)).expect("starting the stub");
+    for index in 1..=3 {
+        let body = format!("v{index}");
+        let created = raw_request(
+            &stub,
+            &format!(
+                "PUT /stub-bucket/pages/{index}.md HTTP/1.1\r\nif-none-match: *\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(created.starts_with("HTTP/1.1 200 OK"), "{created}");
+    }
+
+    let listed = raw_request(
+        &stub,
+        "GET /stub-bucket?list-type=2&prefix=pages&max-keys=1000 HTTP/1.1\r\n\r\n",
+    );
+    assert!(listed.contains("<MaxKeys>1000</MaxKeys>"), "{listed}");
+    assert!(listed.contains("<KeyCount>2</KeyCount>"), "{listed}");
+    assert!(
+        listed.contains("<IsTruncated>true</IsTruncated>"),
+        "{listed}"
+    );
+
+    // And a size the stub has to honour literally, so the echo is not the
+    // only thing the number is wired to.
+    let one = raw_request(
+        &stub,
+        "GET /stub-bucket?list-type=2&prefix=pages&max-keys=1 HTTP/1.1\r\n\r\n",
+    );
+    assert!(one.contains("<MaxKeys>1</MaxKeys>"), "{one}");
+    assert!(one.contains("<KeyCount>1</KeyCount>"), "{one}");
+
+    stub.shutdown();
+}
+
+/// `If-Match: *` asserts existence, not identity. Comparing it as an ETag
+/// would refuse every object that does exist, which is the opposite of what a
+/// client asking "is it still there" is told.
+#[test]
+fn if_match_asterisk_asserts_existence() {
+    let stub = S3Stub::start().expect("starting the stub");
+    let created = raw_request(
+        &stub,
+        "PUT /stub-bucket/probe/star HTTP/1.1\r\nif-none-match: *\r\ncontent-length: 2\r\n\r\nv1",
+    );
+    assert!(created.starts_with("HTTP/1.1 200 OK"), "{created}");
+
+    let replaced = raw_request(
+        &stub,
+        "PUT /stub-bucket/probe/star HTTP/1.1\r\nif-match: *\r\ncontent-length: 2\r\n\r\nv2",
+    );
+    assert!(
+        replaced.starts_with("HTTP/1.1 200 OK"),
+        "an existing object satisfies If-Match: *: {replaced}"
+    );
+    let read = raw_request(&stub, "GET /stub-bucket/probe/star HTTP/1.1\r\n\r\n");
+    assert!(
+        read.ends_with("v2"),
+        "the wildcard write must have landed: {read}"
+    );
+
+    let missing = raw_request(
+        &stub,
+        "PUT /stub-bucket/probe/absent HTTP/1.1\r\nif-match: *\r\ncontent-length: 2\r\n\r\nv2",
+    );
+    assert!(
+        missing.starts_with("HTTP/1.1 404 Not Found"),
+        "a missing object is the answer S3 gives any If-Match on it: {missing}"
+    );
+    assert!(missing.contains("<Code>NoSuchKey</Code>"), "{missing}");
+
+    stub.shutdown();
+}
+
+/// One response header, for assertions that have to compare two responses.
+fn header_value(response: &str, name: &str) -> String {
+    response
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+        .unwrap_or_else(|| panic!("{name} must be in the response:\n{response}"))
+        .trim()
+        .to_string()
 }
 
 fn raw_request(stub: &S3Stub, request: &str) -> String {
