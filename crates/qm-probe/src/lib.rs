@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 
+pub mod s3_stub;
+
 /// S3-compatible connection settings, resolved from the environment.
 #[derive(Debug, Clone)]
 pub struct S3Config {
