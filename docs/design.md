@@ -233,7 +233,9 @@ qm sessions
 不可变版本让"历史"不需要额外机制：链就是历史。
 
 ```bash
-qm history --path notes/raft.md          # 从最早到最新列出各版本
+qm history --path notes/raft.md                       # 从最早到最新列出各版本（含提交时间）
+qm read-page --path notes/raft.md --as-of 1735000000000
+qm log --limit 20                                     # 最近提交
 qm restore --path notes/raft.md --version <page_id>
 ```
 
@@ -241,9 +243,12 @@ qm restore --path notes/raft.md --version <page_id>
 - `restore` **不是覆盖，而是一次普通写入**：以旧版正文提交一个新版本、supersede 当前版本。
   因此回滚本身可被再次回滚，任何后续版本都不会被销毁——这正是"发散写只 supersede、绝不销毁"的延伸。
 - MCP 侧对应 `memory_history` / `memory_restore`（共 16 个工具）。
-- **已知限制**：不可变版本对象里不含提交时间/序号（那些字段只在提交点确定，写进内容会破坏重试幂等），
-  因此 `history` 现在给的是版本顺序而非时间戳。要按时间查询（as-of）需要给每版加一个**提交后写入的元数据sidecar**
-  （缺失即容忍），或为提交单独记一条有序日志——两者都还没做。
+- **时间线来自 commit log（已实现）**：提交时间/序号写在**提交成功之后**的
+  `commits/<seq>.json`（`CommitRecord`）。为什么必须后写：这些字段只在提交点确定，塞进内容寻址的不可变版本会破坏
+  重试幂等。因此该日志是**建议性元数据**——提交与日志之间崩溃会少一条记录（历史少一个时间戳），
+  但不会让任何权威判断出错。
+- 由此得到两个查询：`qm log`（最近提交，最新在前）与 `qm read-page --as-of <ms>`（那一刻这一页是什么）。
+  删除之后再按更早时间读，仍能读到删除前的正文——历史是只读的。
 - 测试：写三个版本 → history 按序返回 3 条 → restore 最早那版 → 当前正文等于旧版、
   链长变 4（而不是 3）、被回滚掉的第三版仍可读；未知版本 id 报 not found。
 

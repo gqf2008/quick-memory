@@ -79,7 +79,7 @@ cargo run -p qm-cli --bin qm -- handoff claim --id <id>
 工具：`memory_capture` / `memory_consolidate` / `memory_search` / `memory_write_page` /
 `memory_read_page` / `memory_delete_page` / `memory_publish` / `memory_compact` /
 `memory_sessions` / `memory_status` / `memory_handoff_open` / `memory_handoff_list` /
-`memory_handoff_claim` / `memory_handoff_done`。它们与 `qm` 命令共用同一份实现，返回 JSON。
+`memory_handoff_claim` / `memory_handoff_done` / `memory_history` / `memory_restore` / `memory_log`。它们与 `qm` 命令共用同一份实现，返回 JSON。
 
 本地试协议用 `qm-mcp --synthetic-bucket`（内存、非持久，仅用于冒烟）。
 

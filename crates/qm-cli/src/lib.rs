@@ -188,11 +188,20 @@ pub enum Command {
         #[arg(long)]
         version: String,
     },
-    /// Print a page.
+    /// Print a page, optionally as it was at a point in time.
     ReadPage {
         /// Path inside the project.
         #[arg(long)]
         path: String,
+        /// Show the version that was current at this Unix time (ms).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// Show the most recent commits.
+    Log {
+        /// Maximum entries.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Tombstone a page.
     DeletePage {
@@ -829,14 +838,24 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             })
         }
-        Command::ReadPage { path } => {
+        Command::ReadPage { path, as_of } => {
             let page_path = ctx.page(path)?;
-            let page = ctx
-                .project
-                .read_page(&ctx.workspace, &ctx.project_id, &page_path)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?
-                .with_context(|| format!("no page at {}", page_path.as_str()))?;
+            let page = match as_of {
+                Some(at_ms) => ctx
+                    .project
+                    .version_at(&ctx.workspace, &ctx.project_id, &page_path, *at_ms)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+                    .with_context(|| {
+                        format!("no version of {} existed at {at_ms}", page_path.as_str())
+                    })?,
+                None => ctx
+                    .project
+                    .read_page(&ctx.workspace, &ctx.project_id, &page_path)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+                    .with_context(|| format!("no page at {}", page_path.as_str()))?,
+            };
             Ok(if ctx.json {
                 serde_json::json!({
                     "path": page.path.as_str(),
@@ -856,8 +875,36 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .read_page_versions(&ctx.workspace, &ctx.project_id, &page_path)
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // Timestamps come from the advisory commit log, which may be
+            // missing an entry (a crash between commit and log write); the
+            // version order itself is authoritative.
+            let log = ctx
+                .project
+                .read_commit_log(&ctx.workspace, &ctx.project_id, usize::MAX)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let committed_at = |page_id: &qm_core::PageId| {
+                log.iter()
+                    .find(|record| record.page_id.as_ref() == Some(page_id))
+                    .map(|record| record.at_ms)
+            };
             Ok(if ctx.json {
-                serde_json::to_string(&versions)?
+                let described: Vec<serde_json::Value> = versions
+                    .iter()
+                    .map(|version| {
+                        // A superset of the version object: enough to restore
+                        // from, plus when it was committed when the log knows.
+                        serde_json::json!({
+                            "page_id": version.page_id,
+                            "path": version.path,
+                            "title": version.title,
+                            "body": version.body,
+                            "supersedes": version.supersedes,
+                            "committed_at_ms": committed_at(&version.page_id),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&described)?
             } else if versions.is_empty() {
                 format!("no versions at {}", page_path.as_str())
             } else {
@@ -866,9 +913,11 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .enumerate()
                     .map(|(index, version)| {
                         format!(
-                            "{}\t{}\tsupersedes={}",
+                            "{}\t{}\tcommitted_at={}\tsupersedes={}",
                             index + 1,
                             version.page_id,
+                            committed_at(&version.page_id)
+                                .map_or("-".to_string(), |at| at.to_string()),
                             version
                                 .supersedes
                                 .as_ref()
@@ -917,6 +966,32 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     historical.page_id,
                     outcome.manifest_seq
                 )
+            })
+        }
+        Command::Log { limit } => {
+            let records = ctx
+                .project
+                .read_commit_log(&ctx.workspace, &ctx.project_id, *limit)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&records)?
+            } else if records.is_empty() {
+                "no commits".to_string()
+            } else {
+                records
+                    .iter()
+                    .map(|record| {
+                        format!(
+                            "{:>6}\t{}\t{:?}\t{}",
+                            record.seq,
+                            record.at_ms,
+                            record.kind,
+                            record.path.as_str()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             })
         }
         Command::DeletePage { path } => {
@@ -1453,6 +1528,77 @@ mod tests {
         .await
         .expect_err("restoring a version that does not exist must fail");
         assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn as_of_reading_and_the_commit_log_answer_when() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for (index, body) in ["first", "second", "third"].iter().enumerate() {
+            execute(
+                &cli(&["write-page", "--path", "notes/raft.md", "--body", body]),
+                Context {
+                    now_ms: (index as i64 + 1) * 1_000,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Read the page as it was at each point in its life.
+        for (at, expected) in [(1_000, "first"), (2_000, "second"), (3_000, "third")] {
+            let mut ctx = context(Arc::clone(&bucket), &cache);
+            ctx.now_ms = at;
+            let body = execute(
+                &cli(&[
+                    "read-page",
+                    "--path",
+                    "notes/raft.md",
+                    "--as-of",
+                    &at.to_string(),
+                ]),
+                ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(body, expected, "as of {at}");
+        }
+
+        // Before the first commit there is nothing to show.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 500;
+        let missing = execute(
+            &cli(&["read-page", "--path", "notes/raft.md", "--as-of", "500"]),
+            ctx,
+        )
+        .await
+        .expect_err("nothing existed that early");
+        assert!(missing.to_string().contains("no version"), "{missing}");
+
+        // The log lists commits newest first, and history reports timestamps.
+        let log = execute(
+            &cli(&["log", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let records: Vec<qm_core::CommitRecord> = serde_json::from_str(&log).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].seq, 3);
+        assert_eq!(records[0].at_ms, 3_000);
+
+        let history = execute(
+            &cli(&["history", "--path", "notes/raft.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let described: Vec<serde_json::Value> = serde_json::from_str(&history).unwrap();
+        assert_eq!(described.len(), 3);
+        assert_eq!(described[0]["committed_at_ms"], 1_000);
+        assert_eq!(described[2]["committed_at_ms"], 3_000);
     }
 
     #[tokio::test]

@@ -12,10 +12,10 @@ mod model;
 mod scrub;
 
 pub use model::{
-    CatalogHead, Handoff, HandoffState, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest,
-    Observation, ObservationSegment, PageEntry, PageVersion, SessionHead, SplitEntry, Tombstone,
-    WalEntry, content_hash, derive_handoff_id, derive_observation_id, derive_page_id,
-    derive_segment_id,
+    CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, Lease,
+    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PageVersion,
+    SessionHead, SplitEntry, Tombstone, WalEntry, content_hash, derive_handoff_id,
+    derive_observation_id, derive_page_id, derive_segment_id,
 };
 pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 
@@ -275,6 +275,18 @@ impl KeyLayout {
             self.scope_prefix(ws, proj),
             writer
         )
+    }
+
+    /// Advisory commit record; one object per committed sequence.
+    #[must_use]
+    pub fn commit_record(&self, ws: &WorkspaceId, proj: &ProjectId, seq: u64) -> String {
+        format!("{}/commits/{seq:020}.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Prefix holding every commit record of a project.
+    #[must_use]
+    pub fn commit_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/commits", self.scope_prefix(ws, proj))
     }
 
     /// Prefix holding every session of a project.

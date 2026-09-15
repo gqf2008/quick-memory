@@ -487,6 +487,42 @@ pub fn derive_handoff_id(title: &str, body: &str, created_at_ms: i64) -> String 
     hex(&hasher.finalize())
 }
 
+/// What a commit did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKind {
+    /// A page version became current.
+    PageWritten,
+    /// A page was tombstoned.
+    PageDeleted,
+}
+
+/// Advisory record of one commit, written *after* the CAS that made it real.
+///
+/// This is the one place commit-time facts can live: putting them inside the
+/// immutable version object would break retry idempotency (a retry would write
+/// different bytes to the same content-addressed key). So the record is written
+/// second, and a crash between the two steps leaves a page whose history shows
+/// no timestamp — degraded, never wrong. Nothing authoritative reads this log:
+/// it answers "when" and "as of", never "what is true now".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRecord {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Commit sequence assigned by the winning CAS.
+    pub seq: u64,
+    /// Commit timestamp in milliseconds.
+    pub at_ms: i64,
+    /// Machine that committed.
+    pub writer_id: WriterId,
+    /// What was committed.
+    pub kind: CommitKind,
+    /// Page the commit concerns.
+    pub path: PagePath,
+    /// Version written, for `PageWritten`.
+    pub page_id: Option<PageId>,
+}
+
 /// A lease on an optional, abandonable job (compaction, garbage collection).
 ///
 /// Leases exist so that "only one machine at a time" is expressible without a

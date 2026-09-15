@@ -85,6 +85,14 @@ impl ProjectStore {
             }
         }
 
+        // Commit records are advisory for correctness but they *are* the
+        // timeline, so they stay live: reclaiming them would silently erase
+        // "when" from every page.
+        let commit_prefix = layout.commit_prefix(workspace_id, project_id);
+        for (key, _) in self.cas().list(&commit_prefix).await? {
+            keys.insert(key);
+        }
+
         let catalog = self.load_catalog(workspace_id, project_id).await?;
         keys.insert(layout.catalog_head(workspace_id, project_id));
         if let Some(catalog_key) = catalog.catalog_key {
@@ -267,6 +275,11 @@ mod tests {
             store.cas().head(orphan_catalog).await,
             Err(StoreError::NotFound)
         ));
+
+        // Commit records must survive too: they carry the timeline.
+        let log = store.read_commit_log(&ws(), &proj(), 10).await.unwrap();
+        // (two page commits were made above)
+        assert_eq!(log.len(), 2, "the commit log must not be collected");
 
         // The live project still reads and its history survives.
         let page = store

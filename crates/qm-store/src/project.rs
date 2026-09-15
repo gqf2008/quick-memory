@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use qm_core::{
-    CatalogHead, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest,
-    Observation, ObservationSegment, PageEntry, PagePath, PageVersion, ProjectId, SessionHead,
-    SessionId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash,
-    derive_handoff_id, derive_page_id, derive_segment_id,
+    CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease,
+    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PagePath, PageVersion,
+    ProjectId, SessionHead, SessionId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId,
+    content_hash, derive_handoff_id, derive_page_id, derive_segment_id,
 };
 
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -366,6 +366,24 @@ impl ProjectStore {
 
             match committed {
                 Ok(_) => {
+                    // Advisory, and deliberately second: the commit is already
+                    // real, so a failure here degrades history rather than
+                    // correctness.
+                    let _ = self
+                        .write_commit_record(
+                            &request.workspace_id,
+                            &request.project_id,
+                            CommitRecord {
+                                schema: MANIFEST_SCHEMA,
+                                seq,
+                                at_ms: request.now_ms,
+                                writer_id: request.writer_id.clone(),
+                                kind: CommitKind::PageWritten,
+                                path: request.path.clone(),
+                                page_id: Some(page_id.clone()),
+                            },
+                        )
+                        .await;
                     return Ok(CommitOutcome {
                         manifest_seq: seq,
                         page_id,
@@ -871,6 +889,21 @@ impl ProjectStore {
 
             match committed {
                 Ok(_) => {
+                    let _ = self
+                        .write_commit_record(
+                            workspace_id,
+                            project_id,
+                            CommitRecord {
+                                schema: MANIFEST_SCHEMA,
+                                seq,
+                                at_ms: now_ms,
+                                writer_id: writer_id.clone(),
+                                kind: CommitKind::PageDeleted,
+                                path: path.clone(),
+                                page_id: removed.clone(),
+                            },
+                        )
+                        .await;
                     return Ok(DeleteOutcome {
                         manifest_seq: seq,
                         removed,
@@ -1227,6 +1260,82 @@ impl ProjectStore {
         }
         newest_first.reverse();
         Ok(newest_first)
+    }
+
+    /// Write one advisory commit record. Create-if-absent, so a replay of the
+    /// same sequence is a no-op rather than a mismatch.
+    async fn write_commit_record(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        record: CommitRecord,
+    ) -> Result<(), StoreError> {
+        let key = self
+            .layout
+            .commit_record(workspace_id, project_id, record.seq);
+        self.create_or_verify(&key, &record).await.map(|_| ())
+    }
+
+    /// Read the commit log, newest first, up to `limit` records.
+    ///
+    /// Advisory metadata: entries can be missing (a crash between the commit
+    /// and this write), and nothing authoritative depends on them.
+    ///
+    /// # Errors
+    /// Propagates listing and decode failures.
+    pub async fn read_commit_log(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<CommitRecord>, StoreError> {
+        let prefix = self.layout.commit_prefix(workspace_id, project_id);
+        let listed = self.cas.list(&prefix).await?;
+        let mut records = Vec::with_capacity(listed.len());
+        for (key, _) in listed {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            let (bytes, _) = self.cas.read(&key).await?;
+            records.push(decode::<CommitRecord>(&bytes, &key)?);
+        }
+        records.sort_by_key(|record| std::cmp::Reverse(record.seq));
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    /// The version of a page that was current at `at_ms`, if any.
+    ///
+    /// Answers a question history alone cannot: what did this page say on that
+    /// date. It reads the commit log backwards from `at_ms`, so a page that was
+    /// deleted later still reports what it said before the delete.
+    ///
+    /// # Errors
+    /// Propagates log reads and version reads.
+    pub async fn version_at(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        at_ms: i64,
+    ) -> Result<Option<PageVersion>, StoreError> {
+        let records = self
+            .read_commit_log(workspace_id, project_id, usize::MAX)
+            .await?;
+        for record in records {
+            if record.path != *path || record.at_ms > at_ms {
+                continue;
+            }
+            return match (record.kind, record.page_id) {
+                (CommitKind::PageWritten, Some(page_id)) => Ok(Some(
+                    self.read_page_version(workspace_id, project_id, path, &page_id)
+                        .await?,
+                )),
+                // Deleted as of then: the page did not exist.
+                _ => Ok(None),
+            };
+        }
+        Ok(None)
     }
 
     /// Every version of a page, oldest first, bodies included.
@@ -1813,6 +1922,75 @@ mod tests {
             matches!(too_late, Err(StoreError::HandoffNotOpen { .. })),
             "{too_late:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_commit_log_answers_when_and_as_of() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let path = PagePath::new("notes/raft.md").unwrap();
+        let writer = WriterId::new("mbp-a").unwrap();
+
+        for (version, body) in [(1_000, "first"), (2_000, "second"), (3_000, "third")] {
+            store
+                .commit_page(request("mbp-a", "notes/raft.md", body, version))
+                .await
+                .unwrap();
+        }
+
+        // The log is newest-first and carries the commit-time facts the
+        // immutable version objects deliberately cannot hold.
+        let log = store.read_commit_log(&ws(), &proj(), 10).await.unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].seq, 3);
+        assert_eq!(log[0].at_ms, 3_000);
+        assert_eq!(log[0].kind, CommitKind::PageWritten);
+        assert!(log[0].page_id.is_some());
+
+        // As-of reads walk back to whatever was current then.
+        let at_two = store
+            .version_at(&ws(), &proj(), &path, 2_000)
+            .await
+            .unwrap()
+            .expect("a version existed then");
+        assert_eq!(at_two.body, "second");
+        let at_one = store
+            .version_at(&ws(), &proj(), &path, 1_500)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_one.body, "first");
+        assert!(
+            store
+                .version_at(&ws(), &proj(), &path, 999)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing existed before the first commit"
+        );
+
+        // A later delete does not rewrite the past.
+        store
+            .delete_page(&ws(), &proj(), &path, &writer, 4_000)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .version_at(&ws(), &proj(), &path, 5_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "as of now the page is gone"
+        );
+        let before_delete = store
+            .version_at(&ws(), &proj(), &path, 3_500)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_delete.body, "third");
+        let log = store.read_commit_log(&ws(), &proj(), 10).await.unwrap();
+        assert_eq!(log[0].kind, CommitKind::PageDeleted);
+        assert_eq!(log[0].page_id, Some(before_delete.page_id));
     }
 
     #[tokio::test]

@@ -100,6 +100,24 @@ pub struct RestoreArgs {
     pub version: String,
 }
 
+/// Arguments for `memory_read_page`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadPageArgs {
+    /// Path inside the project.
+    pub path: String,
+    /// Read the version that was current at this Unix time (ms).
+    #[serde(default)]
+    pub as_of: Option<i64>,
+}
+
+/// Arguments for `memory_log`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LogArgs {
+    /// Maximum entries.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Arguments for page-addressed tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PageArgs {
@@ -252,12 +270,34 @@ impl MemoryServer {
     }
 
     /// Read the current version of a page.
-    #[tool(description = "Read the current version of a page.")]
+    #[tool(description = "Read a page. Pass as_of (Unix ms) to read the version \
+                       that was current then — useful when asking what a page \
+                       said at some earlier point.")]
     async fn memory_read_page(
         &self,
-        Parameters(args): Parameters<PageArgs>,
+        Parameters(args): Parameters<ReadPageArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.dispatch(Command::ReadPage { path: args.path }).await
+        self.dispatch(Command::ReadPage {
+            path: args.path,
+            as_of: args.as_of,
+        })
+        .await
+    }
+
+    /// Show the most recent commits.
+    #[tool(
+        description = "Show the most recent commits (newest first) with their \
+                       sequence, wall-clock time, kind and path. Call this at the \
+                       start of a session to see what has been happening."
+    )]
+    async fn memory_log(
+        &self,
+        Parameters(args): Parameters<LogArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Log {
+            limit: args.limit.unwrap_or(20),
+        })
+        .await
     }
 
     /// List a page's versions, oldest first.

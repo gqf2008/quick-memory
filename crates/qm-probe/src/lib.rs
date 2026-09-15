@@ -357,9 +357,10 @@ mod tests {
         assert_eq!(report.pages, 3);
         assert_eq!(report.wal_records, 12);
         assert!(report.attempts >= 12);
+        // 12 page versions + 12 WAL records + 12 commit records + the manifest.
         assert_eq!(
             delete_scope(&bucket, &report.workspace).await.unwrap(),
-            12 + 12 + 1
+            12 + 12 + 12 + 1
         );
     }
 }

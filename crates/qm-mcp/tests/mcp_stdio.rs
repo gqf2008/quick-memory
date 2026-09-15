@@ -150,6 +150,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_status",
         "memory_history",
         "memory_restore",
+        "memory_log",
         "memory_handoff_open",
         "memory_handoff_list",
         "memory_handoff_claim",
