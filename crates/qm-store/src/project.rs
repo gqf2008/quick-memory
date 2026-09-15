@@ -616,12 +616,7 @@ impl ProjectStore {
     /// List every handoff of a project, oldest first.
     ///
     /// # Errors
-    /// Propagates listing failures, and propagates a failing read as a failure
-    /// of the whole call: a partial log is never returned. The failure reported
-    /// is the one belonging to the *smallest* key, because the listing is
-    /// sorted — so a bucket that fails several reads at once still produces the
-    /// same error every run, instead of whichever read happened to finish
-    /// first. Which read finishes first is allowed to decide nothing at all.
+    /// Propagates listing and decode failures.
     pub async fn list_handoffs(
         &self,
         workspace_id: &WorkspaceId,
@@ -886,12 +881,7 @@ impl ProjectStore {
     /// List proposals, oldest first.
     ///
     /// # Errors
-    /// Propagates listing failures, and propagates a failing read as a failure
-    /// of the whole call: a partial log is never returned. The failure reported
-    /// is the one belonging to the *smallest* key, because the listing is
-    /// sorted — so a bucket that fails several reads at once still produces the
-    /// same error every run, instead of whichever read happened to finish
-    /// first. Which read finishes first is allowed to decide nothing at all.
+    /// Propagates listing and decode failures.
     pub async fn list_proposals(
         &self,
         workspace_id: &WorkspaceId,
@@ -2081,21 +2071,54 @@ mod tests {
     /// time" would look identical even when the caller really does overlap
     /// them; a real bucket suspends on the round trip, and the yield is the
     /// stand-in for that. No wall-clock threshold enters the assertions.
+    ///
+    /// Which read suspends longest is what decides the order the caller sees
+    /// results in, so [`CompletionOrder`] lets a test pick that order. Both
+    /// directions are in use: the ordering test reverses the *answer* (the
+    /// oldest commit comes back first), and the failure test reverses the
+    /// *failures*, so that the one a first-failure-wins reader would report is
+    /// deliberately not the one the contract names.
     #[derive(Debug)]
     struct CountingStore {
         inner: InMemory,
         reads: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        order: CompletionOrder,
     }
+
+    /// The order a fixture hands overlapping reads back in.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CompletionOrder {
+        /// The smallest sequence first: the order the keys are listed in.
+        OldestFirst,
+        /// The largest sequence first: the reverse of the listing.
+        NewestFirst,
+    }
+
+    /// Longest stagger [`CompletionOrder::NewestFirst`] ever asks for.
+    ///
+    /// It only has to exceed the sequences of the logs the tests here build, so
+    /// that subtracting the sequence is a strict reversal inside that range.
+    const REVERSED_STAGGER_SPAN: usize = 64;
 
     impl CountingStore {
         fn new() -> Arc<Self> {
+            Self::in_order(CompletionOrder::OldestFirst)
+        }
+
+        /// A bucket that hands the newest read back first.
+        fn newest_first() -> Arc<Self> {
+            Self::in_order(CompletionOrder::NewestFirst)
+        }
+
+        fn in_order(order: CompletionOrder) -> Arc<Self> {
             Arc::new(Self {
                 inner: InMemory::new(),
                 reads: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
+                order,
             })
         }
 
@@ -2128,6 +2151,21 @@ mod tests {
             .and_then(|last| last.strip_suffix(".json"))
             .and_then(|seq| seq.parse::<usize>().ok())
             .unwrap_or(0)
+    }
+
+    /// Every commit key of the test scope, in the order `list` hands them back
+    /// — the same listing `read_commit_log` walks, relative to the same prefix.
+    async fn commit_keys(bucket: &Arc<dyn ObjectStore>) -> Vec<String> {
+        let store = machine(bucket);
+        let prefix = store.layout().commit_prefix(&ws(), &proj());
+        store
+            .cas
+            .list(&prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
     }
 
     impl std::fmt::Display for CountingStore {
@@ -2189,12 +2227,18 @@ mod tests {
                 let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
                 self.reads.fetch_add(1, AtomicOrdering::SeqCst);
-                // Stagger the reads so the oldest commits come back first —
-                // the reverse of the answer. A real bucket hands completions
-                // back in whatever order it likes; this makes that disorder
-                // deterministic, which is what keeps the ordering assertions
-                // below load-bearing rather than satisfied by luck.
-                for _ in 0..=commit_seq_in(location.as_ref()) {
+                // Stagger the reads so they come back in an order this test
+                // picked rather than in the order they were started. A real
+                // bucket hands completions back in whatever order it likes;
+                // this makes that disorder deterministic, which is what keeps
+                // the assertions below load-bearing rather than satisfied by
+                // luck.
+                let seq = commit_seq_in(location.as_ref());
+                let stagger = match self.order {
+                    CompletionOrder::OldestFirst => seq,
+                    CompletionOrder::NewestFirst => REVERSED_STAGGER_SPAN.saturating_sub(seq),
+                };
+                for _ in 0..stagger {
                     tokio::task::yield_now().await;
                 }
                 let out = self.inner.get_opts(location, options).await;
@@ -3707,6 +3751,89 @@ mod tests {
         assert_eq!(
             windowed_paths,
             vec!["notes/n200.md", "notes/n199.md", "notes/n198.md"]
+        );
+    }
+
+    /// A failing read fails the whole call — never a partial log — and the
+    /// failure it reports is the one belonging to the smallest failing key.
+    ///
+    /// With overlapping reads, "which failure" is a choice this function makes
+    /// rather than a fact about the bucket, so it has to be the same choice
+    /// every run: the listing is sorted, so the smallest key is what the serial
+    /// loop this replaced reported. The fixture answers the *newest* of the two
+    /// broken commits first, which is the discriminating input — reporting the
+    /// first failure to arrive names the newer key instead, and that is what
+    /// this test caught when the selection was reverted to `record?`.
+    #[tokio::test]
+    async fn a_failed_read_fails_the_whole_log_with_the_smallest_key() {
+        let counter = CountingStore::newest_first();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=6 {
+            store
+                .commit_page(request(
+                    "mbp-1",
+                    &format!("notes/n{index}.md"),
+                    "body",
+                    index * 1_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Premise: the six commits exist and read back cleanly, so a failure
+        // below cannot be explained by an empty or unreadable log.
+        let healthy = store
+            .read_commit_log(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(healthy.len(), 6, "the premise: every commit reads");
+
+        // Break two of them by replacing the records with bytes no
+        // `CommitRecord` decodes to. The smaller of the two keys is the one the
+        // contract names; the larger one is answered first.
+        let keys = commit_keys(&bucket).await;
+        assert_eq!(keys.len(), 6, "the premise: six commit objects to break");
+        let smaller = keys[1].clone();
+        let larger = keys[4].clone();
+        for key in [&smaller, &larger] {
+            bucket
+                .put(
+                    &Path::from(key.as_str()),
+                    PutPayload::from_static(b"not a commit record"),
+                )
+                .await
+                .unwrap();
+        }
+        // Premise: the objects really do hold the corrupt payload, so the
+        // failures come from what is stored and not from the listing.
+        for key in [&smaller, &larger] {
+            let stored = bucket
+                .get(&Path::from(key.as_str()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(
+                stored.as_ref(),
+                b"not a commit record".as_slice(),
+                "{key} must hold the corrupt payload"
+            );
+        }
+
+        let error = store
+            .read_commit_log(&ws(), &proj(), usize::MAX)
+            .await
+            .expect_err("a failing read must fail the whole call, never a partial log");
+        let message = error.to_string();
+        assert!(
+            message.contains(&smaller),
+            "the failure reported must be the smallest failing key's: {message}"
+        );
+        assert!(
+            !message.contains(&larger),
+            "the first failure to arrive must not decide which one is reported: {message}"
         );
     }
 
