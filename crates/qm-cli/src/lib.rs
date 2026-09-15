@@ -450,6 +450,10 @@ fn one_line(text: &str) -> String {
 /// The sections are always all present when there is anything at all to show,
 /// because "no handoffs" and "the handoff section never rendered" are different
 /// facts and a reader should not have to guess which one they are looking at.
+///
+/// `limit == 0` returns the truncation notice before the empty-window check:
+/// every section is capped to nothing, so the report is empty *by request*, and
+/// answering "no recent activity" would report an empty window instead.
 fn render_digest(digest: &Digest, limit: usize) -> String {
     if limit == 0 {
         return "no entries shown: --limit 0 caps every digest section".to_string();
