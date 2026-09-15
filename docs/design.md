@@ -219,8 +219,9 @@ qm sessions
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- 10 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
-  publish / compact / sessions / status`，沿用 ai-memory 的命名习惯，让 agent 的既有习惯可直接迁移。
+- 17 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
+  publish / compact / sessions / status / history / restore / log /
+  handoff_open / handoff_list / handoff_claim / handoff_done`，沿用 ai-memory 的命名习惯。
 - **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
 - 协议层有真实回环测试：拉起 `qm-mcp` 二进制，走 `initialize → tools/list → tools/call`，
   断言工具齐全且都有描述与 inputSchema，跑通 capture → consolidate → publish → search，
@@ -242,7 +243,7 @@ qm restore --path notes/raft.md --version <page_id>
 - `history` 沿 `supersedes` 链逐版取出正文（**不写任何东西**）。
 - `restore` **不是覆盖，而是一次普通写入**：以旧版正文提交一个新版本、supersede 当前版本。
   因此回滚本身可被再次回滚，任何后续版本都不会被销毁——这正是"发散写只 supersede、绝不销毁"的延伸。
-- MCP 侧对应 `memory_history` / `memory_restore`（共 16 个工具）。
+- MCP 侧对应 `memory_history` / `memory_restore`。
 - **时间线来自 commit log（已实现）**：提交时间/序号写在**提交成功之后**的
   `commits/<seq>.json`（`CommitRecord`）。为什么必须后写：这些字段只在提交点确定，塞进内容寻址的不可变版本会破坏
   重试幂等。因此该日志是**建议性元数据**——提交与日志之间崩溃会少一条记录（历史少一个时间戳），
@@ -372,7 +373,7 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
 - `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（10 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（17 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 
