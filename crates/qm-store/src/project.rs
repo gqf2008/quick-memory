@@ -1229,6 +1229,44 @@ impl ProjectStore {
         Ok(newest_first)
     }
 
+    /// Every version of a page, oldest first, bodies included.
+    ///
+    /// The chain is the history: each version's object stays immutable and the
+    /// `supersedes` links order them, so this needs no extra bookkeeping.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] on a broken chain, plus backend failures.
+    pub async fn read_page_versions(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+    ) -> Result<Vec<PageVersion>, StoreError> {
+        let mut versions = Vec::new();
+        for entry in self.page_history(workspace_id, project_id, path).await? {
+            versions.push(
+                self.read_page_version(workspace_id, project_id, path, &entry.page_id)
+                    .await?,
+            );
+        }
+        Ok(versions)
+    }
+
+    /// Read one historical version by id.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when that version object is absent.
+    pub async fn read_page_version_by_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        page_id: &qm_core::PageId,
+    ) -> Result<PageVersion, StoreError> {
+        self.read_page_version(workspace_id, project_id, path, page_id)
+            .await
+    }
+
     /// Read every committed WAL record.
     ///
     /// The result is a *set*, ordered deterministically by page id for stable

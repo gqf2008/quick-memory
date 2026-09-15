@@ -148,6 +148,8 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_compact",
         "memory_sessions",
         "memory_status",
+        "memory_history",
+        "memory_restore",
         "memory_handoff_open",
         "memory_handoff_list",
         "memory_handoff_claim",
@@ -239,6 +241,54 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "a second claim must fail: {second_claim}"
     );
     client.call_tool(12, "memory_handoff_done", serde_json::json!({"id": id}));
+
+    // History and restore over the wire: the older body comes back as a new
+    // version rather than overwriting anything.
+    let written = client.call_tool(
+        13,
+        "memory_write_page",
+        serde_json::json!({"path": "notes/history.md", "body": "first body"}),
+    );
+    let _ = written;
+    let _ = client.call_tool(
+        14,
+        "memory_write_page",
+        serde_json::json!({"path": "notes/history.md", "body": "second body"}),
+    );
+    let history = client.call_tool(
+        15,
+        "memory_history",
+        serde_json::json!({"path": "notes/history.md"}),
+    );
+    let history_text = tool_text(&history);
+    let versions: serde_json::Value = serde_json::from_str(&history_text)
+        .unwrap_or_else(|error| panic!("history must be JSON: {error}: {history_text}"));
+    assert_eq!(versions.as_array().map(Vec::len), Some(2), "{versions}");
+    let oldest = versions[0]["page_id"]
+        .as_str()
+        .expect("version id")
+        .to_string();
+
+    let restored = client.call_tool(
+        16,
+        "memory_restore",
+        serde_json::json!({"path": "notes/history.md", "version": oldest}),
+    );
+    assert!(
+        tool_text(&restored).contains("restored_from"),
+        "{}",
+        tool_text(&restored)
+    );
+    let current = client.call_tool(
+        17,
+        "memory_read_page",
+        serde_json::json!({"path": "notes/history.md"}),
+    );
+    assert!(
+        tool_text(&current).contains("first body"),
+        "{}",
+        tool_text(&current)
+    );
 
     // A tool that fails must report the failure rather than invent success.
     let bad = client.call_tool_raw(

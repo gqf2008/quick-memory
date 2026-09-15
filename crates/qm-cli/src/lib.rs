@@ -173,6 +173,21 @@ pub enum Command {
         #[arg(long)]
         body: Option<String>,
     },
+    /// List a page's versions, oldest first.
+    History {
+        /// Path inside the project.
+        #[arg(long)]
+        path: String,
+    },
+    /// Restore an older version as a new one.
+    Restore {
+        /// Path inside the project.
+        #[arg(long)]
+        path: String,
+        /// Version id to restore (from `qm history`).
+        #[arg(long)]
+        version: String,
+    },
     /// Print a page.
     ReadPage {
         /// Path inside the project.
@@ -834,6 +849,76 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 page.body
             })
         }
+        Command::History { path } => {
+            let page_path = ctx.page(path)?;
+            let versions = ctx
+                .project
+                .read_page_versions(&ctx.workspace, &ctx.project_id, &page_path)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&versions)?
+            } else if versions.is_empty() {
+                format!("no versions at {}", page_path.as_str())
+            } else {
+                versions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, version)| {
+                        format!(
+                            "{}\t{}\tsupersedes={}",
+                            index + 1,
+                            version.page_id,
+                            version
+                                .supersedes
+                                .as_ref()
+                                .map_or("-".to_string(), ToString::to_string)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Command::Restore { path, version } => {
+            let page_path = ctx.page(path)?;
+            let page_id = qm_core::PageId::new(version)?;
+            let historical = ctx
+                .project
+                .read_page_version_by_id(&ctx.workspace, &ctx.project_id, &page_path, &page_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // Restoring is a normal write: it supersedes the current version
+            // and leaves every later object untouched, so a restore is itself
+            // reversible.
+            let outcome = ctx
+                .project
+                .commit_page(CommitPageRequest {
+                    workspace_id: ctx.workspace.clone(),
+                    project_id: ctx.project_id.clone(),
+                    path: page_path.clone(),
+                    title: historical.title.clone(),
+                    body: historical.body.clone(),
+                    writer_id: ctx.writer.clone(),
+                    now_ms: ctx.now_ms,
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::json!({
+                    "restored_from": historical.page_id.as_str(),
+                    "page_id": outcome.page_id.as_str(),
+                    "manifest_seq": outcome.manifest_seq,
+                })
+                .to_string()
+            } else {
+                format!(
+                    "restored {} from {} as a new version at seq {}",
+                    page_path.as_str(),
+                    historical.page_id,
+                    outcome.manifest_seq
+                )
+            })
+        }
         Command::DeletePage { path } => {
             let page_path = ctx.page(path)?;
             let outcome = ctx
@@ -1291,6 +1376,83 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("\"sessions\":1"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn history_lists_versions_and_restore_creates_a_new_one() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for (index, body) in ["first", "second", "third"].iter().enumerate() {
+            execute(
+                &cli(&["write-page", "--path", "notes/raft.md", "--body", body]),
+                Context {
+                    now_ms: (index as i64 + 1) * 1_000,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let history = execute(
+            &cli(&["history", "--path", "notes/raft.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let versions: Vec<qm_core::PageVersion> = serde_json::from_str(&history).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].body, "first");
+        assert_eq!(versions[2].body, "third");
+        assert!(versions[2].supersedes.is_some());
+        let oldest = versions[0].page_id.as_str().to_string();
+
+        // Restoring the first version writes a *new* version…
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 10_000;
+        let restored = execute(
+            &cli(&["restore", "--path", "notes/raft.md", "--version", &oldest]),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(restored.contains("as a new version"), "{restored}");
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 11_000;
+        let current = execute(&cli(&["read-page", "--path", "notes/raft.md"]), ctx)
+            .await
+            .unwrap();
+        assert_eq!(current, "first");
+
+        // …and the version it restored from is still readable, as is the third.
+        let history = execute(
+            &cli(&["history", "--path", "notes/raft.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let versions: Vec<qm_core::PageVersion> = serde_json::from_str(&history).unwrap();
+        assert_eq!(versions.len(), 4, "a restore appends, it never rewrites");
+        assert!(versions.iter().any(|v| v.body == "third"));
+
+        // An unknown version id is refused by name.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 12_000;
+        let missing = execute(
+            &cli(&[
+                "restore",
+                "--path",
+                "notes/raft.md",
+                "--version",
+                &"0".repeat(64),
+            ]),
+            ctx,
+        )
+        .await
+        .expect_err("restoring a version that does not exist must fail");
+        assert!(missing.to_string().contains("not found"), "{missing}");
     }
 
     #[tokio::test]

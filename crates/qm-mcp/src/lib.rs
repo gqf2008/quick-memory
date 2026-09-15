@@ -91,6 +91,15 @@ pub struct HandoffIdArgs {
     pub id: String,
 }
 
+/// Arguments for `memory_restore`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestoreArgs {
+    /// Path inside the project.
+    pub path: String,
+    /// Version id to restore, from `memory_history`.
+    pub version: String,
+}
+
 /// Arguments for page-addressed tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PageArgs {
@@ -249,6 +258,37 @@ impl MemoryServer {
         Parameters(args): Parameters<PageArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::ReadPage { path: args.path }).await
+    }
+
+    /// List a page's versions, oldest first.
+    #[tool(
+        description = "List a page's versions, oldest first, with each version's \
+                       body. History is never destroyed: superseded versions stay \
+                       readable, which is what makes memory_history and \
+                       memory_restore possible."
+    )]
+    async fn memory_history(
+        &self,
+        Parameters(args): Parameters<PageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::History { path: args.path }).await
+    }
+
+    /// Restore an older version as a new one.
+    #[tool(
+        description = "Restore an older version of a page. The restore is itself \
+                       a new version that supersedes the current one, so nothing \
+                       is lost and a restore can be undone by restoring again."
+    )]
+    async fn memory_restore(
+        &self,
+        Parameters(args): Parameters<RestoreArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Restore {
+            path: args.path,
+            version: args.version,
+        })
+        .await
     }
 
     /// Tombstone a page.

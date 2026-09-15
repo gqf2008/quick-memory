@@ -228,6 +228,22 @@ qm sessions
 - 该测试用 `--synthetic-bucket`（进程内、非持久、**不是后端**，启动时向 stderr 打警告）。
   真后端仍由三个探针在带凭据时验证。
 
+## 6.11 历史与回滚：回滚本身也是一次提交
+
+不可变版本让"历史"不需要额外机制：链就是历史。
+
+```bash
+qm history --path notes/raft.md          # 从最早到最新列出各版本
+qm restore --path notes/raft.md --version <page_id>
+```
+
+- `history` 沿 `supersedes` 链逐版取出正文（**不写任何东西**）。
+- `restore` **不是覆盖，而是一次普通写入**：以旧版正文提交一个新版本、supersede 当前版本。
+  因此回滚本身可被再次回滚，任何后续版本都不会被销毁——这正是"发散写只 supersede、绝不销毁"的延伸。
+- MCP 侧对应 `memory_history` / `memory_restore`（共 16 个工具）。
+- 测试：写三个版本 → history 按序返回 3 条 → restore 最早那版 → 当前正文等于旧版、
+  链长变 4（而不是 3）、被回滚掉的第三版仍可读；未知版本 id 报 not found。
+
 ## 6.10 交接棒（handoff）：只能被认领一次
 
 ai-memory 里最值得搬的一条并发语义是"页面共享、接力棒自有"。在对象存储上它反而比 SQL 更简单：
@@ -319,7 +335,7 @@ echo "rolled back the index change" | qm hook --session sess-1
 
 ## 10. 从 ai-memory 借的思想
 
-保留（均已实现）：`(workspace, project, path)` 三元身份、观测→页面的"编译而非检索"、supersession 链、handoff 只被认领一次、FTS+entity+link 多路 RRF、
+保留（均已实现）：`(workspace, project, path)` 三元身份、观测→页面的"编译而非检索"、supersession 链、handoff 只被认领一次、FTS+entity+link 多路 RRF、历史/revert（restore-page）、
 sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-closed 的 scope 解析、MCP 工具面。
 
 替换：SQLite（→ CAS 对象 + 派生索引）、git 工作树（→ 不可变版本 + manifest 链）、fs watcher（→ 发布/重建作业）、
