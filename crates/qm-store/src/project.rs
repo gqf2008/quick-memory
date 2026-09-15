@@ -2281,7 +2281,9 @@ mod tests {
     /// anything actually ran.
     #[derive(Debug)]
     struct CountingStore {
-        inner: InMemory,
+        /// Shared rather than owned so a test can hand the *same* bucket to a
+        /// second machine without going through this instrumentation.
+        inner: Arc<InMemory>,
         reads: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
@@ -2297,6 +2299,11 @@ mod tests {
         /// deletes the object first, so it fails with the backend's own
         /// `NotFound` rather than with a hand-built error.
         vanished: Mutex<BTreeSet<String>>,
+        /// A commit to run against the same bucket just before the next
+        /// manifest update is offered, which is what drives a *real* CAS
+        /// conflict instead of a hand-built orphan: the update that follows is
+        /// stale by the time it reaches the commit point.
+        interloper: Mutex<Option<CommitPageRequest>>,
         order: CompletionOrder,
     }
 
@@ -2330,15 +2337,31 @@ mod tests {
 
         fn in_order(order: CompletionOrder) -> Arc<Self> {
             Arc::new(Self {
-                inner: InMemory::new(),
+                inner: Arc::new(InMemory::new()),
                 reads: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 bookings: AtomicUsize::new(0),
                 completed: Mutex::new(Vec::new()),
                 vanished: Mutex::new(BTreeSet::new()),
+                interloper: Mutex::new(None),
                 order,
             })
+        }
+
+        /// Run `request` against the same bucket immediately before the next
+        /// manifest update, so that update loses its CAS.
+        fn interfere_once(&self, request: CommitPageRequest) {
+            *self.interloper.lock().unwrap() = Some(request);
+        }
+
+        /// The held-back commit, if this write is the manifest update it is
+        /// waiting for. Taking it means it runs exactly once.
+        fn take_interloper(&self, location: &Path) -> Option<CommitPageRequest> {
+            if !location.as_ref().ends_with("/manifest.json") {
+                return None;
+            }
+            self.interloper.lock().unwrap().take()
         }
 
         /// Reads issued since the last [`Self::reset`].
@@ -2422,7 +2445,24 @@ mod tests {
             'life1: 'async_trait,
             Self: 'async_trait,
         {
-            Box::pin(async move { self.inner.put_opts(location, payload, opts).await })
+            Box::pin(async move {
+                // The commit point is the one write whose staleness matters: let
+                // a held-back commit land first, so the update this call is
+                // about to offer is already describing the past. It goes
+                // straight to the shared bucket, so it is neither counted here
+                // nor able to re-enter this instrumentation — and the page
+                // version and WAL record the caller wrote before this call stay
+                // where they are, which is the leftover a real lost race leaves.
+                if let Some(request) = self.take_interloper(location) {
+                    let other: Arc<dyn ObjectStore> =
+                        Arc::clone(&self.inner) as Arc<dyn ObjectStore>;
+                    machine(&other)
+                        .commit_page(request)
+                        .await
+                        .expect("the held-back commit must land");
+                }
+                self.inner.put_opts(location, payload, opts).await
+            })
         }
 
         fn put_multipart_opts<'life0, 'life1, 'async_trait>(
@@ -4390,6 +4430,193 @@ mod tests {
         assert_eq!(
             ids, ordered,
             "the WAL is ordered by page id, not by the order the reads finished"
+        );
+    }
+
+    /// Drive a real lost commit race and hand back what it left behind.
+    ///
+    /// Machine A's first attempt writes its page version and its WAL record,
+    /// then offers a manifest update built on the version it read. A held-back
+    /// commit from machine B is made to land just before that update, so the
+    /// update is stale by the time it reaches the commit point; A retries,
+    /// finds a *different* predecessor for the same path, derives a different
+    /// page id, and commits that one instead. The first attempt's objects are
+    /// therefore in the bucket and in nobody's chain.
+    ///
+    /// Returns the store, the contested path, the id of the attempt that lost,
+    /// and the ids the manifest does name, oldest first.
+    async fn a_lost_attempt(
+        counter: &Arc<CountingStore>,
+    ) -> (
+        ProjectStore,
+        PagePath,
+        qm_core::PageId,
+        Vec<qm_core::PageId>,
+    ) {
+        const PATH: &str = "notes/race.md";
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        let path = PagePath::new(PATH).unwrap();
+
+        // A first version, so the contested commit has a predecessor to
+        // supersede: without one the retry would derive the *same* page id and
+        // the losing attempt would not be an orphan at all.
+        store
+            .commit_page(request("mbp-a", PATH, "v1", 1_000))
+            .await
+            .unwrap();
+        let first = store
+            .load(&ws(), &proj())
+            .await
+            .unwrap()
+            .manifest
+            .head_page_id(&path)
+            .expect("the first commit must leave a head");
+
+        counter.interfere_once(request("mbp-b", PATH, "v2 from b", 2_000));
+        store
+            .commit_page(request("mbp-a", PATH, "v2 from a", 3_000))
+            .await
+            .unwrap();
+
+        // What A's first attempt derived: its own path, title and body, with the
+        // predecessor that was still current when it started.
+        let losing = qm_core::derive_page_id(&path, PATH, "v2 from a", Some(&first));
+        let history = store.page_history(&ws(), &proj(), &path).await.unwrap();
+        assert!(
+            !history.iter().any(|entry| entry.page_id == losing),
+            "the premise: the losing attempt is not what the manifest names"
+        );
+        (
+            store,
+            path,
+            losing,
+            history.into_iter().map(|entry| entry.page_id).collect(),
+        )
+    }
+
+    /// A record left behind by an attempt that lost the commit race is still in
+    /// the bucket, and `read_wal` returns it.
+    ///
+    /// The WAL is "what was written"; only the manifest says what was
+    /// committed. So the record set can be larger than the set of versions the
+    /// manifest names — here by exactly one, and the extra one carries the
+    /// *stale* predecessor, which is what makes it identifiable as the attempt
+    /// that lost rather than a committed version.
+    #[tokio::test]
+    async fn read_wal_returns_the_record_a_lost_cas_left_behind() {
+        let counter = CountingStore::new();
+        let (store, path, losing, committed) = a_lost_attempt(&counter).await;
+
+        let history = store.page_history(&ws(), &proj(), &path).await.unwrap();
+        assert_eq!(history.len(), 3, "three versions committed to this path");
+        let committed_ids: Vec<&str> = history.iter().map(|entry| entry.page_id.as_str()).collect();
+        assert_eq!(
+            committed_ids.first(),
+            Some(&committed[0].as_str()),
+            "the premise: the first version is still the start of the chain"
+        );
+        assert!(
+            !committed_ids.contains(&losing.as_str()),
+            "the premise: no committed version is the losing attempt"
+        );
+
+        let wal = store.read_wal(&ws(), &proj()).await.unwrap();
+        let ids: Vec<&str> = wal.iter().map(|entry| entry.page_id.as_str()).collect();
+        assert_eq!(
+            wal.len(),
+            4,
+            "three committed versions plus the record the retry abandoned"
+        );
+        assert_eq!(
+            wal.len(),
+            history.len() + 1,
+            "read_wal answers with what the bucket holds, not with what is committed"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| **id == losing.as_str()).count(),
+            1,
+            "the abandoned record is returned, exactly once"
+        );
+
+        // The record itself still names the predecessor the losing attempt saw,
+        // which is why the retry derived a different page id and left it here.
+        let abandoned = wal
+            .iter()
+            .find(|entry| entry.page_id == losing)
+            .expect("the abandoned record is in the answer");
+        assert_eq!(abandoned.supersedes.as_ref(), Some(&committed[0]));
+        assert_eq!(abandoned.path, path);
+    }
+
+    /// `qm gc` is what reclaims the record a lost race left behind — which is
+    /// why a read racing a collection has to treat a missing record as a
+    /// failure rather than quietly answering with a shorter list.
+    #[tokio::test]
+    async fn gc_reclaims_the_wal_record_a_lost_cas_left_behind() {
+        let counter = CountingStore::new();
+        let (store, path, losing, _) = a_lost_attempt(&counter).await;
+        let orphan = store.layout().wal_entry(&ws(), &proj(), losing.as_str());
+
+        // Premise: the abandoned record is readable, and it is the one object
+        // under the WAL prefix that nothing references.
+        let before = store.read_wal(&ws(), &proj()).await.unwrap();
+        assert_eq!(before.len(), 4, "the premise: four records are readable");
+        assert!(
+            before.iter().any(|entry| entry.page_id == losing),
+            "the premise: the abandoned record is one of them"
+        );
+
+        // A dry run names nothing it did not do.
+        let plan = store
+            .gc_orphans(&ws(), &proj(), 10_000, 0, false)
+            .await
+            .unwrap();
+        assert!(plan.dry_run);
+        assert_eq!(plan.deleted, 0);
+        assert!(plan.deleted_keys.is_empty());
+        assert!(store.cas().head(&orphan).await.is_ok());
+
+        // The apply pass reclaims it: the key is named, and the object is gone.
+        let applied = store
+            .gc_orphans(&ws(), &proj(), 10_000, 0, true)
+            .await
+            .unwrap();
+        assert!(
+            applied.deleted_keys.iter().any(|key| key == &orphan),
+            "the collection must name the abandoned record: {:?}",
+            applied.deleted_keys
+        );
+        assert!(matches!(
+            store.cas().head(&orphan).await,
+            Err(StoreError::NotFound)
+        ));
+
+        // And only that one: the committed versions still read, still in order.
+        let after = store.read_wal(&ws(), &proj()).await.unwrap();
+        assert_eq!(
+            after.len(),
+            3,
+            "collection must leave every referenced record alone"
+        );
+        assert!(!after.iter().any(|entry| entry.page_id == losing));
+        assert_eq!(
+            store
+                .page_history(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "history is a feature, not garbage"
+        );
+        assert_eq!(
+            store
+                .read_page(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "v2 from a"
         );
     }
 
