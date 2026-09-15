@@ -21,7 +21,9 @@ use qm_core::{
     WriterId,
 };
 use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
-use qm_search::{PageDoc, compact_project, publish_split_index, search_project, search_workspace};
+use qm_search::{
+    PageDoc, compact_project, publish_split_index, search_project_tuned, search_workspace_tuned,
+};
 use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
 /// Command line interface.
@@ -137,6 +139,9 @@ pub enum Command {
         /// Search every project in the workspace, not just the current one.
         #[arg(long, default_value_t = false)]
         global: bool,
+        /// Ignore how recently a page changed when ranking.
+        #[arg(long, default_value_t = false)]
+        no_recency: bool,
     },
     /// Rebuild this machine's split from the current pages and publish it.
     Publish,
@@ -580,14 +585,25 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             query,
             limit,
             global,
+            no_recency,
         } => {
+            // Freshness helps but must not dominate relevance: the boost is
+            // bounded, and --no-recency turns it off entirely.
+            let tuning = if *no_recency {
+                qm_search::SearchTuning::default()
+            } else {
+                qm_search::SearchTuning {
+                    now_ms: ctx.now_ms,
+                    ..Default::default()
+                }
+            };
             let outcome = if *global {
                 let projects = ctx
                     .project
                     .list_projects(&ctx.workspace)
                     .await
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
-                search_workspace(
+                search_workspace_tuned(
                     ctx.bucket.as_ref(),
                     &ctx.project,
                     &ctx.workspace,
@@ -595,10 +611,11 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     &ctx.cache_dir,
                     query,
                     *limit,
+                    &tuning,
                 )
                 .await?
             } else {
-                search_project(
+                search_project_tuned(
                     ctx.bucket.as_ref(),
                     &ctx.project,
                     &ctx.workspace,
@@ -606,6 +623,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     &ctx.cache_dir,
                     query,
                     *limit,
+                    &tuning,
                 )
                 .await?
             };

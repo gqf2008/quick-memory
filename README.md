@@ -42,6 +42,7 @@ cargo run -p qm-cli --bin qm -- consolidate --session sess-1          # --compil
 cargo run -p qm-cli --bin qm -- publish   # 增量：只发布本机上次发布后变化的页面
 cargo run -p qm-cli --bin qm -- search "suite" --json
 cargo run -p qm-cli --bin qm -- search "suite" --global          # 跨项目检索
+cargo run -p qm-cli --bin qm -- search "suite" --no-recency      # 关掉新近度先验
 cargo run -p qm-cli --bin qm -- export --to ./exported   # 人工可读迁出
 cargo run -p qm-cli --bin qm -- import --from ./exported # 迁到另一个桶
 cargo run -p qm-cli --bin qm -- verify        # 桶完整性自检（只读）

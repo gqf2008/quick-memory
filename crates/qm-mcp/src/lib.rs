@@ -279,6 +279,9 @@ impl MemoryServer {
             query: args.query,
             limit: args.limit.unwrap_or(10),
             global: args.global.unwrap_or(false),
+            // Agents get the same freshness tie-breaker the CLI does; it is
+            // bounded, reported per hit, and cannot overturn stream agreement.
+            no_recency: false,
         })
         .await
     }

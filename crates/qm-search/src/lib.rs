@@ -89,11 +89,24 @@ pub struct Hit {
     pub page_id: String,
     /// Page title.
     pub title: String,
-    /// BM25 score.
+    /// Final score: the fused rank score after any recency adjustment.
     pub score: f32,
+    /// The fused score before the recency adjustment, for explainability.
+    #[serde(default)]
+    pub fused_score: f32,
+    /// Multiplier applied for recency (1.0 when the tuning is disabled).
+    #[serde(default = "default_multiplier")]
+    pub recency_multiplier: f32,
+    /// When the page version was committed, in milliseconds.
+    #[serde(default)]
+    pub updated_at_ms: i64,
     /// Retrieval streams that produced this hit, e.g. `body` and `entities`.
     #[serde(default)]
     pub streams: Vec<String>,
+}
+
+fn default_multiplier() -> f32 {
+    1.0
 }
 
 fn schema() -> Schema {
@@ -292,6 +305,7 @@ pub fn search_stream(
     let workspace_field = optional("workspace_id");
     let project_field = optional("project_id");
     let title_field = optional("title");
+    let updated_field = optional("updated_at_ms");
     // Foreign splits have no title: use the first stored text field so a hit is
     // still identifiable to a human.
     let title_fallback: Option<tantivy::schema::Field> = s
@@ -323,6 +337,12 @@ pub fn search_stream(
                 }
             },
             score,
+            fused_score: score,
+            recency_multiplier: 1.0,
+            updated_at_ms: updated_field
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
             streams: vec![stream.to_string()],
         });
     }
@@ -545,6 +565,37 @@ pub async fn search_workspace(
     query: &str,
     limit: usize,
 ) -> Result<SearchOutcome> {
+    search_workspace_tuned(
+        store,
+        project_store,
+        workspace_id,
+        projects,
+        cache_root,
+        query,
+        limit,
+        &SearchTuning::default(),
+    )
+    .await
+}
+
+/// Workspace search with an explicit relevance/recency trade-off.
+///
+/// The tuning is applied once, after the cross-project fusion: applying it per
+/// project as well would count the same prior twice.
+///
+/// # Errors
+/// Propagates each project's search failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_workspace_tuned(
+    store: &dyn ObjectStore,
+    project_store: &ProjectStore,
+    workspace_id: &WorkspaceId,
+    projects: &[ProjectId],
+    cache_root: &Path,
+    query: &str,
+    limit: usize,
+    tuning: &SearchTuning,
+) -> Result<SearchOutcome> {
     let mut lists = Vec::new();
     let mut splits_searched = 0usize;
     let mut candidates = 0usize;
@@ -578,6 +629,7 @@ pub async fn search_workspace(
         .map(|(stream, _)| stream.clone())
         .collect();
     let mut hits = fuse_rrf(lists, 60.0);
+    tuning.apply(&mut hits);
     hits.truncate(limit);
     Ok(SearchOutcome {
         hits,
@@ -587,6 +639,76 @@ pub async fn search_workspace(
         streams_active,
         stream_candidates,
     })
+}
+
+/// How retrieval trades relevance against recency.
+///
+/// The borrowed design applies a *bounded* authority adjustment after fusion.
+/// The bound is on the multiplier (0.5 = at most +50%), and one property of
+/// reciprocal-rank fusion has to be stated plainly: RRF scores are compressed
+/// (rank 1 and rank 2 differ by ~1.6% for k=60), so **any** positive boost can
+/// reorder adjacent ranks. Recency here is a tie-breaker between comparably
+/// relevant pages — not a licence for stale-but-irrelevant content to win, and
+/// not a strong preference input. A page that agrees across *more streams*
+/// (body + entities, say) is roughly twice as strong and keeps its lead.
+/// A zero half-life disables the adjustment entirely.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchTuning {
+    /// Age at which the boost halves, in milliseconds.
+    pub recency_half_life_ms: i64,
+    /// Maximum relative boost, e.g. 0.5 for "+50% at most".
+    pub max_boost: f32,
+    /// Reference time; hits newer than this get the full boost.
+    pub now_ms: i64,
+}
+
+impl Default for SearchTuning {
+    fn default() -> Self {
+        Self {
+            recency_half_life_ms: 30 * 24 * 60 * 60 * 1_000,
+            max_boost: 0.5,
+            now_ms: 0,
+        }
+    }
+}
+
+impl SearchTuning {
+    /// Whether the adjustment does anything.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.recency_half_life_ms <= 0 || self.max_boost <= 0.0 || self.now_ms <= 0
+    }
+
+    /// Bounded recency multiplier for a page committed at `updated_at_ms`.
+    #[must_use]
+    pub fn multiplier(&self, updated_at_ms: i64) -> f32 {
+        if self.is_disabled() || updated_at_ms <= 0 {
+            return 1.0;
+        }
+        let age_ms = (self.now_ms - updated_at_ms).max(0) as f32;
+        let half_life = self.recency_half_life_ms as f32;
+        // 2^(-age/half_life): 1.0 for a brand-new page, 0.5 after one half-life.
+        let decay = (-age_ms / half_life).exp2();
+        1.0 + self.max_boost * decay
+    }
+
+    /// Apply the multiplier to a fused result list, re-sorting it.
+    fn apply(&self, hits: &mut [Hit]) {
+        if self.is_disabled() {
+            return;
+        }
+        for hit in hits.iter_mut() {
+            hit.recency_multiplier = self.multiplier(hit.updated_at_ms);
+            hit.fused_score = hit.score;
+            hit.score *= hit.recency_multiplier;
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.page_id.cmp(&b.page_id))
+        });
+    }
 }
 
 /// What a project search did.
@@ -741,6 +863,34 @@ pub async fn search_project(
     query: &str,
     limit: usize,
 ) -> Result<SearchOutcome> {
+    search_project_tuned(
+        store,
+        project_store,
+        workspace_id,
+        project_id,
+        cache_root,
+        query,
+        limit,
+        &SearchTuning::default(),
+    )
+    .await
+}
+
+/// Search a project with an explicit relevance/recency trade-off.
+///
+/// # Errors
+/// Propagates catalog, materialisation, and query failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_project_tuned(
+    store: &dyn ObjectStore,
+    project_store: &ProjectStore,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    cache_root: &Path,
+    query: &str,
+    limit: usize,
+    tuning: &SearchTuning,
+) -> Result<SearchOutcome> {
     let loaded = project_store
         .load_catalog(workspace_id, project_id)
         .await
@@ -803,6 +953,8 @@ pub async fn search_project(
         .map_err(|error| anyhow::anyhow!("{error}"))?
         .manifest;
     let before = fused.len();
+    let mut fused = fused;
+    tuning.apply(&mut fused);
     let mut hits: Vec<Hit> = fused
         .into_iter()
         .filter(|hit| {
@@ -1191,6 +1343,153 @@ mod tests {
         assert_eq!(
             second.hits, first.hits,
             "the second search must be served from the cache"
+        );
+    }
+
+    #[test]
+    fn recency_boost_is_bounded_and_disabled_cleanly() {
+        let half_life = 30 * 24 * 60 * 60 * 1_000i64;
+        let tuning = SearchTuning {
+            recency_half_life_ms: half_life,
+            max_boost: 0.5,
+            now_ms: 10 * half_life,
+        };
+        // Brand new: the full boost, never more.
+        assert!((tuning.multiplier(tuning.now_ms) - 1.5).abs() < 1e-6);
+        // One half-life old: half the boost.
+        assert!((tuning.multiplier(tuning.now_ms - half_life) - 1.25).abs() < 1e-6);
+        // Very old: the boost tends to zero, so relevance dominates.
+        assert!(tuning.multiplier(1).abs() < 1.01);
+        // A future timestamp is treated as new, not as a huge bonus.
+        assert!((tuning.multiplier(tuning.now_ms + half_life) - 1.5).abs() < 1e-6);
+
+        let disabled = SearchTuning {
+            recency_half_life_ms: 0,
+            ..tuning
+        };
+        assert_eq!(disabled.multiplier(tuning.now_ms), 1.0);
+        assert!(disabled.is_disabled());
+    }
+
+    /// What the recency prior actually promises, checked as three properties:
+    /// equally relevant pages are ordered by freshness, agreement across more
+    /// streams still wins, and disabling the prior changes nothing at all.
+    #[tokio::test]
+    async fn recency_breaks_ties_without_overturning_stream_agreement() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let writer = WriterId::new("mbp-a").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let now = 1_700_000_000_000i64;
+        let long_ago = now - 365 * 24 * 60 * 60 * 1_000;
+
+        // old-strong declares the entity (two streams), the others do not.
+        let pages = [
+            ("notes/old-plain.md", "consensus in prose", long_ago),
+            ("notes/new-plain.md", "consensus in prose", now),
+            ("notes/old-strong.md", "consensus in `consensus`", long_ago),
+        ];
+        let mut docs = Vec::new();
+        for (path, body, at) in pages {
+            let page_path = PagePath::new(path).unwrap();
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: page_path.clone(),
+                    title: path.to_string(),
+                    body: body.to_string(),
+                    writer_id: writer.clone(),
+                    now_ms: at,
+                })
+                .await
+                .unwrap();
+            let page = project
+                .read_page(&workspace, &project_id, &page_path)
+                .await
+                .unwrap()
+                .unwrap();
+            // Keep the real page id: a synthetic one would be filtered out by
+            // the authority check and the test would measure nothing.
+            docs.push(PageDoc::from_version(&workspace, &project_id, &page, at));
+        }
+        publish_split_index(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            &writer,
+            1,
+            &docs,
+            &build_root.path().join("s"),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let tuning = SearchTuning {
+            now_ms: now,
+            ..Default::default()
+        };
+        let outcome = search_project_tuned(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "consensus",
+            10,
+            &tuning,
+        )
+        .await
+        .unwrap();
+        let order: Vec<&str> = outcome.hits.iter().map(|hit| hit.path.as_str()).collect();
+        let rank = |path: &str| {
+            order
+                .iter()
+                .position(|candidate| *candidate == path)
+                .unwrap()
+        };
+
+        // Agreeing across two streams is a stronger signal than being fresh in
+        // one, and the bounded boost cannot overturn it.
+        assert!(
+            rank("notes/old-strong.md") < rank("notes/new-plain.md"),
+            "stream agreement must beat freshness: {order:?}"
+        );
+        // Between equally relevant pages, the fresher one comes first.
+        assert!(
+            rank("notes/new-plain.md") < rank("notes/old-plain.md"),
+            "equally relevant pages order by freshness: {order:?}"
+        );
+        // The boost is reported, not hidden.
+        let fresh = outcome
+            .hits
+            .iter()
+            .find(|hit| hit.path == "notes/new-plain.md")
+            .unwrap();
+        assert!(fresh.recency_multiplier > 1.0, "{fresh:?}");
+        assert!(fresh.fused_score > 0.0, "{fresh:?}");
+
+        // Disabling the prior leaves every multiplier at 1.0.
+        let untuned = search_project(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "consensus",
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(
+            untuned
+                .hits
+                .iter()
+                .all(|hit| (hit.recency_multiplier - 1.0).abs() < f32::EPSILON)
         );
     }
 
