@@ -3116,7 +3116,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
 
     use futures::stream::BoxStream;
@@ -3212,6 +3212,24 @@ mod tests {
         /// machine writing the other form is refused — that refusal is a guard
         /// of its own, and it would make the conflict unreachable.
         interloper: Mutex<Option<(u32, CommitPageRequest)>>,
+        /// A commit to run against the same bucket the moment the *next*
+        /// manifest put returns, which is the other half of the race
+        /// [`Self::interfere_once`] covers: that one makes the caller's update
+        /// stale before it is offered, this one starts a write only once the
+        /// commit point has already been replaced.
+        follow_once: Mutex<Option<(u32, CommitPageRequest)>>,
+        /// Outcomes of the commits [`Self::follow_once`] armed, in the order
+        /// they ran. A refused one is recorded as its error: the point of the
+        /// timing is that being refused here is a *documented* answer, not a
+        /// write that quietly vanished.
+        followed: Mutex<Vec<Result<CommitOutcome, String>>>,
+        /// Whether every manifest put is followed by a full read of the scope,
+        /// recorded in [`Self::observations`].
+        watch_manifest_puts: AtomicBool,
+        /// What a full read of the scope found immediately after each manifest
+        /// put returned, while that watch was armed. Each entry is the number
+        /// of live pages, or the error the read failed with.
+        observations: Mutex<Vec<Result<usize, String>>>,
         /// A put this bucket will refuse once, when its key ends this way.
         ///
         /// An interruption has to land *at* the switch, because that is the
@@ -3262,6 +3280,10 @@ mod tests {
                 completed: Mutex::new(Vec::new()),
                 vanished: Mutex::new(BTreeSet::new()),
                 interloper: Mutex::new(None),
+                follow_once: Mutex::new(None),
+                followed: Mutex::new(Vec::new()),
+                watch_manifest_puts: AtomicBool::new(false),
+                observations: Mutex::new(Vec::new()),
                 refused_put: Mutex::new(None),
                 written: Mutex::new(Vec::new()),
                 order,
@@ -3286,6 +3308,35 @@ mod tests {
                 return None;
             }
             self.interloper.lock().unwrap().take()
+        }
+
+        /// Run `request` against the same bucket as soon as the next manifest
+        /// put has returned — the commit that starts after the flip.
+        fn follow_once(&self, request: CommitPageRequest) {
+            self.follow_once_as(qm_core::MANIFEST_FORMAT_WHOLE, request);
+        }
+
+        /// The same, by a machine writing `format`.
+        fn follow_once_as(&self, format: u32, request: CommitPageRequest) {
+            *self.follow_once.lock().unwrap() = Some((format, request));
+        }
+
+        /// What the commits armed with [`Self::follow_once`] returned.
+        fn followed(&self) -> Vec<Result<CommitOutcome, String>> {
+            self.followed.lock().unwrap().clone()
+        }
+
+        /// Read the whole scope immediately after every manifest put, so that
+        /// "the commit point never names an object that is not there yet" is
+        /// observed at the instant it could be false rather than argued from
+        /// the order of the source lines.
+        fn watch_manifest_puts(&self) {
+            self.watch_manifest_puts.store(true, AtomicOrdering::SeqCst);
+        }
+
+        /// What those reads found, in the order the puts returned.
+        fn observations(&self) -> Vec<Result<usize, String>> {
+            self.observations.lock().unwrap().clone()
         }
 
         /// Refuse the next put whose key ends with `suffix`, once.
@@ -3319,12 +3370,52 @@ mod tests {
             self.vanished.lock().unwrap().insert(key.to_string());
         }
 
+        /// The two things a fixture does the moment a commit point has moved:
+        /// observe the scope a reader would see, then start the write that was
+        /// waiting for this instant.
+        ///
+        /// Both go through the *inner* bucket with a separate store, so they
+        /// neither re-enter this instrumentation nor disturb the counters of
+        /// the call they are attached to.
+        async fn after_manifest_put(&self, committed: bool) {
+            let probe = {
+                let other: Arc<dyn ObjectStore> = Arc::clone(&self.inner) as Arc<dyn ObjectStore>;
+                machine(&other)
+                    .recent_pages(&ws(), &proj(), usize::MAX)
+                    .await
+                    .map(|pages| pages.len())
+                    .map_err(|error| error.to_string())
+            };
+            if self.watch_manifest_puts.load(AtomicOrdering::SeqCst) {
+                self.observations.lock().unwrap().push(probe);
+            }
+            // Only a put that landed can have moved the commit point, so a
+            // refused one neither opens the window nor releases the follow-up.
+            if !committed {
+                return;
+            }
+            let Some((format, request)) = self.follow_once.lock().unwrap().take() else {
+                return;
+            };
+            let other: Arc<dyn ObjectStore> = Arc::clone(&self.inner) as Arc<dyn ObjectStore>;
+            let outcome = machine_with_format(&other, format)
+                .commit_page(request)
+                .await
+                .map_err(|error| error.to_string());
+            self.followed.lock().unwrap().push(outcome);
+        }
+
         /// Forget what has been observed, so a test can time one call.
         fn reset(&self) {
             self.reads.store(0, AtomicOrdering::SeqCst);
             self.max_in_flight.store(0, AtomicOrdering::SeqCst);
             self.completed.lock().unwrap().clear();
             self.written.lock().unwrap().clear();
+            *self.follow_once.lock().unwrap() = None;
+            self.followed.lock().unwrap().clear();
+            self.watch_manifest_puts
+                .store(false, AtomicOrdering::SeqCst);
+            self.observations.lock().unwrap().clear();
         }
     }
 
@@ -3461,7 +3552,11 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(location.as_ref().to_string());
-                self.inner.put_opts(location, payload, opts).await
+                let result = self.inner.put_opts(location, payload, opts).await;
+                if location.as_ref().ends_with("/manifest.json") {
+                    self.after_manifest_put(result.is_ok()).await;
+                }
+                result
             })
         }
 
@@ -6250,6 +6345,297 @@ mod tests {
         );
     }
 
+    /// Path counts the split is measured at.
+    ///
+    /// 1 000 and 100 000 are the ends: at 1 000 not every shard is reachable
+    /// yet, at 100 000 every one is and each carries ~390 paths, which is where
+    /// a single shard gets as close to the per-object ceiling as this fixture
+    /// takes it.
+    const SHARD_SCALE_PATH_COUNTS: [usize; 3] = [1_000, 10_000, 100_000];
+
+    /// What one split of a manifest into shards measures, in production bytes.
+    #[derive(Debug)]
+    struct SplitMeasurement {
+        /// Non-empty shards, i.e. objects the root names.
+        shards: usize,
+        /// Smallest number of paths any named shard carries.
+        min_paths: usize,
+        /// Largest number of paths any named shard carries.
+        ///
+        /// The spread and not the average: the per-shard ceiling has to hold
+        /// for the worst shard, and a hash can pile paths up.
+        max_paths: usize,
+        /// Bytes of the largest shard, against `MANIFEST_MAX_BYTES`.
+        max_shard_bytes: usize,
+        /// Bytes of the root pointer that names those shards.
+        root_bytes: usize,
+        /// Bytes the same manifest takes as a single object.
+        whole_bytes: usize,
+    }
+
+    /// Split `manifest`, encode every shard with the production encoder, and
+    /// measure what came out.
+    ///
+    /// The encoded shards come back with the numbers so that the second half of
+    /// the probe can stage the *same* split instead of splitting and encoding
+    /// 100 000 paths a second time.
+    fn split_and_measure(manifest: &Manifest) -> (SplitMeasurement, Vec<(ManifestShard, Bytes)>) {
+        let layout = KeyLayout::new("v1");
+        let parts = manifest.clone().into_shards();
+        let mut shards: Vec<ShardRef> = Vec::with_capacity(parts.len());
+        let mut encoded: Vec<(ManifestShard, Bytes)> = Vec::with_capacity(parts.len());
+        let mut sizes: Vec<usize> = Vec::with_capacity(parts.len());
+        let mut counts: Vec<usize> = Vec::with_capacity(parts.len());
+        for part in parts {
+            let bytes = encode_shard(&ws(), &proj(), &part).unwrap();
+            let hash = content_hash(&bytes);
+            sizes.push(bytes.len());
+            counts.push(part.pages.len() + part.tombstones.len());
+            shards.push(ShardRef {
+                shard: part.shard,
+                key: layout.manifest_shard(&ws(), &proj(), &hash),
+                content_hash: hash,
+                path_count: part.pages.len() + part.tombstones.len(),
+            });
+            encoded.push((part, bytes));
+        }
+        let mut root = ManifestRoot::empty(ws(), proj());
+        root.seq = manifest.seq;
+        root.updated_at_ms = manifest.updated_at_ms;
+        root.shards = shards;
+        let measurement = SplitMeasurement {
+            shards: encoded.len(),
+            min_paths: counts.iter().copied().min().unwrap_or(0),
+            max_paths: counts.iter().copied().max().unwrap_or(0),
+            max_shard_bytes: sizes.iter().copied().max().unwrap_or(0),
+            root_bytes: encode_root(&ws(), &proj(), &root).unwrap().len(),
+            whole_bytes: manifest_bytes(manifest),
+        };
+        (measurement, encoded)
+    }
+
+    /// Write an already-encoded split into `bucket` the way a migration leaves
+    /// a scope — without committing its 100 000 pages one at a time.
+    async fn stage_sharded(
+        bucket: &Arc<dyn ObjectStore>,
+        manifest: &Manifest,
+        encoded: Vec<(ManifestShard, Bytes)>,
+    ) -> ManifestRoot {
+        let store = shard_machine(bucket);
+        let mut shards: Vec<ShardRef> = Vec::with_capacity(encoded.len());
+        for (part, bytes) in encoded {
+            let hash = content_hash(&bytes);
+            let key = store.layout().manifest_shard(&ws(), &proj(), &hash);
+            store.cas().create(&key, bytes).await.unwrap();
+            shards.push(ShardRef {
+                shard: part.shard,
+                key,
+                content_hash: hash,
+                path_count: part.pages.len() + part.tombstones.len(),
+            });
+        }
+        let mut root = ManifestRoot::empty(ws(), proj());
+        root.seq = manifest.seq;
+        root.updated_at_ms = manifest.updated_at_ms;
+        root.shards = shards;
+        let bytes = encode_root(&ws(), &proj(), &root).unwrap();
+        store
+            .cas()
+            .create(&store.layout().manifest(&ws(), &proj()), bytes)
+            .await
+            .unwrap();
+        root
+    }
+
+    /// The measured scale point for the split: the same 100 000-path fixture
+    /// `manifest_size_is_linear_in_paths` measures, stored the way a migrated
+    /// scope stores it.
+    ///
+    /// The numbers are pinned as literals because `docs/ops.md` and
+    /// `docs/design.md` quote them as the evidence for what the sharded form
+    /// bounds. A wider `PageEntry` moves every one of them, and that has to fail
+    /// here rather than leave the documentation quietly wrong. What is measured
+    /// is *this* point; the path ceiling of a whole scope is an extrapolation
+    /// from it, and is described as one.
+    ///
+    /// The second half of the same run measures what a *single* path costs at
+    /// that size: the objects a commit touches and the objects a read touches.
+    /// Those are the numbers the read-path table quotes, and they are the ones
+    /// that would grow if the split stopped bounding the work.
+    ///
+    ///     cargo test -p qm-store --lib sharded_manifest_scale_probe -- --nocapture
+    #[tokio::test]
+    async fn sharded_manifest_scale_probe() {
+        println!("paths,shards,min_paths,max_paths,max_shard_bytes,root_bytes,whole_bytes");
+        let hundred_thousand = manifest_with_paths(100_000, false);
+        let (at_scale, parts_at_scale) = split_and_measure(&hundred_thousand);
+        let measured: Vec<SplitMeasurement> = SHARD_SCALE_PATH_COUNTS
+            .iter()
+            .take(2)
+            .map(|count| split_and_measure(&manifest_with_paths(*count, false)).0)
+            .chain(std::iter::once(at_scale))
+            .collect();
+        let mut parts_at_scale = parts_at_scale.into_iter();
+        for (count, split) in SHARD_SCALE_PATH_COUNTS.iter().zip(&measured) {
+            println!(
+                "{count},{},{},{},{},{},{}",
+                split.shards,
+                split.min_paths,
+                split.max_paths,
+                split.max_shard_bytes,
+                split.root_bytes,
+                split.whole_bytes
+            );
+        }
+
+        assert_eq!(
+            measured
+                .iter()
+                .map(|split| (
+                    split.shards,
+                    split.min_paths,
+                    split.max_paths,
+                    split.max_shard_bytes,
+                    split.root_bytes,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (251, 1, 10, 2_526, 58_014),
+                (256, 25, 61, 14_928, 59_424),
+                (256, 335, 442, 107_911, 59_681),
+            ],
+            "the measured split moved; docs/ops.md and docs/design.md quote these \
+             shard counts, spreads, shard bytes and root bytes, so all of them have \
+             to be re-derived together"
+        );
+
+        // The split is the only thing that changed: this is the fixture the
+        // single-object table measures, and as one object it is still that size.
+        assert_eq!(
+            measured[2].whole_bytes, MEASURED_BYTES[3],
+            "the split must be measured on the same fixture the ceiling table uses"
+        );
+
+        // The root sizes the path count, not the shard count: two roots with the
+        // same 256 shard references differ only by the digits of `path_count`
+        // and `seq`, and ten times the paths buys 257 bytes.
+        assert_eq!(
+            measured[2].root_bytes - measured[1].root_bytes,
+            257,
+            "the root's size is a function of the shard references and the digits in \
+             them, not of how many paths the shards hold"
+        );
+
+        // How much of a shard's ceiling the largest shard uses at this point.
+        // Integer division on purpose: the documentation says "under a ninth",
+        // which is a claim about whole multiples, not about 9.7.
+        assert_eq!(
+            MANIFEST_MAX_BYTES / measured[2].max_shard_bytes,
+            9,
+            "docs quote the largest shard at the measured point as under a ninth of \
+             MANIFEST_MAX_BYTES"
+        );
+        // The same 100 000-path scope, written the way a migration leaves one,
+        // measured through the real store against a counting bucket. The
+        // objects are compared as **key sets**, not counts — a count is
+        // satisfied by a reader that fetched one object twice and never asked
+        // for another.
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let root =
+            stage_sharded(&other, &hundred_thousand, parts_at_scale.by_ref().collect()).await;
+        assert_eq!(
+            root.shards.len(),
+            usize::from(qm_core::MANIFEST_SHARD_COUNT),
+            "the premise: at this size every shard is materialised"
+        );
+        let store = shard_machine(&other);
+
+        let path = PagePath::new("notes/late.md").unwrap();
+        let manifest_key = store.layout().manifest(&ws(), &proj());
+        let shard_key = root
+            .shard(manifest_shard_index(path.as_str()))
+            .expect("the premise: the path's shard exists")
+            .key
+            .clone();
+        let page_id = derive_page_id(&path, "late", "committed at scale", None);
+        let page_key = store.layout().page_version(&ws(), &proj(), &path, &page_id);
+        let wal_key = store.layout().wal_entry(&ws(), &proj(), page_id.as_str());
+
+        bucket.reset();
+        let outcome = store
+            .commit_page(titled(
+                "mbp-a",
+                path.as_str(),
+                "late",
+                "committed at scale",
+                9_000,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.page_id, page_id);
+        let mut read = bucket.completed();
+        read.sort();
+        let mut expected = vec![manifest_key.clone(), shard_key.clone()];
+        expected.sort();
+        assert_eq!(
+            read,
+            expected,
+            "a commit reads the root and the one shard the path hashes to — not the \
+         other {} shards",
+            root.shards.len() - 1
+        );
+        // The shard the commit *replaced* is the one it read; the key in the
+        // bucket is the new one, and the root names it.
+        let new_shard_key = store
+            .load(&ws(), &proj())
+            .await
+            .unwrap()
+            .root
+            .unwrap()
+            .shard(manifest_shard_index(path.as_str()))
+            .unwrap()
+            .key
+            .clone();
+        assert_ne!(
+            new_shard_key, shard_key,
+            "the premise: the shard really changed, so the write is the new object"
+        );
+        let commit_record = store
+            .layout()
+            .commit_record(&ws(), &proj(), outcome.manifest_seq);
+        let mut written = bucket.written();
+        written.sort();
+        let mut expected = vec![
+            commit_record,
+            manifest_key.clone(),
+            new_shard_key.clone(),
+            page_key.clone(),
+            wal_key,
+        ];
+        expected.sort();
+        assert_eq!(
+            written, expected,
+            "and it rewrites exactly one shard, never the whole project"
+        );
+
+        bucket.reset();
+        let page = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .expect("the page committed at scale is readable");
+        assert_eq!(page.body, "committed at scale");
+        let mut read = bucket.completed();
+        read.sort();
+        let mut expected = vec![manifest_key, new_shard_key, page_key];
+        expected.sort();
+        assert_eq!(
+            read, expected,
+            "a read is the root, the one shard, and the version it points at"
+        );
+    }
+
     /// Every byte of one entry, attributed by perturbing exactly one field.
     ///
     /// The marginal cost is not a guess: the parts are measured, and the
@@ -6769,6 +7155,268 @@ mod tests {
         keys.iter()
             .filter(|key| key.contains("/manifest/shards/"))
             .count()
+    }
+
+    /// A commit that wins the race against a migration is not lost by it.
+    ///
+    /// This is the timing a retry loop exists for: the racing commit lands
+    /// between the migration's read and the migration's CAS, so the root the
+    /// migration is about to offer already describes the past. The migration
+    /// has to notice and convert the state it actually found — an offering that
+    /// overwrote the winner instead would delete a commit that had already
+    /// returned success, and with it a sequence number every later commit is
+    /// counted against.
+    #[tokio::test]
+    async fn a_commit_that_beats_the_migration_cas_survives_the_migration() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = machine(&other);
+        seed_whole(&store, 5).await;
+
+        let raced = PagePath::new("notes/raced.md").unwrap();
+        bucket.interfere_once(request("mbp-b", raced.as_str(), "raced in", 9_000));
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+
+        // The claim first: a commit that returned success is still there. A
+        // conversion that overwrote it would delete a page the caller was told
+        // was durable, and roll the scope back past a sequence number every
+        // later commit is counted against.
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        let root = loaded
+            .root
+            .clone()
+            .expect("the migration committed the sharded form");
+        let page = store
+            .read_page(&ws(), &proj(), &raced)
+            .await
+            .unwrap()
+            .expect("the racing commit is still reachable through the new root");
+        assert_eq!(page.body, "raced in");
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            6,
+            "five seeded pages and the one that won the race"
+        );
+
+        // And how it happened: the migration noticed, read again, and planned
+        // the state it actually found rather than the one it started from.
+        assert_eq!(
+            migration.attempts, 2,
+            "the racing commit made the first offering stale, so the migration had to \
+             read again rather than overwrite it"
+        );
+        assert_eq!(
+            migration.manifest_seq, 6,
+            "the racing commit took sequence 6 and the root carries it"
+        );
+        assert_eq!(
+            loaded.manifest.seq, 6,
+            "the commit point did not roll back to the sequence it read first"
+        );
+
+        // No hole and no repeat: every path holds the sequence its own commit
+        // took, and those are exactly the numbers the six winners were given.
+        let mut seqs: Vec<u64> = loaded
+            .manifest
+            .pages
+            .values()
+            .map(|entry| entry.seq)
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1u64..=6).collect::<Vec<u64>>());
+        assert_eq!(
+            root.shards
+                .iter()
+                .map(|reference| reference.path_count)
+                .sum::<usize>(),
+            6,
+            "every committed path is named by exactly one shard"
+        );
+        assert!(
+            store.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "the converted scope is intact, not merely readable"
+        );
+    }
+
+    /// A write that only starts moving once the commit point has flipped lands
+    /// in the new form, on top of what the migration produced.
+    ///
+    /// The mirror image of the test above: there the racing write makes the
+    /// migration's offering stale, here the migration has already committed and
+    /// the write reads the root it left. Both are timings a real race produces;
+    /// this fixture chooses them instead of hoping for them.
+    #[tokio::test]
+    async fn a_commit_that_starts_after_the_migration_cas_lands_in_the_new_form() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = machine(&other);
+        seed_whole(&store, 4).await;
+
+        let after = PagePath::new("notes/after.md").unwrap();
+        bucket.follow_once_as(
+            qm_core::MANIFEST_FORMAT_SHARDED,
+            request("mbp-b", after.as_str(), "written after the flip", 9_000),
+        );
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert_eq!(
+            migration.attempts, 1,
+            "nothing raced the migration's own commitment in this schedule"
+        );
+        assert_eq!(migration.manifest_seq, 4);
+
+        let followed = bucket.followed();
+        assert_eq!(
+            followed.len(),
+            1,
+            "the follow-up must run exactly once: {followed:?}"
+        );
+        let followed = followed.into_iter().next().unwrap().unwrap();
+        assert_eq!(
+            followed.manifest_seq, 5,
+            "the write that started after the flip takes the next sequence"
+        );
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert_eq!(loaded.manifest.seq, 5);
+        let page = store
+            .read_page(&ws(), &proj(), &after)
+            .await
+            .unwrap()
+            .expect("the write that followed the migration is reachable");
+        assert_eq!(page.body, "written after the flip");
+        let mut seqs: Vec<u64> = loaded
+            .manifest
+            .pages
+            .values()
+            .map(|entry| entry.seq)
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1u64..=5).collect::<Vec<u64>>());
+        assert!(
+            store.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "an append to the sharded form is an intact scope"
+        );
+    }
+
+    /// A format-1 write in exactly that position is refused, and refusing it
+    /// costs nothing: no sequence is consumed, no page becomes visible, and the
+    /// objects it would have written are not there.
+    ///
+    /// This is the documented boundary of a mixed deployment — a machine that
+    /// has not been switched over cannot append to a sharded scope — and the
+    /// thing that makes it acceptable is that it is loud. A silent loss in this
+    /// position is the failure mode this test exists to catch.
+    #[tokio::test]
+    async fn a_format_one_commit_that_starts_after_the_migration_cas_is_refused() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = machine(&other);
+        seed_whole(&store, 4).await;
+
+        let refused = PagePath::new("notes/refused.md").unwrap();
+        let body = "this must not become visible";
+        bucket.follow_once(request("mbp-b", refused.as_str(), body, 9_000));
+        store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+
+        let followed = bucket.followed();
+        assert_eq!(
+            followed.len(),
+            1,
+            "the follow-up must run exactly once: {followed:?}"
+        );
+        let error = followed.into_iter().next().unwrap().unwrap_err();
+        assert!(
+            error.contains("migrate-manifest"),
+            "the refusal has to name the way out: {error}"
+        );
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert_eq!(
+            loaded.manifest.seq, 4,
+            "a refused write consumes no sequence"
+        );
+        assert_eq!(
+            store.read_page(&ws(), &proj(), &refused).await.unwrap(),
+            None,
+            "the refused page is not visible"
+        );
+        assert!(
+            store
+                .page_history(&ws(), &proj(), &refused)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and it has no history either"
+        );
+
+        // The objects the refused write would have written are addressed by the
+        // id its own content derives, so their absence is an exact statement
+        // rather than a missing substring.
+        let would_be = derive_page_id(&refused, "this must not become visible", body, None);
+        let keys = all_keys(&other).await;
+        assert!(
+            !keys.iter().any(|key| key.contains(would_be.as_str())),
+            "the refused commit left no page version and no WAL record: {keys:?}"
+        );
+    }
+
+    /// Every instant of a migration leaves a scope a reader can open.
+    ///
+    /// Each manifest put in this test is followed, before it returns, by a full
+    /// read through a second store — the read materialises the root *and every
+    /// shard it names*. That samples the scope at exactly the moment the commit
+    /// point has moved, which is the one instant a write-ordering mistake is
+    /// observable and the one instant a later repair cannot hide: a migration
+    /// that switched the root before writing the objects it names would be
+    /// caught here, and nowhere else.
+    #[tokio::test]
+    async fn every_instant_of_a_migration_leaves_a_scope_a_reader_can_open() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = machine(&other);
+        seed_whole(&store, 20).await;
+
+        bucket.reset();
+        bucket.watch_manifest_puts();
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(!migration.already_there, "{migration:?}");
+
+        let observations = bucket.observations();
+        assert_eq!(
+            observations.len(),
+            1,
+            "the migration moves the commit point exactly once: {observations:?}"
+        );
+        assert_eq!(
+            observations[0],
+            Ok(20),
+            "the reader that sampled the moment the root landed saw the whole scope, \
+             not a root naming a shard that is not there yet"
+        );
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            20
+        );
     }
 
     /// Going back must not lose what was written after the migration.
