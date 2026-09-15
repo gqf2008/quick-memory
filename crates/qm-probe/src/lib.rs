@@ -145,6 +145,24 @@ pub struct ManifestScenarioReport {
     pub failures: Vec<String>,
 }
 
+/// Committed versions with no record in the bucket's write-ahead log.
+///
+/// One direction only, deliberately: a WAL record the manifest never names is
+/// expected (a lost CAS race leaves one behind, see `docs/ops.md`), so it is
+/// not a failure. A committed version with no record is.
+fn versions_missing_from_the_wal(
+    committed: &[qm_core::PageId],
+    wal: &[qm_core::WalEntry],
+) -> Vec<qm_core::PageId> {
+    let recorded: std::collections::BTreeSet<&str> =
+        wal.iter().map(|entry| entry.page_id.as_str()).collect();
+    committed
+        .iter()
+        .filter(|id| !recorded.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Run the multi-machine commit scenario against `bucket` and verify it.
 ///
 /// The scenario is what S1 must prove: independent writers, no coordination,
@@ -273,10 +291,22 @@ pub async fn run_manifest_scenario(
         }
     }
     let wal = reader.read_wal(&workspace, &project).await?;
-    if wal.len() != expected as usize {
+    // Not a count. `read_wal` returns the records the bucket *holds*, and a
+    // commit that lost its CAS race leaves one the manifest never names, so a
+    // healthy scope with a retry in it has more records than committed
+    // versions. What must hold is the other direction: every committed version
+    // has its record, or the WAL cannot be replayed for this scope.
+    let committed: Vec<qm_core::PageId> = chains
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().cloned())
+        .collect();
+    let missing = versions_missing_from_the_wal(&committed, &wal);
+    if !missing.is_empty() {
         failures.push(format!(
-            "WAL has {} records, expected {expected}",
-            wal.len()
+            "WAL is missing records for {} of {} committed versions (first missing: {})",
+            missing.len(),
+            committed.len(),
+            missing[0]
         ));
     }
 
@@ -368,6 +398,110 @@ mod tests {
             delete_scope(&bucket, &report.workspace).await.unwrap(),
             12 + 12 + 12 + 1
         );
+    }
+
+    /// The WAL check asks one direction only: a record the manifest never
+    /// names is expected (a lost CAS race leaves one), while a committed
+    /// version with no record is a failure.
+    #[test]
+    fn wal_coverage_runs_committed_to_recorded_and_not_the_other_way() {
+        use qm_core::{MANIFEST_SCHEMA, PageId, PagePath, WalEntry, WriterId, derive_page_id};
+
+        let path = PagePath::new("notes/probe/wal-coverage.md").unwrap();
+        let entry = |title: &str, body: &str| WalEntry {
+            schema: MANIFEST_SCHEMA,
+            writer_id: WriterId::new("probe-coverage-0").unwrap(),
+            page_id: derive_page_id(&path, title, body, None),
+            path: path.clone(),
+            supersedes: None,
+        };
+        let (first, second) = (entry("page a", "body v1"), entry("page b", "body v1"));
+        let committed = vec![first.page_id.clone(), second.page_id.clone()];
+        assert_ne!(
+            committed[0], committed[1],
+            "the two versions need different ids or the cases below are vacuous"
+        );
+
+        // Exactly one record per committed version: covered.
+        let wal = vec![first.clone(), second.clone()];
+        assert_eq!(
+            versions_missing_from_the_wal(&committed, &wal),
+            Vec::<PageId>::new()
+        );
+
+        // One record more than the scope committed, which is what a lost CAS
+        // race leaves behind: still covered, and this is the case that used to
+        // fail the probe on a healthy bucket.
+        let mut with_orphan = wal.clone();
+        with_orphan.push(entry("an attempt that lost its CAS race", "body v0"));
+        assert_eq!(
+            versions_missing_from_the_wal(&committed, &with_orphan),
+            Vec::<PageId>::new()
+        );
+
+        // One committed version the bucket has no record for: not covered, and
+        // the version it names is the missing one.
+        assert_eq!(
+            versions_missing_from_the_wal(&committed, std::slice::from_ref(&second)),
+            vec![committed[0].clone()]
+        );
+    }
+
+    /// The same property end to end, through the scenario the probe binary
+    /// runs: a bucket holding a record the manifest never named must not be
+    /// reported as a failure.
+    #[tokio::test]
+    async fn a_wal_record_the_manifest_never_named_does_not_fail_the_scenario() {
+        use qm_core::{
+            KeyLayout, MANIFEST_SCHEMA, ProjectId, WalEntry, WorkspaceId, WriterId, derive_page_id,
+        };
+
+        let bucket: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let suffix = "orphan-wal";
+        let workspace = WorkspaceId::new(format!("probe-ws-{suffix}")).unwrap();
+        let project = ProjectId::new(format!("probe-proj-{suffix}")).unwrap();
+
+        // What a commit that lost its CAS race leaves behind: the record is
+        // written before the manifest update is offered, and the retry derives
+        // a different page id, so nothing ever names this one.
+        let path = qm_core::PagePath::new("notes/probe/ghost.md").unwrap();
+        let ghost = WalEntry {
+            schema: MANIFEST_SCHEMA,
+            writer_id: WriterId::new("probe-ghost-0").unwrap(),
+            page_id: derive_page_id(&path, "probe ghost", "body v0", None),
+            path: path.clone(),
+            supersedes: None,
+        };
+        let key = KeyLayout::new("v1").wal_entry(&workspace, &project, ghost.event_id());
+        qm_store::CasStore::new(std::sync::Arc::clone(&bucket), "")
+            .create(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&ghost).unwrap()),
+            )
+            .await
+            .expect("planting the orphan record before the scenario runs");
+
+        let report = run_manifest_scenario(
+            &bucket,
+            &ManifestScenarioParams {
+                machines: 1,
+                writes: 3,
+                max_attempts: 64,
+                scope_suffix: Some(suffix.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.commits, 3);
+        // The premise: the bucket really held one record more than the scope
+        // committed, which is the shape that used to fail the probe.
+        assert_eq!(report.wal_records, report.commits as usize + 1);
+        // 3 page versions + 4 WAL records (3 committed + the orphan) + 3 commit
+        // records + the manifest.
+        assert_eq!(delete_scope(&bucket, &report.workspace).await.unwrap(), 11);
     }
 }
 
