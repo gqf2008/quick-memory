@@ -4141,4 +4141,354 @@ mod tests {
         assert_eq!(tail.sessions.len(), 0, "no session head is in this window");
         assert_eq!(tail.handoffs.len(), 2);
     }
+
+    // ---------------------------------------------------------------------
+    // Single-object manifest scale: measured, not assumed.
+    //
+    // `manifest.json` carries every path in the scope, so its size is a
+    // function of the project rather than of a commit — and every commit
+    // rewrites the whole object. These tests measure that function on the
+    // production encoder and pin the consequence: how many paths the commit
+    // point's ceiling actually buys.
+    // ---------------------------------------------------------------------
+
+    /// Seconds since the epoch a real commit carries: 13 digits, so the
+    /// manifest's own timestamps are priced at their realistic width.
+    const FIXTURE_NOW_MS: i64 = 1_756_000_000_000;
+
+    /// Title width the fixtures hold constant, in UTF-8 bytes.
+    const FIXTURE_TITLE_BYTES: usize = 40;
+
+    /// A path shaped like the ones this project writes.
+    fn path_at(index: usize) -> PagePath {
+        PagePath::new(format!("notes/topic-{index:05}/note-{index:05}.md")).unwrap()
+    }
+
+    /// A 64-character lowercase hex page id, what `derive_page_id` returns.
+    fn page_id_at(index: usize) -> PageId {
+        PageId::new(format!("{index:064x}")).unwrap()
+    }
+
+    /// A title of *exactly* `bytes` UTF-8 bytes: mostly ASCII plus a few CJK
+    /// words at 3 bytes each, which is what this project's pages look like.
+    fn title_of(index: usize, bytes: usize) -> String {
+        let source = format!("Raft 提交点与 page_id 派生 rev-{index:05}");
+        let mut title = String::new();
+        for ch in source.chars() {
+            if title.len() + ch.len_utf8() > bytes {
+                break;
+            }
+            title.push(ch);
+        }
+        while title.len() < bytes {
+            title.push('.');
+        }
+        title
+    }
+
+    /// One `PageEntry` exactly as `commit_page` builds it.
+    fn entry_at(index: usize, supersedes: Option<PageId>) -> PageEntry {
+        PageEntry {
+            page_id: page_id_at(index + 1),
+            seq: index as u64 + 1,
+            created_at_ms: FIXTURE_NOW_MS + index as i64,
+            writer_id: WriterId::new("mbp-a").unwrap(),
+            title: title_of(index, FIXTURE_TITLE_BYTES),
+            supersedes,
+        }
+    }
+
+    /// A scope holding exactly `paths` current versions.
+    fn manifest_with_paths(paths: usize, rewritten: bool) -> Manifest {
+        let mut manifest = Manifest::empty(ws(), proj());
+        for index in 0..paths {
+            let supersedes = rewritten.then(|| page_id_at(index + 1));
+            let path = path_at(index);
+            manifest.record(&path, entry_at(index, supersedes));
+        }
+        manifest
+    }
+
+    /// Bytes the production encoder puts on the wire for this manifest.
+    fn manifest_bytes(manifest: &Manifest) -> usize {
+        encode(manifest).unwrap().len()
+    }
+
+    /// Largest path count whose manifest still fits in `limit` bytes.
+    fn paths_under(limit: usize, rewritten: bool) -> usize {
+        let mut low = 0usize;
+        let mut high = limit / 64; // a per-path cost below 64 B would be a surprise
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if manifest_bytes(&manifest_with_paths(mid, rewritten)) <= limit {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+
+    /// The measured curve, held as literals.
+    ///
+    /// These are the numbers `docs/ops.md` quotes. They are pinned rather than
+    /// derived so that a wider `PageEntry` — which moves every claim about how
+    /// many paths fit, and with them the ceiling's rationale — fails here
+    /// instead of leaving the documentation quietly wrong.
+    const MEASURED_PATH_COUNTS: [usize; 4] = [100, 1_000, 10_000, 100_000];
+    const MEASURED_BYTES: [usize; 4] = [24_217, 242_019, 2_429_021, 24_389_023];
+    /// Every entry rewritten, 10 000 paths.
+    const MEASURED_REWRITTEN_BYTES: usize = 3_049_021;
+    /// Paths that fit in [`MANIFEST_MAX_BYTES`], fresh and all-rewritten.
+    const PATHS_AT_CEILING: usize = 4_319;
+    const PATHS_AT_CEILING_REWRITTEN: usize = 3_441;
+
+    #[test]
+    fn manifest_size_is_linear_in_paths() {
+        let sizes: Vec<usize> = MEASURED_PATH_COUNTS
+            .iter()
+            .map(|count| manifest_bytes(&manifest_with_paths(*count, false)))
+            .collect();
+        assert_eq!(
+            sizes, MEASURED_BYTES,
+            "the measured curve moved; docs/ops.md quotes these bytes and the \
+             ceiling's path count, so both have to be re-derived"
+        );
+
+        let rewritten = manifest_bytes(&manifest_with_paths(10_000, true));
+        assert_eq!(rewritten, MEASURED_REWRITTEN_BYTES);
+
+        println!("paths,bytes,marginal_b_per_path,avg_b_per_path");
+        for (index, count) in MEASURED_PATH_COUNTS.iter().enumerate() {
+            let marginal = if index == 0 {
+                0
+            } else {
+                (sizes[index] - sizes[index - 1]) / (count - MEASURED_PATH_COUNTS[index - 1])
+            };
+            println!(
+                "{count},{},{marginal},{}",
+                sizes[index],
+                sizes[index] / count
+            );
+        }
+        println!(
+            "10_000 rewritten,{rewritten},{},{}",
+            (rewritten - sizes[2]) / 10_000,
+            rewritten / 10_000
+        );
+
+        assert_eq!(
+            paths_under(MANIFEST_MAX_BYTES, false),
+            PATHS_AT_CEILING,
+            "docs/ops.md states how many fresh paths the ceiling buys"
+        );
+        assert_eq!(
+            paths_under(MANIFEST_MAX_BYTES, true),
+            PATHS_AT_CEILING_REWRITTEN,
+            "docs/ops.md states how many rewritten paths the ceiling buys"
+        );
+        assert_eq!(
+            MANIFEST_MAX_BYTES, 1_048_576,
+            "the ceiling is the documented 1 MiB; changing it changes the path counts above"
+        );
+    }
+
+    /// Every byte of one entry, attributed by perturbing exactly one field.
+    ///
+    /// The marginal cost is not a guess: the parts are measured, and the
+    /// remainder — field names, quotes, braces, colons — is checked against a
+    /// literal skeleton so that a changed field set cannot leave the table in
+    /// `docs/ops.md` describing a shape that no longer exists.
+    #[test]
+    fn manifest_bytes_are_accounted_for_field_by_field() {
+        let base = entry_at(0, None);
+        let entry_bytes = serde_json::to_vec(&base).unwrap().len();
+        assert_eq!(base.title.len(), FIXTURE_TITLE_BYTES);
+
+        let mut longer_title = base.clone();
+        longer_title.title.push_str(&".".repeat(10));
+        let title_cost = serde_json::to_vec(&longer_title).unwrap().len() - entry_bytes;
+        assert_eq!(title_cost, 10, "a title byte costs a byte");
+
+        let mut with_supersedes = base.clone();
+        with_supersedes.supersedes = Some(page_id_at(7));
+        let supersedes_cost = serde_json::to_vec(&with_supersedes).unwrap().len() - entry_bytes;
+        assert_eq!(supersedes_cost, 62, "null -> \"64 hex\" is 4 -> 66 bytes");
+
+        let path_len = path_at(0).as_str().len();
+        let skeleton =
+            r#"{"page_id":"","seq":,"created_at_ms":,"writer_id":"","title":"","supersedes":}"#;
+        let accounted =
+            64 + 1 + 13 + base.writer_id.as_str().len() + FIXTURE_TITLE_BYTES + 4 + skeleton.len();
+        assert_eq!(
+            entry_bytes, accounted,
+            "the entry is page id + seq + created_at_ms + writer id + title + \
+             supersedes + the JSON skeleton, and nothing else"
+        );
+
+        let marginal = path_len + 2 + 1 + entry_bytes + 1;
+        println!(
+            "path key <path> = {} ({} chars + 2 quotes), colon 1, entry_json={entry_bytes}, comma 1",
+            path_len + 2,
+            path_len
+        );
+        println!(
+            "  page_id 64 + seq 1 + created_at_ms 13 + writer_id {} + title {} + supersedes 4",
+            base.writer_id.as_str().len(),
+            FIXTURE_TITLE_BYTES
+        );
+        println!("  json skeleton {} + comma 1", skeleton.len());
+        println!("marginal_per_path_at_one_digit_seq={marginal}");
+    }
+
+    /// Write a manifest object directly, as another machine's commit would
+    /// have left it.
+    ///
+    /// Reaching this state through `commit_page` would mean 4 319 commits,
+    /// each rewriting the whole manifest — the fixture writes the state the
+    /// ceiling is about, not the history that produced it.
+    async fn seed_manifest(store: &ProjectStore, paths: usize) {
+        let bytes = encode(&manifest_with_paths(paths, false)).unwrap();
+        store
+            .cas()
+            .create(&store.layout().manifest(&ws(), &proj()), bytes)
+            .await
+            .unwrap();
+    }
+
+    /// Every object in the bucket, so a refusal can be shown to write nothing.
+    async fn object_keys(bucket: &Arc<dyn ObjectStore>) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut listing = bucket.list(None);
+        while let Some(item) = listing.next().await {
+            keys.push(item.unwrap().location.to_string());
+        }
+        keys.sort();
+        keys
+    }
+
+    /// The write that crosses (or reaches) the ceiling: index `at` of the same
+    /// fixture family the measurements use, so its manifest is byte-for-byte
+    /// the one `manifest_with_paths` predicts.
+    fn crossing_request(at: usize) -> CommitPageRequest {
+        CommitPageRequest {
+            workspace_id: ws(),
+            project_id: proj(),
+            path: path_at(at),
+            title: title_of(at, FIXTURE_TITLE_BYTES),
+            body: "the body that reaches the ceiling".to_string(),
+            writer_id: WriterId::new("mbp-a").unwrap(),
+            now_ms: FIXTURE_NOW_MS + at as i64,
+        }
+    }
+
+    /// The ceiling is a refusal, it fires at the documented path count, and it
+    /// fires before anything reaches the bucket.
+    ///
+    /// The counts are literals on purpose: deriving them from
+    /// `MANIFEST_MAX_BYTES` would make the test agree with itself at any
+    /// threshold, so neither a shrunken ceiling (the "just below it still
+    /// commits" half would fire) nor a raised one (this half would) would show
+    /// up in a red run.
+    #[tokio::test]
+    async fn a_manifest_at_the_ceiling_commits_and_one_path_past_it_is_refused() {
+        let at_ceiling = manifest_bytes(&manifest_with_paths(PATHS_AT_CEILING, false));
+        let past_ceiling = manifest_bytes(&manifest_with_paths(PATHS_AT_CEILING + 1, false));
+        assert!(
+            at_ceiling <= MANIFEST_MAX_BYTES,
+            "{PATHS_AT_CEILING} paths encode to {at_ceiling}, which must still fit in {MANIFEST_MAX_BYTES}"
+        );
+        assert!(
+            past_ceiling > MANIFEST_MAX_BYTES,
+            "{} paths encode to {past_ceiling}, which must not fit in {MANIFEST_MAX_BYTES}",
+            PATHS_AT_CEILING + 1
+        );
+
+        // One path short: the commit lands, and the manifest really does reach
+        // the measured ceiling.
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        seed_manifest(&store, PATHS_AT_CEILING - 1).await;
+        let request = crossing_request(PATHS_AT_CEILING - 1);
+        let path = request.path.clone();
+        let outcome = store.commit_page(request).await.unwrap();
+        assert_eq!(outcome.manifest_seq, PATHS_AT_CEILING as u64);
+        let committed = store.load(&ws(), &proj()).await.unwrap().manifest;
+        assert_eq!(manifest_bytes(&committed), at_ceiling);
+        assert_eq!(committed.pages.len(), PATHS_AT_CEILING);
+        assert!(
+            store
+                .read_page(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .is_some(),
+            "the page committed at the ceiling is readable"
+        );
+
+        // At the ceiling: the next path crosses it, so the commit is refused
+        // with the numbers in the error, and the bucket is left untouched.
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        seed_manifest(&store, PATHS_AT_CEILING).await;
+        let before = object_keys(&bucket).await;
+        let error = store
+            .commit_page(crossing_request(PATHS_AT_CEILING))
+            .await
+            .unwrap_err();
+        // The refusal as an operator would see it.
+        println!("refusal: {error}");
+        match error {
+            StoreError::ManifestTooLarge {
+                workspace_id,
+                project_id,
+                paths,
+                bytes,
+                limit,
+            } => {
+                assert_eq!(workspace_id, "acme");
+                assert_eq!(project_id, "ai-memory");
+                assert_eq!(paths, PATHS_AT_CEILING + 1);
+                assert_eq!(bytes, past_ceiling);
+                assert_eq!(limit, 1_048_576);
+            }
+            other => panic!("the ceiling must refuse the commit, got {other:?}"),
+        }
+        assert_eq!(
+            object_keys(&bucket).await,
+            before,
+            "a refused commit must leave no page object and no WAL entry behind"
+        );
+    }
+
+    /// A scope that is already over the ceiling can still be repaired.
+    ///
+    /// The delete path is deliberately unguarded: deletion is the only shipped
+    /// operation that can shrink a manifest, so refusing it would leave an
+    /// over-limit scope with no way back under the limit. This test goes red if
+    /// the ceiling guard is ever applied there.
+    #[tokio::test]
+    async fn a_scope_over_the_ceiling_can_still_be_deleted_from() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let paths = PATHS_AT_CEILING + 100;
+        seed_manifest(&store, paths).await;
+        assert!(
+            manifest_bytes(&manifest_with_paths(paths, false)) > MANIFEST_MAX_BYTES,
+            "the fixture has to be over the ceiling for this test to mean anything"
+        );
+
+        let outcome = store
+            .delete_page(
+                &ws(),
+                &proj(),
+                &path_at(0),
+                &WriterId::new("mbp-a").unwrap(),
+                FIXTURE_NOW_MS,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.already_deleted);
+        assert!(outcome.removed.is_some(), "the delete must remove the head");
+        assert_eq!(outcome.manifest_seq, paths as u64 + 1);
+    }
 }
