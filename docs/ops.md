@@ -61,6 +61,17 @@ qm compact          # 拿不到租约会返回 "another machine holds the compac
   按分片内容哈希命名；命中缓存就不再访问桶。缓存可以随时删除。
 - 多机共用一台机器时**不要**让不同 `QM_WRITER` 共用一个缓存目录（watermark 会互相覆盖）。
 
+## 备份与迁移
+
+桶本身就是备份（对象不可变 + 版本控制）。除桶之外，还可以导出一份**人工可读**的副本：
+
+```bash
+qm export --to ./backup-$(date +%F)     # 页面 markdown + 会话 JSONL + _export.json
+qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相同的页面会跳过
+```
+
+导出不含历史链与 commit log —— 它给的是内容，不是考古现场。要完整的历史请依赖桶的持久性与版本控制。
+
 ## 完整性自检
 
 ```bash

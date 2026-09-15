@@ -295,6 +295,23 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
+## 6.16 迁出与迁入（export / import）
+
+桶是权威，但"只能通过这个桶访问自己的记忆"是不可接受的。迁出是**人工可读**的：
+
+```bash
+qm export --to ./exported      # 每个 live 页面写成同路径 .md，外加 _export.json / _sessions/
+# …换桶、换机器、发给别人…
+qm import --from ./exported
+```
+
+- 页面写成**原样的 markdown**（不发明 frontmatter），任何编辑器都能看；标题等元数据放在 `_export.json`。
+- 会话以**原始观测 JSONL** 迁出，而不是渲染后的页面——迁入方可以重新编译，而不是被迫接受别人的渲染结果。
+- 迁入对**内容相同**的页面直接跳过，所以重复迁入不会堆版本（有测试断言 manifest `seq` 不变）。
+- 与 ai-memory 的 export/import 定位一致：这是迁移与人工备份路径，**不是**权威状态的一部分；
+  历史（supersession 链）与 commit log 不随迁出，迁出方得到的是内容而不是考古现场。
+- 只暴露在 CLI 上：这是运维动作，不是 agent 工具，所以没有对应的 MCP tool。
+
 ## 6.15 完整性自检（`qm verify`）
 
 没有服务器可以问"这个桶健康吗"，所以任何一台机器都必须能从对象自己回答。`qm verify` 做三件事：

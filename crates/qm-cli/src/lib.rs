@@ -170,6 +170,18 @@ pub enum Command {
         #[command(subcommand)]
         action: HandoffAction,
     },
+    /// Write every live page (and session) to a directory.
+    Export {
+        /// Destination directory.
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// Commit pages and sessions from an exported directory.
+    Import {
+        /// Source directory.
+        #[arg(long)]
+        from: PathBuf,
+    },
     /// Check that the bucket's authoritative state is internally consistent.
     Verify {
         /// Check every project in the workspace.
@@ -893,6 +905,199 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 })
             }
         },
+        Command::Export { to } => {
+            std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+            let loaded = ctx
+                .project
+                .load(&ctx.workspace, &ctx.project_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let mut index = Vec::new();
+            for (path, entry) in &loaded.manifest.pages {
+                let page_path = PagePath::new(path)?;
+                let page = ctx
+                    .project
+                    .read_page_version(&ctx.workspace, &ctx.project_id, &page_path, &entry.page_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let target = to.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // The markdown stays exactly what was stored: no frontmatter is
+                // invented, so the export is editable in any editor.
+                std::fs::write(&target, &page.body)
+                    .with_context(|| format!("writing {}", target.display()))?;
+                index.push(serde_json::json!({
+                    "path": path,
+                    "title": page.title,
+                    "page_id": page.page_id.as_str(),
+                }));
+            }
+            // Sessions travel as their raw observations so a rebuild can
+            // recompile them rather than trusting a rendered page.
+            let mut sessions = 0usize;
+            for session in ctx
+                .project
+                .list_sessions(&ctx.workspace, &ctx.project_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+            {
+                let observations = ctx
+                    .project
+                    .read_session_observations(&ctx.workspace, &ctx.project_id, &session)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                if observations.is_empty() {
+                    continue;
+                }
+                let dir = to.join("_sessions");
+                std::fs::create_dir_all(&dir)?;
+                let mut body = String::new();
+                for observation in &observations {
+                    body.push_str(&serde_json::to_string(observation)?);
+                    body.push('\n');
+                }
+                std::fs::write(dir.join(format!("{session}.jsonl")), body)?;
+                sessions += 1;
+            }
+            std::fs::write(
+                to.join("_export.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": 1,
+                    "workspace": ctx.workspace.to_string(),
+                    "project": ctx.project_id.to_string(),
+                    "manifest_seq": loaded.manifest.seq,
+                    "pages": index,
+                }))?,
+            )?;
+            let pages = index.len();
+            Ok(if ctx.json {
+                serde_json::json!({ "pages": pages, "sessions": sessions, "to": to.display().to_string() })
+                    .to_string()
+            } else {
+                format!(
+                    "exported {pages} page(s) and {sessions} session(s) to {}",
+                    to.display()
+                )
+            })
+        }
+        Command::Import { from } => {
+            let manifest_path = from.join("_export.json");
+            let titles: std::collections::BTreeMap<String, String> = std::fs::read(&manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value.get("pages").cloned())
+                .and_then(|pages| pages.as_array().cloned())
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .filter_map(|page| {
+                            Some((
+                                page.get("path")?.as_str()?.to_string(),
+                                page.get("title")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            let mut sessions = 0usize;
+            for entry in walkdir::WalkDir::new(from).sort_by_file_name() {
+                let entry = entry?;
+                if !entry.file_type().is_file()
+                    || entry.path().extension().is_none_or(|ext| ext != "md")
+                {
+                    continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(from)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let page_path = PagePath::new(&relative)?;
+                let body = std::fs::read_to_string(entry.path())?;
+                // Re-importing an unchanged file must not append a version.
+                if let Some(current) = ctx
+                    .project
+                    .read_page(&ctx.workspace, &ctx.project_id, &page_path)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+                    && current.body == body
+                {
+                    skipped += 1;
+                    continue;
+                }
+                ctx.project
+                    .commit_page(CommitPageRequest {
+                        workspace_id: ctx.workspace.clone(),
+                        project_id: ctx.project_id.clone(),
+                        path: page_path,
+                        title: titles
+                            .get(&relative)
+                            .cloned()
+                            .unwrap_or_else(|| relative.clone()),
+                        body,
+                        writer_id: ctx.writer.clone(),
+                        now_ms: ctx.now_ms,
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                imported += 1;
+            }
+
+            let sessions_dir = from.join("_sessions");
+            if sessions_dir.is_dir() {
+                for entry in walkdir::WalkDir::new(&sessions_dir).sort_by_file_name() {
+                    let entry = entry?;
+                    if !entry.file_type().is_file()
+                        || entry.path().extension().is_none_or(|ext| ext != "jsonl")
+                    {
+                        continue;
+                    }
+                    let session_id = SessionId::new(
+                        entry
+                            .path()
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                    )?;
+                    let mut observations = Vec::new();
+                    for line in std::fs::read_to_string(entry.path())?.lines() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        observations.push(serde_json::from_str::<Observation>(line)?);
+                    }
+                    if observations.is_empty() {
+                        continue;
+                    }
+                    ctx.project
+                        .ingest_observations(IngestObservationsRequest {
+                            workspace_id: ctx.workspace.clone(),
+                            project_id: ctx.project_id.clone(),
+                            session_id,
+                            writer_id: ctx.writer.clone(),
+                            observations,
+                            now_ms: ctx.now_ms,
+                        })
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    sessions += 1;
+                }
+            }
+
+            Ok(if ctx.json {
+                serde_json::json!({ "imported": imported, "unchanged": skipped, "sessions": sessions })
+                    .to_string()
+            } else {
+                format!(
+                    "imported {imported} page(s) ({skipped} unchanged) and {sessions} session(s)"
+                )
+            })
+        }
         Command::Verify { global, strict } => {
             // First prove the backend itself honours the contract everything
             // else rests on: a store without conditional writes is not
@@ -1763,6 +1968,125 @@ mod tests {
         .await
         .expect_err("restoring a version that does not exist must fail");
         assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn export_and_import_move_a_project_between_buckets() {
+        let source: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        // A project with two pages and a captured session.
+        for (index, (path, body)) in [
+            ("notes/raft.md", "leader election"),
+            ("notes/quickwit.md", "`tantivy` splits"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            execute(
+                &cli(&[
+                    "write-page",
+                    "--path",
+                    path,
+                    "--title",
+                    path,
+                    "--body",
+                    body,
+                ]),
+                Context {
+                    now_ms: (index as i64 + 1) * 1_000,
+                    ..context(Arc::clone(&source), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        execute(
+            &cli(&["capture", "--session", "sess-1", "--text", "an observation"]),
+            Context {
+                now_ms: 5_000,
+                ..context(Arc::clone(&source), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        let exported = TempDir::new().unwrap();
+        let out = execute(
+            &cli(&["export", "--to", &exported.path().to_string_lossy()]),
+            context(Arc::clone(&source), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("2 page(s)"), "{out}");
+        assert!(exported.path().join("notes/raft.md").is_file());
+        assert!(exported.path().join("_export.json").is_file());
+        assert!(exported.path().join("_sessions/sess-1.jsonl").is_file());
+        assert_eq!(
+            std::fs::read_to_string(exported.path().join("notes/raft.md")).unwrap(),
+            "leader election",
+            "exported markdown must be exactly what was stored"
+        );
+
+        // A different bucket imports it.
+        let target: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target_cache = TempDir::new().unwrap();
+        let imported = execute(
+            &cli(&["import", "--from", &exported.path().to_string_lossy()]),
+            Context {
+                now_ms: 9_000,
+                ..context(Arc::clone(&target), &target_cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(imported.contains("imported 2 page(s)"), "{imported}");
+
+        let ctx = context(Arc::clone(&target), &target_cache);
+        let page = ctx
+            .project
+            .read_page(
+                &ctx.workspace,
+                &ctx.project_id,
+                &PagePath::new("notes/quickwit.md").unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("imported page");
+        assert_eq!(page.body, "`tantivy` splits");
+        assert_eq!(
+            page.title, "notes/quickwit.md",
+            "titles travel with the export"
+        );
+        let sessions = ctx
+            .project
+            .list_sessions(&ctx.workspace, &ctx.project_id)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1, "sessions travel as raw observations");
+
+        // Re-importing an unchanged directory adds no versions.
+        let mut again = context(Arc::clone(&target), &target_cache);
+        again.now_ms = 10_000;
+        let again_out = execute(
+            &cli(&["import", "--from", &exported.path().to_string_lossy()]),
+            again,
+        )
+        .await
+        .unwrap();
+        assert!(again_out.contains("0 page(s)"), "{again_out}");
+        assert!(again_out.contains("2 unchanged"), "{again_out}");
+        let ctx = context(Arc::clone(&target), &target_cache);
+        assert_eq!(
+            ctx.project
+                .load(&ctx.workspace, &ctx.project_id)
+                .await
+                .unwrap()
+                .manifest
+                .seq,
+            2,
+            "a repeated import must not append versions"
+        );
     }
 
     #[tokio::test]
