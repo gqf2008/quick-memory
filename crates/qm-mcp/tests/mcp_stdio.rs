@@ -151,6 +151,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_history",
         "memory_restore",
         "memory_log",
+        "memory_recent",
         "memory_compact_session",
         "memory_verify",
         "memory_propose",
@@ -208,6 +209,15 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
     );
     let text = tool_text(&searched);
     assert!(text.contains("sessions/sess-mcp.md"), "{text}");
+
+    // `memory_recent` answers "what was the last session working on?" without a
+    // query, so it must see the page this round trip just published.
+    let recent = client.call_tool(7, "memory_recent", serde_json::json!({"limit": 5}));
+    let recent_text = tool_text(&recent);
+    assert!(
+        recent_text.contains("sessions/sess-mcp.md"),
+        "{recent_text}"
+    );
 
     // Handoffs: open, list, claim, and refuse a second claim — over the wire.
     let opened = client.call_tool(

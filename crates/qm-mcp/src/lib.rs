@@ -177,6 +177,14 @@ pub struct LogArgs {
     pub limit: Option<usize>,
 }
 
+/// Arguments for `memory_recent`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecentArgs {
+    /// Maximum pages.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Arguments for page-addressed tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PageArgs {
@@ -383,6 +391,23 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Log {
             limit: args.limit.unwrap_or(20),
+        })
+        .await
+    }
+
+    /// List pages by when they last changed.
+    #[tool(
+        description = "List pages by when they last changed, newest first, with \
+                       each page's timestamp, path and title. Call this at the \
+                       start of a session to answer \"what was the last session \
+                       working on?\" before reaching for a full search."
+    )]
+    async fn memory_recent(
+        &self,
+        Parameters(args): Parameters<RecentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Recent {
+            limit: args.limit.unwrap_or(10),
         })
         .await
     }

@@ -250,8 +250,8 @@ qm sessions
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- 23 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
-  publish / compact / sessions / status / history / restore / log /
+- 24 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
+  publish / compact / sessions / status / history / restore / log / recent /
   handoff_open / handoff_list / handoff_claim / handoff_done / verify /
   compact_session`，沿用 ai-memory 的命名习惯。
 - **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
@@ -326,6 +326,21 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
+## 6.19 最近变化：会话开始时先看这里
+
+agent 开场最常问的问题不是"搜点什么"，而是"上一个会话在做什么"。这不需要检索，
+只需要**已经写在提交点里的顺序**：
+
+- `ProjectStore::recent_pages(ws, proj, limit)` 读 manifest，按 `PageEntry::created_at_ms`
+  **降序**返回 live 页面，同毫秒按 `path` **升序**打平。tie-breaker 不是装饰：两台机器在同一毫秒提交时，
+  没有它就没有一个"所有机器都同意"的顺序，而这种漂移恰好是对象存储形态最容易漏掉的问题。
+- 被 tombstone 的路径**天然不在 `manifest.pages` 里**，所以这里不额外造"删除状态"去过滤它——
+  删除的唯一权威仍然是提交点。
+- `qm recent [--limit N]`（默认 10）/ `memory_recent { limit? }`：人类输出 `created_at_ms\tpath\ttitle`，
+  `--json` 给结构化字段。两者共用同一次 `execute()` 分发。
+- 它**不读任何页面对象**：标题已经在 manifest 里，所以这是"读一个对象即可回答"的问题，
+  比跑一次检索便宜得多——这也是它在 agent 开场流程里的位置。
+
 ## 6.18 提案与审批：学习性修改不直接落盘
 
 借来的设计里，自动化（curator/auto-improve）**只能提议**，不能直接改记忆；有权限的才好批准。
@@ -345,7 +360,7 @@ qm reject  --id <id> --note "not this time"
   中途崩溃只会留下"已批准、id 未知"，**决定不会丢**。
 - 应用走的是普通 `commit_page`：因此仍然 supersede 而非覆盖，历史与回滚照旧可用。
 - 拒绝同样是一次 CAS，只写决定，不碰页面。
-- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 23 个工具）。
+- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 24 个工具）。
 
 ## 6.17 新近度先验：它承诺什么、不承诺什么
 
@@ -554,7 +569,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
 - `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（23 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（24 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 

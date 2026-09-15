@@ -52,6 +52,7 @@ qm publish
 qm read-page --path notes/raft.md
 qm history  --path notes/raft.md
 qm log --limit 10
+qm recent --limit 10        # 按最后修改时间列出页面：开场先看这里
 ```
 
 ## 4. 接进 agent
@@ -79,8 +80,8 @@ MCP（Codex / Claude Code 等）：
 
 工具：`memory_search` / `memory_capture` / `memory_consolidate` / `memory_publish` /
 `memory_write_page` / `memory_read_page` / `memory_history` / `memory_restore` /
-`memory_log` / `memory_delete_page` / `memory_compact` / `memory_sessions` /
-`memory_status` / `memory_handoff_{open,list,claim,done}`。
+`memory_log` / `memory_recent` / `memory_delete_page` / `memory_compact` /
+`memory_sessions` / `memory_status` / `memory_handoff_{open,list,claim,done}`。
 
 自动采集（把 harness 的生命周期钩子指向它，事件 JSON 走 stdin）：
 

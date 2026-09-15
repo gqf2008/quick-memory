@@ -286,6 +286,12 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// List pages by when they last changed, newest first.
+    Recent {
+        /// Maximum pages.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Tombstone a page.
     DeletePage {
         /// Path inside the project.
@@ -1583,6 +1589,44 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .join("\n")
             })
         }
+        Command::Recent { limit } => {
+            let pages = ctx
+                .project
+                .recent_pages(&ctx.workspace, &ctx.project_id, *limit)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                let described: Vec<serde_json::Value> = pages
+                    .iter()
+                    .map(|(path, entry)| {
+                        serde_json::json!({
+                            "path": path,
+                            "page_id": entry.page_id,
+                            "title": entry.title,
+                            "created_at_ms": entry.created_at_ms,
+                            "seq": entry.seq,
+                            "writer_id": entry.writer_id,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&described)?
+            } else if pages.is_empty() {
+                "no pages".to_string()
+            } else {
+                pages
+                    .iter()
+                    .map(|(path, entry)| {
+                        format!(
+                            "{}\t{}\t{}",
+                            entry.created_at_ms,
+                            path.as_str(),
+                            entry.title
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
         Command::DeletePage { path } => {
             let page_path = ctx.page(path)?;
             let outcome = ctx
@@ -2032,6 +2076,69 @@ mod tests {
             .await
             .expect_err("a deleted page must not be readable");
         assert!(error.to_string().contains("no page"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn recent_lists_the_last_pages_to_change() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for (path, title, body, now_ms) in [
+            ("notes/first.md", "First", "one", 1_000),
+            ("notes/second.md", "Second", "two", 2_000),
+        ] {
+            execute(
+                &cli(&[
+                    "write-page",
+                    "--path",
+                    path,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                ]),
+                Context {
+                    now_ms,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let out = execute(
+            &cli(&["recent", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let paths: Vec<&str> = parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["notes/second.md", "notes/first.md"]);
+
+        // The human shape is what a person reads at the top of a session.
+        let text = execute(&cli(&["recent"]), context(Arc::clone(&bucket), &cache))
+            .await
+            .unwrap();
+        assert_eq!(
+            text,
+            "2000\tnotes/second.md\tSecond\n1000\tnotes/first.md\tFirst"
+        );
+
+        // `--limit` narrows it; the default is 10, so one page is not enough
+        // to tell the flag apart from the default. Ask for exactly one.
+        let limited = execute(
+            &cli(&["recent", "--limit", "1"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited, "2000\tnotes/second.md\tSecond");
     }
 
     #[tokio::test]

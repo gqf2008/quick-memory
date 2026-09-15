@@ -30,7 +30,7 @@ crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
 crates/qm-cli     `qm` 命令行（agent 入口）
-crates/qm-mcp     `qm-mcp` MCP stdio 服务器（23 个 memory_* 工具）
+crates/qm-mcp     `qm-mcp` MCP stdio 服务器（24 个 memory_* 工具）
 ```
 
 ## 命令行

@@ -362,6 +362,46 @@ impl ProjectStore {
         }
     }
 
+    /// List the live pages of a scope, newest commit first.
+    ///
+    /// Sorting is by `PageEntry::created_at_ms` descending with the path
+    /// ascending as a tie-breaker. The tie-breaker is what makes the order
+    /// total: two machines that committed inside the same millisecond would
+    /// otherwise be free to disagree, which is exactly the kind of drift an
+    /// object-store-backed list must not have.
+    ///
+    /// A tombstoned path is absent from `manifest.pages` by construction, so
+    /// deleted pages need no extra filter here.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when a committed path is no longer a valid page
+    /// path — a manifest that cannot be listed is a manifest to repair, not to
+    /// render partially.
+    pub async fn recent_pages(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<(PagePath, PageEntry)>, StoreError> {
+        let loaded = self.load(workspace_id, project_id).await?;
+        let mut pages = Vec::with_capacity(loaded.manifest.pages.len());
+        for (raw, entry) in loaded.manifest.pages {
+            let path = PagePath::new(&raw).map_err(|error| {
+                StoreError::Corrupt(format!("manifest page path {raw:?}: {error}"))
+            })?;
+            pages.push((path, entry));
+        }
+        pages.sort_by(|left, right| {
+            right
+                .1
+                .created_at_ms
+                .cmp(&left.1.created_at_ms)
+                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+        });
+        pages.truncate(limit);
+        Ok(pages)
+    }
+
     /// Commit a new page version.
     ///
     /// # Errors
@@ -1854,6 +1894,149 @@ mod tests {
             writer_id: WriterId::new(writer).unwrap(),
             now_ms,
         }
+    }
+
+    #[tokio::test]
+    async fn recent_pages_orders_newest_first_and_respects_limit() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+
+        // Three paths, three distinct commit times, in deliberately unsorted
+        // path order so a passing test cannot be explained by the key order.
+        for (path, at) in [
+            ("notes/middle.md", 2_000),
+            ("notes/oldest.md", 1_000),
+            ("notes/newest.md", 3_000),
+        ] {
+            store
+                .commit_page(request("mbp-a", path, "body", at))
+                .await
+                .expect("commit");
+        }
+
+        let all = store.recent_pages(&ws(), &proj(), 10).await.unwrap();
+        let observed: Vec<&str> = all.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            observed,
+            ["notes/newest.md", "notes/middle.md", "notes/oldest.md"],
+            "newest commit must come first"
+        );
+        assert_eq!(all[0].1.created_at_ms, 3_000);
+        assert_eq!(all[0].1.title, "notes/newest.md");
+
+        let top_two = store.recent_pages(&ws(), &proj(), 2).await.unwrap();
+        assert_eq!(top_two.len(), 2, "limit must truncate");
+        assert_eq!(top_two[0].0.as_str(), "notes/newest.md");
+        assert_eq!(top_two[1].0.as_str(), "notes/middle.md");
+
+        // A limit larger than the corpus is not an error.
+        assert_eq!(
+            store.recent_pages(&ws(), &proj(), 99).await.unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_pages_break_ties_on_the_path() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+
+        // Same millisecond: without the path tie-breaker the order would be
+        // whatever the map iteration happened to produce.
+        for path in ["notes/b.md", "notes/a.md", "notes/c.md"] {
+            store
+                .commit_page(request("mbp-a", path, "body", 5_000))
+                .await
+                .expect("commit");
+        }
+
+        let observed: Vec<String> = store
+            .recent_pages(&ws(), &proj(), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path.as_str().to_string())
+            .collect();
+        assert_eq!(observed, ["notes/a.md", "notes/b.md", "notes/c.md"]);
+    }
+
+    #[tokio::test]
+    async fn recent_pages_never_resurrect_a_deleted_page() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+
+        for (path, at) in [("notes/keep.md", 1_000), ("notes/drop.md", 2_000)] {
+            store
+                .commit_page(request("mbp-a", path, "body", at))
+                .await
+                .expect("commit");
+        }
+        assert_eq!(
+            store.recent_pages(&ws(), &proj(), 10).await.unwrap().len(),
+            2
+        );
+
+        store
+            .delete_page(
+                &ws(),
+                &proj(),
+                &PagePath::new("notes/drop.md").unwrap(),
+                &WriterId::new("mbp-a").unwrap(),
+                3_000,
+            )
+            .await
+            .expect("delete");
+
+        let observed: Vec<String> = store
+            .recent_pages(&ws(), &proj(), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path.as_str().to_string())
+            .collect();
+        assert_eq!(
+            observed,
+            ["notes/keep.md"],
+            "a tombstoned page must not list"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_pages_of_an_empty_scope_is_empty() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+
+        // No manifest at all: a scope nobody has written to yet.
+        assert!(
+            store
+                .recent_pages(&ws(), &proj(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A committed-but-empty manifest, for good measure.
+        store
+            .commit_page(request("mbp-a", "notes/one.md", "body", 1_000))
+            .await
+            .unwrap();
+        store
+            .delete_page(
+                &ws(),
+                &proj(),
+                &PagePath::new("notes/one.md").unwrap(),
+                &WriterId::new("mbp-a").unwrap(),
+                2_000,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .recent_pages(&ws(), &proj(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fully deleted scope is empty, not an error"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
