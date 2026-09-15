@@ -17,11 +17,12 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use qm_core::{
-    CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease,
-    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PagePath, PageVersion,
-    ProjectId, Proposal, ProposalState, SessionHead, SessionId, SplitEntry, Tombstone, WalEntry,
-    WorkspaceId, WriterId, content_hash, derive_handoff_id, derive_page_id, derive_proposal_id,
-    derive_segment_id,
+    AnyManifest, CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog,
+    KeyLayout, Lease, MANIFEST_FORMAT_SHARDED, MANIFEST_FORMAT_WHOLE, MANIFEST_SCHEMA, Manifest,
+    ManifestPredecessor, ManifestRoot, ManifestShard, Observation, ObservationSegment, PageEntry,
+    PagePath, PageVersion, ProjectId, Proposal, ProposalState, SessionHead, SessionId, ShardRef,
+    SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash, derive_handoff_id,
+    derive_page_id, derive_proposal_id, derive_segment_id, manifest_shard_index,
 };
 use serde::de::DeserializeOwned;
 
@@ -60,6 +61,17 @@ const CONCURRENT_READ_LIMIT: usize = 16;
 /// `manifest_size_is_linear_in_paths`, which pins the documented range and
 /// fails if a `PageEntry` grows enough to move it.
 pub const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+
+/// Largest sharded root pointer this code will ship.
+///
+/// A root holds one reference per materialised shard and the split is fixed at
+/// [`qm_core::MANIFEST_SHARD_COUNT`], so its size is bounded by construction —
+/// unlike the whole form, which grows with the project. The bound is enforced
+/// anyway, in the same place and the same way as the whole form's, because a
+/// root that outgrew its layout would be a protocol problem and not something
+/// to discover from a 5 GiB bucket error. `a_root_with_every_shard_fits_under_
+/// the_ceiling` measures the worst case the split allows and pins it here.
+pub const MANIFEST_ROOT_MAX_BYTES: usize = 64 * 1024;
 
 /// How a fan-out over a listing treats a key the listing named but the bucket
 /// no longer has.
@@ -112,6 +124,154 @@ pub struct LoadedManifest {
     pub manifest: Manifest,
     /// Version to pass to a CAS, or `None` when the manifest does not exist yet.
     pub version: Option<ObjectVersion>,
+    /// The sharded root this manifest was materialized from.
+    ///
+    /// `None` when the scope is stored in the whole form, which is the default
+    /// and what every scope written before format 2 looks like.
+    pub root: Option<Box<ManifestRoot>>,
+}
+
+impl LoadedManifest {
+    /// The storage form the scope is committed in.
+    ///
+    /// Read from the layout rather than from `manifest.format`, because the
+    /// materialized manifest is the *whole* shape of the state whatever shape it
+    /// was stored in: this field is the thing that says which object a writer
+    /// has to replace.
+    #[must_use]
+    pub fn storage_format(&self) -> u32 {
+        match self.root {
+            Some(_) => MANIFEST_FORMAT_SHARDED,
+            None => MANIFEST_FORMAT_WHOLE,
+        }
+    }
+}
+
+/// One path's own state, read without loading the paths around it.
+///
+/// Deliberately not a `Manifest`: it answers about exactly one path, and the
+/// fields that could be mistaken for a whole project's state are private. A
+/// caller cannot read the global page count from it, or hand it to something
+/// that lists pages, because there is no such answer in it — the whole point
+/// of the scoped read is that the other shards were never fetched.
+#[derive(Debug, Clone)]
+pub struct PathState {
+    /// Current entry for the path, if the scope names one.
+    pub head: Option<PageEntry>,
+    /// Whether the path is tombstoned.
+    pub tombstoned: bool,
+    /// Commit sequence of the scope's last successful CAS (0 = never).
+    pub seq: u64,
+    /// Version to pass to a CAS, or `None` when nothing is committed yet.
+    version: Option<ObjectVersion>,
+    /// What was read to answer above.
+    source: PathSource,
+}
+
+/// What one path's read actually pulled back.
+///
+/// `Whole` and `Sharded` are exclusive alternatives, not flags, so a caller
+/// cannot treat a single shard as the whole project: the form it is in *is* the
+/// answer to "how much of the scope is in hand".
+#[derive(Debug, Clone)]
+enum PathSource {
+    /// Nothing has been committed, so there is no commit point at all.
+    Empty,
+    /// The whole-object form. This read produced the entire state.
+    Whole(Box<Manifest>),
+    /// The sharded form: the root, and the one shard this path hashes to.
+    Sharded {
+        root: Box<ManifestRoot>,
+        shard: ManifestShard,
+    },
+}
+
+/// A commit-point write, encoded and checked before anything is written.
+struct CommitWrite {
+    /// Bytes for the CAS target.
+    bytes: Bytes,
+    /// Immutable objects to create before the CAS, in order.
+    objects: Vec<(String, Bytes)>,
+}
+
+/// Whether the whole-form ceiling applies to one commit-point write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ceiling {
+    /// Refuse a commit point that outgrew what one commit may move.
+    Enforced,
+    /// Deletion, which must stay able to shrink a manifest that is already
+    /// over the ceiling — see [`encode_manifest_for_delete`]. The root pointer
+    /// is still checked: its size is bounded by the fixed split, so reaching
+    /// that ceiling would mean the layout is wrong, not that the scope is big.
+    Exempt,
+}
+
+/// What a commit records in the commit point.
+///
+/// One value for both storage forms so `plan_commit` has a single place where
+/// "a write makes this path live" is decided. The whole form stores it through
+/// [`Manifest::record`], the sharded form through the same logic on one shard —
+/// both clear the tombstone, because the newer commit is the truth.
+enum Recorded {
+    /// A page version became current.
+    Page(Box<PageEntry>),
+    /// A path was deleted.
+    Deleted(Box<Tombstone>),
+}
+
+impl Recorded {
+    /// The commit timestamp this record carries.
+    fn timestamp_ms(&self) -> i64 {
+        match self {
+            Self::Page(entry) => entry.created_at_ms,
+            Self::Deleted(tombstone) => tombstone.deleted_at_ms,
+        }
+    }
+
+    /// Apply the record to a whole manifest.
+    fn apply_whole(&self, manifest: &mut Manifest, path: &PagePath) {
+        match self {
+            Self::Page(entry) => manifest.record(path, (**entry).clone()),
+            Self::Deleted(tombstone) => manifest.tombstone(path, (**tombstone).clone()),
+        }
+    }
+
+    /// Apply the record to one shard, with the same rules as `apply_whole`.
+    fn apply_shard(&self, shard: &mut ManifestShard, path: &PagePath) {
+        match self {
+            Self::Page(entry) => {
+                shard.tombstones.remove(path.as_str());
+                shard
+                    .pages
+                    .insert(path.as_str().to_string(), (**entry).clone());
+            }
+            Self::Deleted(tombstone) => {
+                shard.pages.remove(path.as_str());
+                shard
+                    .tombstones
+                    .insert(path.as_str().to_string(), (**tombstone).clone());
+            }
+        }
+    }
+}
+
+/// What a storage-form change did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateOutcome {
+    /// Storage form the scope was in when the call started.
+    pub from: u32,
+    /// Storage form it is in now.
+    pub to: u32,
+    /// Shards the root names after the call.
+    pub shards: usize,
+    /// True when the scope was already in the target form, so nothing changed.
+    pub already_there: bool,
+    /// Key of the archived whole manifest a migration wrote, if any.
+    pub archive: Option<String>,
+    /// Commit sequence after the call.
+    pub manifest_seq: u64,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
 }
 
 /// What a retention pass would keep.
@@ -368,6 +528,7 @@ pub struct ProjectStore {
     cas: CasStore,
     layout: KeyLayout,
     retry: RetryPolicy,
+    manifest_format: u32,
 }
 
 /// Encode a manifest for the single-object commit point.
@@ -380,6 +541,7 @@ fn encode_manifest(
     project_id: &ProjectId,
     manifest: &Manifest,
 ) -> Result<Bytes, StoreError> {
+    check_whole_form(manifest)?;
     let bytes = encode(manifest)?;
     if bytes.len() > MANIFEST_MAX_BYTES {
         return Err(StoreError::ManifestTooLarge {
@@ -409,7 +571,92 @@ fn encode_manifest(
 /// overshoot. That is the trade this function exists to make; the alternative
 /// strands an over-limit scope forever.
 fn encode_manifest_for_delete(manifest: &Manifest) -> Result<Bytes, StoreError> {
+    check_whole_form(manifest)?;
     encode(manifest)
+}
+
+/// Refuse to write a `Manifest` that is tagged as another shape.
+///
+/// The `format` field decides, when the object is read back, whether it is a
+/// whole manifest or a root pointer. A `Manifest` tagged any way but the whole
+/// form would therefore be read as something it is not — and since a body is
+/// only ever read through that discriminant, writing one would be writing an
+/// object that can never be read correctly.
+fn check_whole_form(manifest: &Manifest) -> Result<(), StoreError> {
+    if manifest.format != qm_core::MANIFEST_FORMAT_WHOLE {
+        return Err(StoreError::Corrupt(format!(
+            "refusing to write a whole manifest tagged as form {} — a body is read back \
+             through that discriminant, so this one would never decode as a manifest",
+            manifest.format
+        )));
+    }
+    Ok(())
+}
+
+/// Encode a shard for its content-addressed key.
+///
+/// [`MANIFEST_MAX_BYTES`] applies to *this* object under the sharded form:
+/// the ceiling is what one commit point has to move, and a sharded commit
+/// point moves one shard, not the project.
+fn encode_shard(
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    shard: &ManifestShard,
+) -> Result<Bytes, StoreError> {
+    let bytes = encode(shard)?;
+    if bytes.len() > MANIFEST_MAX_BYTES {
+        return Err(StoreError::ManifestTooLarge {
+            workspace_id: workspace_id.to_string(),
+            project_id: project_id.to_string(),
+            paths: shard.pages.len() + shard.tombstones.len(),
+            bytes: bytes.len(),
+            limit: MANIFEST_MAX_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Encode a root pointer, refusing one that outgrew its own ceiling.
+fn encode_root(
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    root: &ManifestRoot,
+) -> Result<Bytes, StoreError> {
+    let bytes = encode(root)?;
+    if bytes.len() > MANIFEST_ROOT_MAX_BYTES {
+        return Err(StoreError::ManifestRootTooLarge {
+            workspace_id: workspace_id.to_string(),
+            project_id: project_id.to_string(),
+            shards: root.shards.len(),
+            bytes: bytes.len(),
+            limit: MANIFEST_ROOT_MAX_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Check the bytes read for a shard against the layout entry that named them.
+///
+/// A shard's key is its content hash, so a root that points at the wrong
+/// object, or at an object whose bytes were replaced, is caught here — by
+/// hashing what arrived and comparing it with what the root recorded. Without
+/// this a doctored shard would decode happily and answer with pages the commit
+/// point never named.
+fn check_shard_bytes(reference: &ShardRef, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    if key != reference.key {
+        return Err(StoreError::Corrupt(format!(
+            "the root named {} but {key} was read",
+            reference.key
+        )));
+    }
+    let actual = content_hash(bytes);
+    if actual != reference.content_hash {
+        return Err(StoreError::Corrupt(format!(
+            "{key} hashes to {actual} but the root records {}",
+            reference.content_hash
+        )));
+    }
+    Ok(())
 }
 
 /// Ordering for [`ProjectStore::recent_pages`]: newest commit first, path
@@ -436,6 +683,7 @@ impl ProjectStore {
             cas: CasStore::new(store, ""),
             layout: KeyLayout::new(root),
             retry: RetryPolicy::default(),
+            manifest_format: MANIFEST_FORMAT_WHOLE,
         }
     }
 
@@ -444,6 +692,26 @@ impl ProjectStore {
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
+    }
+
+    /// Select the storage form new commits are written in.
+    ///
+    /// [`MANIFEST_FORMAT_WHOLE`] (the default) keeps writing the single object
+    /// every earlier version wrote. [`MANIFEST_FORMAT_SHARDED`] writes a root
+    /// pointer plus immutable shards *and requires the scope to already be in
+    /// that form* — see [`ProjectStore::migrate_manifest_to_sharded`]. This
+    /// selects the form of writes only: reads dispatch on what is stored, so a
+    /// machine that never sets this still reads a sharded scope correctly.
+    #[must_use]
+    pub fn with_manifest_format(mut self, format: u32) -> Self {
+        self.manifest_format = format;
+        self
+    }
+
+    /// The storage form this store writes.
+    #[must_use]
+    pub fn manifest_format(&self) -> u32 {
+        self.manifest_format
     }
 
     /// The key layout in use.
@@ -469,15 +737,509 @@ impl ProjectStore {
     ) -> Result<LoadedManifest, StoreError> {
         let key = self.layout.manifest(workspace_id, project_id);
         match self.cas.read(&key).await {
-            Ok((bytes, version)) => Ok(LoadedManifest {
-                manifest: decode(&bytes, &key)?,
-                version: Some(version),
-            }),
+            Ok((bytes, version)) => match self.read_commit_point(&bytes, &key)? {
+                AnyManifest::Whole(manifest) => Ok(LoadedManifest {
+                    manifest,
+                    version: Some(version),
+                    root: None,
+                }),
+                AnyManifest::Sharded(root) => {
+                    let parts = self.read_shards(&root).await?;
+                    let manifest = root.materialize(&parts)?;
+                    Ok(LoadedManifest {
+                        manifest,
+                        version: Some(version),
+                        root: Some(root),
+                    })
+                }
+            },
             Err(StoreError::NotFound) => Ok(LoadedManifest {
                 manifest: Manifest::empty(workspace_id.clone(), project_id.clone()),
                 version: None,
+                root: None,
             }),
             Err(error) => Err(error),
+        }
+    }
+
+    /// One path's own state, read without loading the paths around it.
+    ///
+    /// The whole form lives in one object, so this reads that object and looks
+    /// the path up. The sharded form reads the root pointer and the single
+    /// shard the path hashes to: everything a commit needs to derive
+    /// `supersedes` and everything a read needs to find the version. Both
+    /// answers are the same ones [`Self::load`] would give — this is the same
+    /// state, reached by a shorter route — and `a_scoped_read_matches_the_full_
+    /// read_in_every_format` pins that.
+    ///
+    /// # Errors
+    /// Propagates backend, decode, and layout failures.
+    pub async fn load_path(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+    ) -> Result<PathState, StoreError> {
+        let key = self.layout.manifest(workspace_id, project_id);
+        match self.cas.read(&key).await {
+            Err(StoreError::NotFound) => Ok(PathState {
+                head: None,
+                tombstoned: false,
+                seq: 0,
+                version: None,
+                source: PathSource::Empty,
+            }),
+            Err(error) => Err(error),
+            Ok((bytes, version)) => match self.read_commit_point(&bytes, &key)? {
+                AnyManifest::Whole(manifest) => {
+                    let head = manifest.head(path).cloned();
+                    let tombstoned = manifest.is_tombstoned(path);
+                    let seq = manifest.seq;
+                    Ok(PathState {
+                        head,
+                        tombstoned,
+                        seq,
+                        version: Some(version),
+                        source: PathSource::Whole(Box::new(manifest)),
+                    })
+                }
+                AnyManifest::Sharded(root) => {
+                    // A root with no entry for this index means this path has
+                    // never been committed: an empty shard is the shard that
+                    // would hold it. That is a normal state, not a missing
+                    // object — an empty scope materialises no shards at all.
+                    let index = manifest_shard_index(path.as_str());
+                    let shard = match root.shard(index) {
+                        Some(reference) => self.read_shard(reference).await?,
+                        None => {
+                            ManifestShard::empty(workspace_id.clone(), project_id.clone(), index)
+                        }
+                    };
+                    Ok(PathState {
+                        head: shard.pages.get(path.as_str()).cloned(),
+                        tombstoned: shard.tombstones.contains_key(path.as_str()),
+                        seq: root.seq,
+                        version: Some(version),
+                        source: PathSource::Sharded { root, shard },
+                    })
+                }
+            },
+        }
+    }
+
+    /// Plan and encode the commit-point write for a recorded page.
+    ///
+    /// Everything happens before the caller writes a byte: the whole form is
+    /// encoded against [`MANIFEST_MAX_BYTES`], the sharded form is encoded
+    /// against [`MANIFEST_MAX_BYTES`] *per shard* and [`MANIFEST_ROOT_MAX_BYTES`]
+    /// for the root. A commit that cannot fit therefore leaves no page object,
+    /// no WAL entry, and no orphan shard behind.
+    ///
+    /// # Errors
+    /// [`StoreError::ManifestFormMismatch`] when the requested form and the
+    /// stored one differ, and the ceiling errors above.
+    fn plan_commit(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        state: &PathState,
+        record: Recorded,
+        ceiling: Ceiling,
+    ) -> Result<CommitWrite, StoreError> {
+        match &state.source {
+            PathSource::Empty | PathSource::Whole(_) => {
+                if self.manifest_format == MANIFEST_FORMAT_SHARDED {
+                    // The one direction that loses data: a root written here
+                    // would name only the shard this commit produced, and every
+                    // path the whole object already carries would leave the
+                    // project. A scope with no commit point has nothing to
+                    // lose, so it may be born sharded.
+                    if let PathSource::Whole(existing) = &state.source {
+                        return Err(StoreError::ManifestFormMismatch {
+                            workspace_id: workspace_id.to_string(),
+                            project_id: project_id.to_string(),
+                            requested: MANIFEST_FORMAT_SHARDED,
+                            stored: MANIFEST_FORMAT_WHOLE,
+                            paths: existing.pages.len() + existing.tombstones.len(),
+                        });
+                    }
+                    let mut shard =
+                        ManifestShard::empty(workspace_id.clone(), project_id.clone(), {
+                            manifest_shard_index(path.as_str())
+                        });
+                    record.apply_shard(&mut shard, path);
+                    let bytes = match ceiling {
+                        Ceiling::Enforced => encode_shard(workspace_id, project_id, &shard)?,
+                        Ceiling::Exempt => encode(&shard)?,
+                    };
+                    let hash = content_hash(&bytes);
+                    let mut root = ManifestRoot::empty(workspace_id.clone(), project_id.clone());
+                    root.seq = state.seq + 1;
+                    root.updated_at_ms = record.timestamp_ms();
+                    root.shards = vec![ShardRef {
+                        shard: shard.shard,
+                        key: self.layout.manifest_shard(workspace_id, project_id, &hash),
+                        content_hash: hash,
+                        path_count: shard.pages.len() + shard.tombstones.len(),
+                    }];
+                    return Ok(CommitWrite {
+                        bytes: encode_root(workspace_id, project_id, &root)?,
+                        objects: root
+                            .shards
+                            .iter()
+                            .map(|reference| (reference.key.clone(), bytes.clone()))
+                            .collect(),
+                    });
+                }
+                // The whole form, unchanged from before the split existed.
+                let mut manifest = match &state.source {
+                    PathSource::Whole(manifest) => (**manifest).clone(),
+                    _ => Manifest::empty(workspace_id.clone(), project_id.clone()),
+                };
+                record.apply_whole(&mut manifest, path);
+                let bytes = match ceiling {
+                    Ceiling::Enforced => encode_manifest(workspace_id, project_id, &manifest)?,
+                    Ceiling::Exempt => encode_manifest_for_delete(&manifest)?,
+                };
+                Ok(CommitWrite {
+                    bytes,
+                    objects: Vec::new(),
+                })
+            }
+            PathSource::Sharded { root, shard } => {
+                if self.manifest_format != MANIFEST_FORMAT_SHARDED {
+                    // Symmetric refusal. Materializing the whole form would not
+                    // lose a path, but it would flip the scope's storage form
+                    // because a machine happened to have the default setting,
+                    // and the next sharded write would be refused in turn.
+                    return Err(StoreError::ManifestFormMismatch {
+                        workspace_id: workspace_id.to_string(),
+                        project_id: project_id.to_string(),
+                        requested: self.manifest_format,
+                        stored: MANIFEST_FORMAT_SHARDED,
+                        paths: shard.pages.len() + shard.tombstones.len(),
+                    });
+                }
+                let mut updated = shard.clone();
+                record.apply_shard(&mut updated, path);
+                let bytes = match ceiling {
+                    Ceiling::Enforced => encode_shard(workspace_id, project_id, &updated)?,
+                    Ceiling::Exempt => encode(&updated)?,
+                };
+                let hash = content_hash(&bytes);
+                let key = self.layout.manifest_shard(workspace_id, project_id, &hash);
+                let mut next_root = (**root).clone();
+                next_root.seq = state.seq + 1;
+                next_root.updated_at_ms = next_root.updated_at_ms.max(record.timestamp_ms());
+                let reference = ShardRef {
+                    shard: updated.shard,
+                    key: key.clone(),
+                    content_hash: hash,
+                    path_count: updated.pages.len() + updated.tombstones.len(),
+                };
+                next_root
+                    .shards
+                    .retain(|entry| entry.shard != updated.shard);
+                next_root.shards.push(reference);
+                next_root.shards.sort_by_key(|entry| entry.shard);
+                Ok(CommitWrite {
+                    bytes: encode_root(workspace_id, project_id, &next_root)?,
+                    objects: vec![(key, bytes)],
+                })
+            }
+        }
+    }
+
+    /// Read one shard by its layout entry, checking it is the object the root
+    /// meant before believing a byte of it.
+    ///
+    /// # Errors
+    /// Propagates backend and decode failures, and reports a shard whose key or
+    /// hash disagrees with the root as [`StoreError::Corrupt`].
+    async fn read_shard(&self, reference: &ShardRef) -> Result<ManifestShard, StoreError> {
+        let (bytes, _) = self.cas.read(&reference.key).await?;
+        check_shard_bytes(reference, &reference.key, &bytes)?;
+        decode::<ManifestShard>(&bytes, &reference.key)
+    }
+
+    /// Decode a commit point body, dispatching on its discriminant.
+    ///
+    /// One place, so the "is this a root or a whole manifest" decision is made
+    /// the same way by every reader. An unknown form is refused rather than
+    /// read as the nearest shape that happens to parse.
+    fn read_commit_point(&self, bytes: &[u8], key: &str) -> Result<AnyManifest, StoreError> {
+        AnyManifest::decode(bytes).map_err(|error| StoreError::Corrupt(format!("{key}: {error}")))
+    }
+
+    /// Read the shards a root names, in the root's order.
+    ///
+    /// Two checks live here and nowhere else, because this is the only place
+    /// that holds the bytes and the layout together: the key read is the key
+    /// the root named, and the bytes hash to the `content_hash` the root
+    /// recorded. [`ManifestRoot::materialize`] checks a shard's *shape*; it
+    /// cannot see whether the object behind it is the one the root meant.
+    ///
+    /// # Errors
+    /// Propagates backend and decode failures, and reports a shard whose bytes
+    /// do not match its recorded hash as [`StoreError::Corrupt`].
+    async fn read_shards(&self, root: &ManifestRoot) -> Result<Vec<ManifestShard>, StoreError> {
+        let keys: Vec<String> = root.shards.iter().map(|entry| entry.key.clone()).collect();
+        let read = self.read_bytes_all(keys).await?;
+        let mut parts = Vec::with_capacity(read.len());
+        for (expected, (key, bytes)) in root.shards.iter().zip(read) {
+            if key != expected.key {
+                return Err(StoreError::Corrupt(format!(
+                    "the root named {} but {key} was read",
+                    expected.key
+                )));
+            }
+            check_shard_bytes(expected, &key, &bytes)?;
+            parts.push(decode::<ManifestShard>(&bytes, &key)?);
+        }
+        Ok(parts)
+    }
+
+    /// Convert a whole-object manifest into the sharded form.
+    ///
+    /// Three properties the issue asks for, and how they are obtained here:
+    ///
+    /// * **Idempotent.** The shard keys are content hashes and the root is
+    ///   deterministic given them, so running this twice writes the same
+    ///   objects; a scope whose commit point is already a root returns
+    ///   untouched without even reading a shard.
+    /// * **Interruptible.** Shards, the archive, and the root are all written
+    ///   before the single CAS. Interrupting anywhere before it leaves the whole
+    ///   manifest in place and some orphan shards, which the next run reuses
+    ///   byte for byte. There is no third state: the commit point is either the
+    ///   old object or the new root.
+    /// * **Reversible.** The old body is copied to a content-addressed archive
+    ///   before the CAS replaces it, and the root records it as
+    ///   [`ManifestPredecessor`]. Nothing is deleted, so
+    ///   [`ProjectStore::rollback_manifest_to_whole`] can go back.
+    ///
+    /// Everything is encoded, and both ceilings are checked, *before* the first
+    /// write: a migration that cannot fit is refused without leaving anything
+    /// behind.
+    ///
+    /// A scope that has never committed has nothing to convert, so this is a
+    /// no-op for it. A scope that is sharded from birth is created by its first
+    /// commit in the sharded form (see [`ProjectStore::with_manifest_format`])
+    /// and carries no `predecessor`.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race, plus
+    /// backend, decode, and ceiling failures.
+    pub async fn migrate_manifest_to_sharded(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<MigrateOutcome, StoreError> {
+        let key = self.layout.manifest(workspace_id, project_id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            // `None` means the scope has never committed: there is no whole
+            // object to convert, and the migration is what *declares* the form
+            // of a scope that has none. Writing the empty root is a create, so
+            // it cannot overwrite a commit that landed in the meantime.
+            let (converted, version) = match self.cas.read(&key).await {
+                Ok((stored, version)) => match self.read_commit_point(&stored, &key)? {
+                    AnyManifest::Whole(manifest) => (Some((manifest, stored)), Some(version)),
+                    AnyManifest::Sharded(root) => {
+                        return Ok(MigrateOutcome {
+                            from: MANIFEST_FORMAT_SHARDED,
+                            to: MANIFEST_FORMAT_SHARDED,
+                            shards: root.shards.len(),
+                            already_there: true,
+                            archive: root.predecessor.as_ref().map(|held| held.key.clone()),
+                            manifest_seq: root.seq,
+                            attempts: attempt,
+                        });
+                    }
+                },
+                Err(StoreError::NotFound) => (None, None),
+                Err(error) => return Err(error),
+            };
+
+            // Everything below is computed before anything is written, so a
+            // refusal is a no-op and a retry re-plans from the state it just
+            // read.
+            //
+            // The archive is the bytes that are *there*, not a re-encoding of
+            // them. Those are the same bytes for the whole form — that is the
+            // compatibility promise the `format` field is skipped for — but
+            // this way the archive cannot be a near-copy that only the encoder
+            // would recognise.
+            let (manifest, archive) = match converted {
+                Some((manifest, stored)) => {
+                    let archive_hash = content_hash(&stored);
+                    (
+                        manifest,
+                        Some((
+                            self.layout
+                                .manifest_archive(workspace_id, project_id, &archive_hash),
+                            archive_hash,
+                            stored,
+                        )),
+                    )
+                }
+                None => (
+                    Manifest::empty(workspace_id.clone(), project_id.clone()),
+                    None,
+                ),
+            };
+            let parts = manifest.clone().into_shards();
+            let mut encoded: Vec<(u16, String, Bytes)> = Vec::with_capacity(parts.len());
+            for part in &parts {
+                let bytes = encode_shard(workspace_id, project_id, part)?;
+                encoded.push((part.shard, content_hash(&bytes), bytes));
+            }
+            let shards: Vec<ShardRef> = encoded
+                .iter()
+                .map(|(index, hash, _)| ShardRef {
+                    shard: *index,
+                    key: self.layout.manifest_shard(workspace_id, project_id, hash),
+                    content_hash: hash.clone(),
+                    path_count: parts
+                        .iter()
+                        .find(|part| part.shard == *index)
+                        .map_or(0, |part| part.pages.len() + part.tombstones.len()),
+                })
+                .collect();
+            let root = ManifestRoot {
+                shards,
+                predecessor: archive.as_ref().map(|(key, hash, _)| ManifestPredecessor {
+                    format: MANIFEST_FORMAT_WHOLE,
+                    seq: manifest.seq,
+                    key: key.clone(),
+                    content_hash: hash.clone(),
+                }),
+                seq: manifest.seq,
+                updated_at_ms: manifest.updated_at_ms,
+                ..ManifestRoot::empty(workspace_id.clone(), project_id.clone())
+            };
+            let root_bytes = encode_root(workspace_id, project_id, &root)?;
+            let shard_count = root.shards.len();
+
+            if let Some((key, _, stored)) = &archive {
+                self.create_or_verify_bytes(key, stored).await?;
+            }
+            for (index, hash, bytes) in &encoded {
+                let shard_key = self.layout.manifest_shard(workspace_id, project_id, hash);
+                // The key the layout entry names and the key written here are
+                // the same string by construction; asserting it keeps a future
+                // edit from writing shards the root cannot find.
+                debug_assert_eq!(
+                    root.shards
+                        .iter()
+                        .find(|r| r.shard == *index)
+                        .map(|r| &r.key),
+                    Some(&shard_key)
+                );
+                self.create_or_verify_bytes(&shard_key, bytes).await?;
+            }
+
+            // An existing commit point is switched with an update, never an
+            // unconditional create: turning the switch into a create would let
+            // it overwrite whatever landed in between. A scope with no commit
+            // point is the one case that creates.
+            let committed = match version {
+                Some(version) => self.cas.update(&key, root_bytes, &version).await,
+                None => self.cas.create(&key, root_bytes).await,
+            };
+            match committed {
+                Ok(_) => {
+                    return Ok(MigrateOutcome {
+                        from: MANIFEST_FORMAT_WHOLE,
+                        to: MANIFEST_FORMAT_SHARDED,
+                        shards: shard_count,
+                        already_there: false,
+                        archive: archive.as_ref().map(|(key, _, _)| key.clone()),
+                        manifest_seq: root.seq,
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Convert a sharded manifest back into the whole-object form.
+    ///
+    /// The whole form is *materialized from the current shards*, not restored
+    /// from the archive. Those are different promises and the weaker one is the
+    /// safe one: restoring the pre-migration bytes would silently discard every
+    /// commit made since the migration, while materializing carries them over.
+    /// The archive stays where it is, so a byte-exact pre-migration snapshot is
+    /// still recoverable by hand.
+    ///
+    /// The write goes through the same ceiling as any whole-form commit, so a
+    /// scope that has outgrown the single object is refused here rather than
+    /// truncated.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race, plus
+    /// backend, decode, layout, and ceiling failures.
+    pub async fn rollback_manifest_to_whole(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<MigrateOutcome, StoreError> {
+        let key = self.layout.manifest(workspace_id, project_id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let loaded = self.load(workspace_id, project_id).await?;
+            let Some(root) = loaded.root else {
+                return Ok(MigrateOutcome {
+                    from: MANIFEST_FORMAT_WHOLE,
+                    to: MANIFEST_FORMAT_WHOLE,
+                    shards: 0,
+                    already_there: true,
+                    archive: None,
+                    manifest_seq: loaded.manifest.seq,
+                    attempts: attempt,
+                });
+            };
+            let archive = root.predecessor.as_ref().map(|held| held.key.clone());
+            let bytes = encode_manifest(workspace_id, project_id, &loaded.manifest)?;
+            let committed = match loaded.version {
+                Some(version) => self.cas.update(&key, bytes, &version).await,
+                None => self.cas.create(&key, bytes).await,
+            };
+            match committed {
+                Ok(_) => {
+                    return Ok(MigrateOutcome {
+                        from: MANIFEST_FORMAT_SHARDED,
+                        to: MANIFEST_FORMAT_WHOLE,
+                        shards: 0,
+                        already_there: false,
+                        archive,
+                        manifest_seq: loaded.manifest.seq,
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -544,17 +1306,21 @@ impl ProjectStore {
 
         loop {
             attempt += 1;
-            let loaded = self
-                .load(&request.workspace_id, &request.project_id)
+            // The scoped read: for the whole form this is the same single
+            // object read the code has always done, and for the sharded form it
+            // is the root plus the one shard this path hashes to — never the
+            // paths that live in other shards.
+            let state = self
+                .load_path(&request.workspace_id, &request.project_id, &request.path)
                 .await?;
-            let supersedes = loaded.manifest.head_page_id(&request.path);
+            let supersedes = state.head.as_ref().map(|entry| entry.page_id.clone());
             let page_id = derive_page_id(
                 &request.path,
                 &request.title,
                 &request.body,
                 supersedes.as_ref(),
             );
-            let seq = loaded.manifest.next_seq();
+            let seq = state.seq + 1;
 
             let page = PageVersion {
                 page_id: page_id.clone(),
@@ -577,32 +1343,40 @@ impl ProjectStore {
                 supersedes: supersedes.clone(),
             };
 
-            let mut manifest = loaded.manifest;
-            manifest.record(
+            // Sized before anything is written: a commit point that outgrew
+            // the ceiling is refused here, so the refusal leaves no page
+            // object, no WAL entry, and no orphan shard behind.
+            let plan = self.plan_commit(
+                &request.workspace_id,
+                &request.project_id,
                 &request.path,
-                PageEntry {
+                &state,
+                Recorded::Page(Box::new(PageEntry {
                     page_id: page_id.clone(),
                     seq,
                     created_at_ms: request.now_ms,
                     writer_id: request.writer_id.clone(),
                     title: request.title.clone(),
                     supersedes: supersedes.clone(),
-                },
-            );
-            // Sized before anything is written: a manifest that outgrew the
-            // commit point is refused here, so the refusal leaves no page
-            // object and no WAL entry behind.
-            let bytes = encode_manifest(&request.workspace_id, &request.project_id, &manifest)?;
+                })),
+                Ceiling::Enforced,
+            )?;
 
             let page_object_created = self.create_or_verify(&page_key, &page).await?;
             let wal_key =
                 self.layout
                     .wal_entry(&request.workspace_id, &request.project_id, entry.event_id());
             self.create_or_verify(&wal_key, &entry).await?;
+            // Immutable shards first: the root must never name an object that
+            // is not there yet, or a reader of the committed root would fail on
+            // a shard the commit point already advertises.
+            for (key, bytes) in &plan.objects {
+                self.create_or_verify_bytes(key, bytes).await?;
+            }
 
-            let committed = match loaded.version {
-                Some(version) => self.cas.update(&manifest_key, bytes, &version).await,
-                None => self.cas.create(&manifest_key, bytes).await,
+            let committed = match state.version {
+                Some(version) => self.cas.update(&manifest_key, plan.bytes, &version).await,
+                None => self.cas.create(&manifest_key, plan.bytes).await,
             };
 
             match committed {
@@ -1492,32 +2266,41 @@ impl ProjectStore {
 
         loop {
             attempt += 1;
-            let loaded = self.load(workspace_id, project_id).await?;
-            if loaded.manifest.is_tombstoned(path) {
+            let state = self.load_path(workspace_id, project_id, path).await?;
+            if state.tombstoned {
                 return Ok(DeleteOutcome {
-                    manifest_seq: loaded.manifest.seq,
+                    manifest_seq: state.seq,
                     removed: None,
                     already_deleted: true,
                     attempts: attempt,
                 });
             }
 
-            let removed = loaded.manifest.head_page_id(path);
-            let seq = loaded.manifest.next_seq();
-            let mut manifest = loaded.manifest;
-            manifest.tombstone(
+            let removed = state.head.as_ref().map(|entry| entry.page_id.clone());
+            let seq = state.seq + 1;
+            // Deletion keeps its exemption from the whole-form ceiling — see
+            // `encode_manifest_for_delete` — in both storage forms. It is the
+            // operation that can shrink a commit point, so refusing it is what
+            // would strand a scope that is already over the limit.
+            let plan = self.plan_commit(
+                workspace_id,
+                project_id,
                 path,
-                Tombstone {
+                &state,
+                Recorded::Deleted(Box::new(Tombstone {
                     seq,
                     deleted_at_ms: now_ms,
                     writer_id: writer_id.clone(),
                     last_page_id: removed.clone(),
-                },
-            );
-            let bytes = encode_manifest_for_delete(&manifest)?;
-            let committed = match loaded.version {
-                Some(version) => self.cas.update(&manifest_key, bytes, &version).await,
-                None => self.cas.create(&manifest_key, bytes).await,
+                })),
+                Ceiling::Exempt,
+            )?;
+            for (key, bytes) in &plan.objects {
+                self.create_or_verify_bytes(key, bytes).await?;
+            }
+            let committed = match state.version {
+                Some(version) => self.cas.update(&manifest_key, plan.bytes, &version).await,
+                None => self.cas.create(&manifest_key, plan.bytes).await,
             };
 
             match committed {
@@ -1810,8 +2593,8 @@ impl ProjectStore {
         project_id: &ProjectId,
         path: &PagePath,
     ) -> Result<Option<PageVersion>, StoreError> {
-        let loaded = self.load(workspace_id, project_id).await?;
-        let Some(entry) = loaded.manifest.head(path) else {
+        let state = self.load_path(workspace_id, project_id, path).await?;
+        let Some(entry) = state.head else {
             return Ok(None);
         };
         let page_id = entry.page_id.clone();
@@ -1867,8 +2650,29 @@ impl ProjectStore {
         project_id: &ProjectId,
         path: &PagePath,
     ) -> Result<Vec<WalEntry>, StoreError> {
-        let loaded = self.load(workspace_id, project_id).await?;
-        let mut cursor = loaded.manifest.head_page_id(path);
+        let state = self.load_path(workspace_id, project_id, path).await?;
+        let head = state.head.map(|entry| entry.page_id);
+        self.page_history_from_head(workspace_id, project_id, path, head)
+            .await
+    }
+
+    /// Walk a page's supersession chain when the head is already in hand.
+    ///
+    /// Exists so a caller that has just read the whole state — `gc`, `verify` —
+    /// does not re-read the commit point (and, in the sharded form, a shard) per
+    /// path: the chain lives in the WAL, and the head is the only thing the
+    /// commit point was needed for.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when a link is missing or names another version.
+    pub(crate) async fn page_history_from_head(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        head: Option<qm_core::PageId>,
+    ) -> Result<Vec<WalEntry>, StoreError> {
+        let mut cursor = head;
         let mut newest_first = Vec::new();
         while let Some(page_id) = cursor {
             if newest_first.len() >= MAX_HISTORY_DEPTH {
@@ -1966,6 +2770,54 @@ impl ProjectStore {
             .into_iter()
             .flatten()
             .collect())
+    }
+
+    /// Read every key, overlapping the requests, and keep the raw bytes.
+    ///
+    /// The same contract as [`ProjectStore::read_all`] — every key present, the
+    /// results in the order the keys were given, one failure fails the batch —
+    /// for callers that have to check what they read rather than only decode
+    /// it. A shard is checked against the hash the root recorded for it, and
+    /// that check needs the bytes, not the parsed value.
+    ///
+    /// # Errors
+    /// Propagates the failing read belonging to the *smallest* key.
+    async fn read_bytes_all(&self, keys: Vec<String>) -> Result<Vec<(String, Bytes)>, StoreError> {
+        let slots = keys.len();
+        let mut objects: Vec<Option<Bytes>> = std::iter::repeat_with(|| None).take(slots).collect();
+        let mut failures: Vec<(String, StoreError)> = Vec::new();
+        let mut reads = futures::stream::iter(keys.clone().into_iter().enumerate())
+            .map(|(index, key)| async move {
+                let outcome = self.cas.read(&key).await.map(|(bytes, _)| bytes);
+                (index, key, outcome)
+            })
+            .buffer_unordered(CONCURRENT_READ_LIMIT);
+        while let Some((index, key, outcome)) = reads.next().await {
+            match outcome {
+                Ok(bytes) => objects[index] = Some(bytes),
+                Err(error) => failures.push((key, error)),
+            }
+        }
+        if let Some((_, error)) = failures
+            .into_iter()
+            .min_by(|left, right| left.0.cmp(&right.0))
+        {
+            return Err(error);
+        }
+        let mut out = Vec::with_capacity(slots);
+        for (key, slot) in keys.into_iter().zip(objects) {
+            let Some(bytes) = slot else {
+                // Unreachable while every failure above returns early, and
+                // stated anyway: a short answer here would look like a bucket
+                // that simply had fewer shards.
+                return Err(StoreError::Corrupt(format!(
+                    "{key} was read as part of a batch that reported no failure, \
+                     but no bytes were collected for it"
+                )));
+            };
+            out.push((key, bytes));
+        }
+        Ok(out)
     }
 
     /// Read every key, overlapping the requests up to
@@ -2152,9 +3004,9 @@ impl ProjectStore {
     /// The whole WAL is listed and read, so the number of objects fetched is
     /// the number of records and not less; the fetch is what overlaps, up to
     /// [`CONCURRENT_READ_LIMIT`]. The order comes from the sort below, never
-    /// from the order the reads finish in — and because that sort is stable and
-    /// [`ProjectStore::read_all`] files each record under its own key's
-    /// position, records that share a page id keep the listing's order.
+    /// from the order the reads finish in. The sort needs no tie-break and the
+    /// read needs no stable input order for it: a record's key *is* its page
+    /// id, so no two objects can carry the same one.
     ///
     /// A key the listing named and the bucket no longer has is a *failure*, not
     /// a skip. No commit path ever deletes a WAL record — a losing attempt only
@@ -2195,6 +3047,30 @@ impl ProjectStore {
 
     /// Create an immutable object, treating a byte-identical existing object as
     /// success (a replay) and anything else as corruption.
+    /// Create an immutable object from bytes that are already encoded.
+    ///
+    /// The same contract as [`ProjectStore::create_or_verify`] for callers
+    /// whose value is its bytes: shards and the archive are addressed by their
+    /// content hash, so comparing the bytes *is* comparing the value, and going
+    /// through a type would mean decoding an object just to decide whether to
+    /// keep it.
+    async fn create_or_verify_bytes(&self, key: &str, bytes: &Bytes) -> Result<bool, StoreError> {
+        match self.cas.create(key, bytes.clone()).await {
+            Ok(_) => Ok(true),
+            Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                let (existing, _) = self.cas.read(key).await?;
+                if existing == *bytes {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Corrupt(format!(
+                        "{key} already exists with different content"
+                    )))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn create_or_verify<T>(&self, key: &str, value: &T) -> Result<bool, StoreError>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + PartialEq,
@@ -2252,6 +3128,16 @@ mod tests {
         })
     }
 
+    /// A machine whose writes use the sharded form.
+    fn shard_machine(store: &Arc<dyn ObjectStore>) -> ProjectStore {
+        machine(store).with_manifest_format(qm_core::MANIFEST_FORMAT_SHARDED)
+    }
+
+    /// A machine writing in `format`, with the same patience as [`machine`].
+    fn machine_with_format(store: &Arc<dyn ObjectStore>, format: u32) -> ProjectStore {
+        machine(store).with_manifest_format(format)
+    }
+
     /// A backend that counts reads and how many of them overlapped.
     ///
     /// `read_commit_log` reaches the bucket through `CasStore::read`, which is
@@ -2303,7 +3189,20 @@ mod tests {
         /// manifest update is offered, which is what drives a *real* CAS
         /// conflict instead of a hand-built orphan: the update that follows is
         /// stale by the time it reaches the commit point.
-        interloper: Mutex<Option<CommitPageRequest>>,
+        ///
+        /// Carries the storage form the interloping machine writes, because a
+        /// machine writing the other form is refused — that refusal is a guard
+        /// of its own, and it would make the conflict unreachable.
+        interloper: Mutex<Option<(u32, CommitPageRequest)>>,
+        /// A put this bucket will refuse once, when its key ends this way.
+        ///
+        /// An interruption has to land *at* the switch, because that is the
+        /// only step whose failure is allowed to leave a scope half-migrated.
+        /// Refusing a shard write instead would only prove that orphans are
+        /// harmless, not that the commit point is still the old one.
+        refused_put: Mutex<Option<String>>,
+        /// Puts this bucket accepted, in order, since the last [`Self::reset`].
+        written: Mutex<Vec<String>>,
         order: CompletionOrder,
     }
 
@@ -2345,6 +3244,8 @@ mod tests {
                 completed: Mutex::new(Vec::new()),
                 vanished: Mutex::new(BTreeSet::new()),
                 interloper: Mutex::new(None),
+                refused_put: Mutex::new(None),
+                written: Mutex::new(Vec::new()),
                 order,
             })
         }
@@ -2352,16 +3253,31 @@ mod tests {
         /// Run `request` against the same bucket immediately before the next
         /// manifest update, so that update loses its CAS.
         fn interfere_once(&self, request: CommitPageRequest) {
-            *self.interloper.lock().unwrap() = Some(request);
+            self.interfere_once_as(qm_core::MANIFEST_FORMAT_WHOLE, request);
+        }
+
+        /// The same, by a machine writing `format`.
+        fn interfere_once_as(&self, format: u32, request: CommitPageRequest) {
+            *self.interloper.lock().unwrap() = Some((format, request));
         }
 
         /// The held-back commit, if this write is the manifest update it is
         /// waiting for. Taking it means it runs exactly once.
-        fn take_interloper(&self, location: &Path) -> Option<CommitPageRequest> {
+        fn take_interloper(&self, location: &Path) -> Option<(u32, CommitPageRequest)> {
             if !location.as_ref().ends_with("/manifest.json") {
                 return None;
             }
             self.interloper.lock().unwrap().take()
+        }
+
+        /// Refuse the next put whose key ends with `suffix`, once.
+        fn refuse_put_once(&self, suffix: &str) {
+            *self.refused_put.lock().unwrap() = Some(suffix.to_string());
+        }
+
+        /// Puts this bucket accepted, in order, since the last [`Self::reset`].
+        fn written(&self) -> Vec<String> {
+            self.written.lock().unwrap().clone()
         }
 
         /// Reads issued since the last [`Self::reset`].
@@ -2390,6 +3306,7 @@ mod tests {
             self.reads.store(0, AtomicOrdering::SeqCst);
             self.max_in_flight.store(0, AtomicOrdering::SeqCst);
             self.completed.lock().unwrap().clear();
+            self.written.lock().unwrap().clear();
         }
     }
 
@@ -2409,6 +3326,40 @@ mod tests {
 
     /// Every commit key of the test scope, in the order `list` hands them back
     /// — the same listing `read_commit_log` walks, relative to the same prefix.
+    fn titled(writer: &str, path: &str, title: &str, body: &str, now_ms: i64) -> CommitPageRequest {
+        CommitPageRequest {
+            title: title.to_string(),
+            ..request(writer, path, body, now_ms)
+        }
+    }
+
+    /// The bucket behind the instrumentation, as the trait object the helpers
+    /// and the store take.
+    fn as_store(bucket: &Arc<CountingStore>) -> Arc<dyn ObjectStore> {
+        Arc::clone(bucket) as Arc<dyn ObjectStore>
+    }
+
+    /// Every key in the bucket, sorted, so a test can assert on the exact set of
+    /// objects a call wrote rather than on the absence of one kind of key.
+    async fn all_keys(bucket: &Arc<dyn ObjectStore>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stream = bucket.list(None);
+        while let Some(meta) = stream.next().await {
+            out.push(meta.unwrap().location.to_string());
+        }
+        out.sort();
+        out
+    }
+
+    /// The bytes of one object, exactly as stored.
+    async fn stored_bytes(bucket: &Arc<dyn ObjectStore>, key: &str) -> Bytes {
+        let (bytes, _) = CasStore::new(Arc::clone(bucket), "")
+            .read(key)
+            .await
+            .unwrap();
+        bytes
+    }
+
     async fn commit_keys(bucket: &Arc<dyn ObjectStore>) -> Vec<String> {
         let store = machine(bucket);
         let prefix = store.layout().commit_prefix(&ws(), &proj());
@@ -2446,6 +3397,24 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move {
+                // One guard, taken once: matching and clearing have to be the
+                // same critical section, and taking the lock again inside the
+                // branch is how a fixture deadlocks the thread it is testing.
+                let refused = {
+                    let mut guard = self.refused_put.lock().unwrap();
+                    match guard.as_ref() {
+                        Some(suffix) if location.as_ref().ends_with(suffix.as_str()) => {
+                            guard.take()
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(suffix) = refused {
+                    return Err(object_store::Error::Generic {
+                        store: "fixture",
+                        source: format!("refused put to {suffix}").into(),
+                    });
+                }
                 // The commit point is the one write whose staleness matters: let
                 // a held-back commit land first, so the update this call is
                 // about to offer is already describing the past. It goes
@@ -2453,14 +3422,18 @@ mod tests {
                 // nor able to re-enter this instrumentation — and the page
                 // version and WAL record the caller wrote before this call stay
                 // where they are, which is the leftover a real lost race leaves.
-                if let Some(request) = self.take_interloper(location) {
+                if let Some((format, request)) = self.take_interloper(location) {
                     let other: Arc<dyn ObjectStore> =
                         Arc::clone(&self.inner) as Arc<dyn ObjectStore>;
-                    machine(&other)
+                    machine_with_format(&other, format)
                         .commit_page(request)
                         .await
                         .expect("the held-back commit must land");
                 }
+                self.written
+                    .lock()
+                    .unwrap()
+                    .push(location.as_ref().to_string());
                 self.inner.put_opts(location, payload, opts).await
             })
         }
@@ -4587,6 +5560,22 @@ mod tests {
             "the collection must name the abandoned record: {:?}",
             applied.deleted_keys
         );
+        // The abandoned attempt left a pair, not one object: the page version
+        // it uploaded and the WAL record that names it. Counting both exactly
+        // is what pins the pair — a `>=` here would pass if the reclaimer also
+        // collected something the manifest still names, or collected only half
+        // the pair and stopped.
+        assert_eq!(
+            applied.deleted, 2,
+            "the loser's page version and WAL record, and nothing else: {:?}",
+            applied.deleted_keys
+        );
+        assert_eq!(
+            applied.deleted_keys.len(),
+            2,
+            "the named keys and the count agree: {:?}",
+            applied.deleted_keys
+        );
         assert!(matches!(
             store.cas().head(&orphan).await,
             Err(StoreError::NotFound)
@@ -5435,5 +6424,933 @@ mod tests {
         assert!(!outcome.already_deleted);
         assert!(outcome.removed.is_some(), "the delete must remove the head");
         assert_eq!(outcome.manifest_seq, paths as u64 + 1);
+    }
+
+    /// Seed `count` committed paths into a whole-form scope.
+    async fn seed_whole(store: &ProjectStore, count: usize) {
+        for index in 0..count {
+            store
+                .commit_page(request(
+                    "mbp-a",
+                    &format!("notes/page-{index:03}.md"),
+                    &format!("body {index}"),
+                    1_000 + index as i64,
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Conversion, not rewrite: a second migration writes nothing at all.
+    #[tokio::test]
+    async fn migrating_twice_changes_nothing() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        seed_whole(&store, 40).await;
+        let pages_before = store
+            .recent_pages(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        let keys_before = all_keys(&bucket).await;
+        assert!(
+            !keys_before.iter().any(|key| key.contains("/manifest/")),
+            "the premise: nothing sharded exists yet"
+        );
+
+        let first = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert_eq!(first.from, qm_core::MANIFEST_FORMAT_WHOLE);
+        assert_eq!(first.to, qm_core::MANIFEST_FORMAT_SHARDED);
+        assert!(!first.already_there);
+        assert_eq!(first.manifest_seq, 40, "the sequence is carried, not reset");
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        let root = loaded.root.clone().expect("the scope is sharded now");
+        assert_eq!(first.shards, root.shards.len());
+        assert!(
+            first.shards >= 3,
+            "the fixture must spread over several shards, got {}",
+            first.shards
+        );
+        assert_eq!(
+            root.shards
+                .iter()
+                .map(|reference| reference.path_count)
+                .sum::<usize>(),
+            40,
+            "every committed path is named by exactly one shard"
+        );
+        assert!(
+            root.shards.iter().all(|reference| reference.path_count > 0),
+            "no empty shard is materialised"
+        );
+        let archive = first
+            .archive
+            .clone()
+            .expect("a converted scope keeps its old body");
+        let after_first = all_keys(&bucket).await;
+        assert!(
+            after_first.contains(&archive),
+            "the pre-migration body is archived, not deleted: {archive}"
+        );
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            pages_before,
+            "the conversion must not change what the scope says"
+        );
+
+        let second = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(second.already_there, "a second migration is a no-op");
+        assert_eq!(second.shards, first.shards);
+        assert_eq!(
+            second.archive.as_deref(),
+            Some(archive.as_str()),
+            "the no-op still reports the predecessor it found"
+        );
+        assert_eq!(
+            all_keys(&bucket).await,
+            after_first,
+            "a second migration writes no object"
+        );
+    }
+
+    /// An interruption lands at the switch, which is the only step that may not
+    /// be half-done; the run then resumes and reuses what it wrote.
+    #[tokio::test]
+    async fn an_interrupted_migration_leaves_the_whole_manifest_in_place_and_resumes() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = machine(&other);
+        seed_whole(&store, 30).await;
+        let pages_before = store
+            .recent_pages(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        let keys_before = all_keys(&other).await;
+
+        bucket.reset();
+        bucket.refuse_put_once("/manifest.json");
+        let error = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("refused put"),
+            "the fixture has to fail the switch: {error}"
+        );
+
+        let written = bucket.written();
+        assert!(
+            written.iter().any(|key| key.contains("/manifest/shards/")),
+            "the shards are written before the switch: {written:?}"
+        );
+        assert!(
+            written.iter().any(|key| key.contains("/manifest/archive/")),
+            "so is the archive: {written:?}"
+        );
+        assert_eq!(
+            written
+                .iter()
+                .filter(|key| key.ends_with("/manifest.json"))
+                .count(),
+            0,
+            "the switch itself is the write that was refused"
+        );
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(
+            loaded.root.is_none(),
+            "an interrupted migration leaves the whole commit point in place"
+        );
+        assert_eq!(loaded.manifest.seq, 30);
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            pages_before,
+            "and the scope still answers exactly as before"
+        );
+        assert!(
+            store.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "the orphans are orphans, not damage"
+        );
+        let interrupted = all_keys(&other).await;
+        assert!(
+            interrupted.len() > keys_before.len(),
+            "the interrupted run did leave its shards behind: {} -> {}",
+            keys_before.len(),
+            interrupted.len()
+        );
+
+        // Resuming: the same shard keys, byte for byte, and one switch.
+        let resumed = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(!resumed.already_there);
+        assert_eq!(resumed.manifest_seq, 30);
+        assert_eq!(resumed.shards, interrupted_shard_count(&interrupted));
+        let relisted = all_keys(&other).await;
+        assert_eq!(
+            relisted.len(),
+            interrupted.len(),
+            "resuming reuses the orphan shards instead of writing more: {relisted:?}"
+        );
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            pages_before
+        );
+        assert!(store.load(&ws(), &proj()).await.unwrap().root.is_some());
+    }
+
+    /// How many shard objects a listing shows.
+    fn interrupted_shard_count(keys: &[String]) -> usize {
+        keys.iter()
+            .filter(|key| key.contains("/manifest/shards/"))
+            .count()
+    }
+
+    /// Going back must not lose what was written after the migration.
+    #[tokio::test]
+    async fn a_rollback_keeps_the_writes_made_after_the_migration() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        store
+            .commit_page(request("mbp-a", "notes/before.md", "v1", 1_000))
+            .await
+            .unwrap();
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        let archive = migration.archive.clone().expect("an archive was written");
+
+        shard_machine(&bucket)
+            .commit_page(request(
+                "mbp-a",
+                "notes/after.md",
+                "written while the scope was sharded",
+                2_000,
+            ))
+            .await
+            .unwrap();
+        let while_sharded = store.load(&ws(), &proj()).await.unwrap();
+        assert_eq!(while_sharded.manifest.seq, 2);
+
+        let rolled_back = store
+            .rollback_manifest_to_whole(&ws(), &proj())
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.from, qm_core::MANIFEST_FORMAT_SHARDED);
+        assert_eq!(rolled_back.to, qm_core::MANIFEST_FORMAT_WHOLE);
+        assert!(!rolled_back.already_there);
+        assert_eq!(
+            rolled_back.archive.as_deref(),
+            Some(archive.as_str()),
+            "the rollback names the predecessor it rolled back over"
+        );
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(loaded.root.is_none(), "the scope is whole again");
+        assert_eq!(loaded.manifest.seq, 2);
+        assert_eq!(
+            loaded.manifest.pages.len(),
+            2,
+            "rolling back materializes the current state; it does not restore the \
+             pre-migration snapshot and drop what came after"
+        );
+        assert!(loaded.manifest.pages.contains_key("notes/after.md"));
+
+        let keys = all_keys(&bucket).await;
+        assert!(
+            keys.contains(&archive),
+            "rollback deletes nothing, so the archive is still there"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("/manifest/shards/")),
+            "and neither are the shards"
+        );
+
+        // Forward again: the same path either way round.
+        let again = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(!again.already_there);
+        assert_eq!(
+            store.load(&ws(), &proj()).await.unwrap().manifest.pages,
+            loaded.manifest.pages,
+            "a round trip changes no answer"
+        );
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            loaded
+                .manifest
+                .pages
+                .iter()
+                .map(|(path, entry)| (PagePath::new(path).unwrap(), entry.clone()))
+                .collect::<Vec<_>>()
+                .tap_sorted()
+        );
+    }
+
+    /// A tiny sorting shim so the round-trip assertion above reads the same way
+    /// `recent_pages` orders its answer.
+    trait SortedByRecency {
+        fn tap_sorted(self) -> Self;
+    }
+
+    impl SortedByRecency for Vec<(PagePath, PageEntry)> {
+        fn tap_sorted(mut self) -> Self {
+            self.sort_by(recency_order);
+            self
+        }
+    }
+
+    /// The direction the issue asks for: a migrated scope still reads with the
+    /// form that was there before, and refuses to be written in it.
+    #[tokio::test]
+    async fn a_migrated_scope_still_reads_in_the_whole_form_and_refuses_whole_writes() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sharded = shard_machine(&bucket);
+        seed_whole(&sharded, 12).await;
+        sharded
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        let whole = machine(&bucket);
+
+        let path = PagePath::new("notes/page-001.md").unwrap();
+        assert_eq!(
+            whole.read_page(&ws(), &proj(), &path).await.unwrap(),
+            sharded.read_page(&ws(), &proj(), &path).await.unwrap(),
+            "a whole-form reader reads the sharded state"
+        );
+        assert_eq!(
+            whole
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            sharded
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            whole.load(&ws(), &proj()).await.unwrap().manifest,
+            sharded.load(&ws(), &proj()).await.unwrap().manifest
+        );
+
+        let before = all_keys(&bucket).await;
+        let error = whole
+            .commit_page(request("mbp-a", "notes/late.md", "v1", 9_000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                StoreError::ManifestFormMismatch {
+                    requested: qm_core::MANIFEST_FORMAT_WHOLE,
+                    stored: qm_core::MANIFEST_FORMAT_SHARDED,
+                    ..
+                }
+            ),
+            "a whole-form write into a sharded scope is refused: {error}"
+        );
+        assert!(
+            error.to_string().contains("migrate-manifest"),
+            "and the refusal says what to do instead: {error}"
+        );
+        assert_eq!(
+            all_keys(&bucket).await,
+            before,
+            "the refused write wrote nothing at all"
+        );
+
+        // The other direction is refused too, so a default machine cannot flip
+        // a scope's form by writing to it.
+        let plain: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let whole_store = machine(&plain);
+        seed_whole(&whole_store, 3).await;
+        let shard_before = all_keys(&plain).await;
+        let error = shard_machine(&plain)
+            .commit_page(request("mbp-a", "notes/late.md", "v1", 9_000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                StoreError::ManifestFormMismatch {
+                    requested: qm_core::MANIFEST_FORMAT_SHARDED,
+                    stored: qm_core::MANIFEST_FORMAT_WHOLE,
+                    paths: 3,
+                    ..
+                }
+            ),
+            "a sharded write into a whole scope would drop its paths: {error}"
+        );
+        assert_eq!(
+            all_keys(&plain).await,
+            shard_before,
+            "that refusal also writes nothing"
+        );
+    }
+
+    /// A scope with no history can be declared sharded, and can go back.
+    #[tokio::test]
+    async fn a_scope_can_be_born_sharded_and_rolled_back_to_whole() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = shard_machine(&bucket);
+        store
+            .commit_page(request("mbp-a", "notes/first.md", "v1", 1_000))
+            .await
+            .unwrap();
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        let root = loaded.root.clone().expect("born sharded");
+        assert!(
+            root.predecessor.is_none(),
+            "nothing was converted, so there is no predecessor to name"
+        );
+        assert_eq!(loaded.manifest.seq, 1);
+
+        let rolled_back = store
+            .rollback_manifest_to_whole(&ws(), &proj())
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.to, qm_core::MANIFEST_FORMAT_WHOLE);
+        assert!(
+            rolled_back.archive.is_none(),
+            "there was never a whole manifest to archive"
+        );
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(loaded.root.is_none());
+        assert_eq!(loaded.manifest.pages.len(), 1);
+        assert!(
+            store.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "the scope is consistent after the round trip"
+        );
+    }
+
+    /// Same writes, same reads: the two storage forms must be invisible.
+    ///
+    /// Table-driven over every read path the two forms share, and over the
+    /// negative answers as well — a deleted path and a path that never existed
+    /// are exactly where a layout that silently lost a shard would look like a
+    /// plausible "nothing there".
+    #[tokio::test]
+    async fn both_forms_answer_identically() {
+        let whole_bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shard_bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let whole = machine(&whole_bucket);
+        let sharded = shard_machine(&shard_bucket);
+        sharded
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(
+            sharded.load(&ws(), &proj()).await.unwrap().root.is_some(),
+            "the premise: the sharded scope really is sharded"
+        );
+
+        let writes = [
+            ("notes/raft.md", "Raft", "leader election", 1_000),
+            ("notes/tantivy.md", "Tantivy", "splits and segments", 2_000),
+            ("notes/gone.md", "Gone", "written to be deleted", 3_000),
+            (
+                "notes/raft.md",
+                "Raft",
+                "leader election and log replication",
+                4_000,
+            ),
+            (
+                "notes/tantivy.md",
+                "Tantivy",
+                "splits, segments, and merges",
+                5_000,
+            ),
+        ];
+        for (path, title, body, now_ms) in writes {
+            let request = titled("mbp-a", path, title, body, now_ms);
+            let left = whole.commit_page(request.clone()).await.unwrap();
+            let right = sharded.commit_page(request).await.unwrap();
+            assert_eq!(
+                left.manifest_seq, right.manifest_seq,
+                "seq is form-independent"
+            );
+            assert_eq!(
+                left.page_id, right.page_id,
+                "the same bytes get the same id"
+            );
+            assert_eq!(
+                left.supersedes, right.supersedes,
+                "the chain a commit extends must not depend on the layout"
+            );
+        }
+        let deleted = PagePath::new("notes/gone.md").unwrap();
+        let writer = WriterId::new("mbp-b").unwrap();
+        let left = whole
+            .delete_page(&ws(), &proj(), &deleted, &writer, 6_000)
+            .await
+            .unwrap();
+        let right = sharded
+            .delete_page(&ws(), &proj(), &deleted, &writer, 6_000)
+            .await
+            .unwrap();
+        assert_eq!(left, right, "deletion answers the same in both forms");
+
+        let whole_loaded = whole.load(&ws(), &proj()).await.unwrap();
+        let sharded_loaded = sharded.load(&ws(), &proj()).await.unwrap();
+        assert!(
+            whole_loaded.root.is_none(),
+            "the premise: one scope is whole"
+        );
+        assert!(
+            sharded_loaded.root.is_some(),
+            "the premise: the other is sharded"
+        );
+        assert_eq!(
+            whole_loaded.manifest.pages, sharded_loaded.manifest.pages,
+            "the materialized pages must be identical"
+        );
+        assert_eq!(
+            whole_loaded.manifest.tombstones,
+            sharded_loaded.manifest.tombstones
+        );
+        assert_eq!(whole_loaded.manifest.seq, sharded_loaded.manifest.seq);
+
+        // `is_current` over a grid of paths crossed with every page id the two
+        // scopes know about, so both "yes" and "no" are compared.
+        let mut ids: Vec<String> = Vec::new();
+        for (_, entry) in &whole_loaded.manifest.pages {
+            ids.push(entry.page_id.to_string());
+        }
+        for (_, entry) in &sharded_loaded.manifest.pages {
+            ids.push(entry.page_id.to_string());
+        }
+        ids.push("0".repeat(64));
+        for path in [
+            "notes/raft.md",
+            "notes/tantivy.md",
+            "notes/gone.md",
+            "notes/never-written.md",
+        ] {
+            for id in &ids {
+                assert_eq!(
+                    whole_loaded.manifest.is_current(path, id),
+                    sharded_loaded.manifest.is_current(path, id),
+                    "visibility of {path} at {id} must not depend on the layout"
+                );
+            }
+        }
+
+        let paths: Vec<PagePath> = [
+            "notes/raft.md",
+            "notes/tantivy.md",
+            "notes/gone.md",
+            "notes/never-written.md",
+        ]
+        .iter()
+        .map(|path| PagePath::new(path).unwrap())
+        .collect();
+
+        assert_eq!(
+            whole
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            sharded
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap(),
+            "the recency listing must agree"
+        );
+        for path in &paths {
+            assert_eq!(
+                whole.read_page(&ws(), &proj(), path).await.unwrap(),
+                sharded.read_page(&ws(), &proj(), path).await.unwrap(),
+                "reading {} must agree",
+                path.as_str()
+            );
+            assert_eq!(
+                whole.page_history(&ws(), &proj(), path).await.unwrap(),
+                sharded.page_history(&ws(), &proj(), path).await.unwrap(),
+                "the supersession chain of {} must agree",
+                path.as_str()
+            );
+        }
+        for at_ms in [0, 1_500, 2_500, 3_500, 4_500, 5_500, 6_500] {
+            for path in &paths {
+                assert_eq!(
+                    whole.version_at(&ws(), &proj(), path, at_ms).await.unwrap(),
+                    sharded
+                        .version_at(&ws(), &proj(), path, at_ms)
+                        .await
+                        .unwrap(),
+                    "what {} said at {at_ms} must agree",
+                    path.as_str()
+                );
+            }
+        }
+        let whole_digest = whole.digest(&ws(), &proj(), 0, usize::MAX).await.unwrap();
+        let shard_digest = sharded.digest(&ws(), &proj(), 0, usize::MAX).await.unwrap();
+        assert_eq!(whole_digest.pages, shard_digest.pages);
+        assert!(
+            !whole_digest.pages.is_empty(),
+            "the premise: the digest has pages to compare"
+        );
+
+        let whole_report = whole.verify_project(&ws(), &proj()).await.unwrap();
+        let shard_report = sharded.verify_project(&ws(), &proj()).await.unwrap();
+        assert!(whole_report.ok(), "{:?}", whole_report.problems);
+        assert!(shard_report.ok(), "{:?}", shard_report.problems);
+        assert_eq!(whole_report.pages, shard_report.pages);
+        assert_eq!(whole_report.manifest_seq, shard_report.manifest_seq);
+        assert!(shard_report.shards > 0, "the report names the split");
+    }
+
+    /// Only one CAS makes a commit visible, in the sharded form too.
+    ///
+    /// The injection lands a *real* competing commit on the same scope just
+    /// before this one is offered, so the second commit's update is stale — the
+    /// same shape as two machines racing, without hand-building a bucket state.
+    #[tokio::test]
+    async fn a_lost_sharded_cas_leaves_an_orphan_shard_and_never_a_half_truth() {
+        let bucket = CountingStore::new();
+        let other = as_store(&bucket);
+        let store = shard_machine(&other);
+        let first = store
+            .commit_page(request("mbp-a", "notes/a.md", "v1", 1_000))
+            .await
+            .unwrap();
+        assert_eq!(first.manifest_seq, 1);
+
+        let interloper = request("mbp-b", "notes/c.md", "written by the other machine", 2_000);
+        bucket.interfere_once_as(qm_core::MANIFEST_FORMAT_SHARDED, interloper);
+        let second = store
+            .commit_page(request("mbp-a", "notes/b.md", "v2", 3_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.attempts, 2,
+            "the first offering lost the CAS and was retried"
+        );
+        assert_eq!(
+            second.manifest_seq, 3,
+            "the losing attempt consumed no sequence: the two winners took 2 and 3"
+        );
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        let root = loaded.root.clone().expect("still sharded");
+        assert_eq!(loaded.manifest.seq, 3);
+        let mut seqs: Vec<u64> = loaded
+            .manifest
+            .pages
+            .values()
+            .map(|entry| entry.seq)
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "three successful CASes, three sequences, no gap"
+        );
+        assert_eq!(
+            loaded
+                .manifest
+                .pages
+                .get("notes/b.md")
+                .map(|entry| entry.seq),
+            Some(3),
+            "the retried commit is the one that took the freed sequence"
+        );
+
+        // Every shard the root names is readable: the commit point never
+        // advertises half a write.
+        for reference in &root.shards {
+            assert!(
+                bucket
+                    .inner
+                    .head(&Path::from(reference.key.clone()))
+                    .await
+                    .is_ok(),
+                "{} is named by the root but missing",
+                reference.key
+            );
+        }
+
+        // And the attempt that lost left its shard behind, unreferenced.
+        let named: BTreeSet<&str> = root
+            .shards
+            .iter()
+            .map(|reference| reference.key.as_str())
+            .collect();
+        let on_disk: BTreeSet<String> = all_keys(&other)
+            .await
+            .into_iter()
+            .filter(|key| key.contains("/manifest/shards/"))
+            .collect();
+        assert!(
+            on_disk.len() > named.len(),
+            "the loser's shard is still in the bucket: {} on disk, {} named",
+            on_disk.len(),
+            named.len()
+        );
+        assert!(
+            named.iter().all(|key| on_disk.contains(*key)),
+            "every named shard must also be present"
+        );
+    }
+
+    /// Turning the switch off has to leave the objects exactly as they were.
+    ///
+    /// The acceptance test is the *set of keys*, not a smell test: an extra
+    /// object is a new object in the bucket for every existing scope, and a
+    /// missing one is a broken commit point.
+    #[tokio::test]
+    async fn the_default_form_writes_exactly_the_objects_it_always_did() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        store
+            .commit_page(request("mbp-a", "notes/raft.md", "leader election", 1_000))
+            .await
+            .unwrap();
+
+        let keys = all_keys(&bucket).await;
+        assert_eq!(
+            keys,
+            vec![
+                "v1/ws/acme/proj/ai-memory/commits/00000000000000000001.json".to_string(),
+                "v1/ws/acme/proj/ai-memory/manifest.json".to_string(),
+                format!(
+                    "v1/ws/acme/proj/ai-memory/pages/notes/raft.md/versions/{}.md",
+                    derive_page_id(
+                        &PagePath::new("notes/raft.md").unwrap(),
+                        "notes/raft.md",
+                        "leader election",
+                        None
+                    )
+                ),
+                format!(
+                    "v1/ws/acme/proj/ai-memory/wal/{}.json",
+                    derive_page_id(
+                        &PagePath::new("notes/raft.md").unwrap(),
+                        "notes/raft.md",
+                        "leader election",
+                        None
+                    )
+                ),
+            ],
+            "one commit writes the page version, the WAL record, the commit record, \
+             and the commit point — and nothing else"
+        );
+
+        // And the commit point itself must not have grown a field on the wire.
+        let raw = stored_bytes(&bucket, "v1/ws/acme/proj/ai-memory/manifest.json").await;
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+        assert!(
+            !text.contains("\"format\""),
+            "the whole form must encode exactly as it did before the field existed: {text}"
+        );
+    }
+
+    /// The claim the split is for: a path read must not fetch the other shards.
+    #[tokio::test]
+    async fn a_sharded_read_touches_the_root_and_one_shard_while_a_listing_touches_them_all() {
+        let bucket = CountingStore::new();
+        let store = shard_machine(&as_store(&bucket));
+        let mut paths = Vec::new();
+        for index in 0..60 {
+            let path = format!("notes/page-{index:03}.md");
+            store
+                .commit_page(request("mbp-a", &path, "body", 1_000 + index as i64))
+                .await
+                .unwrap();
+            paths.push(path);
+        }
+        let root = store
+            .load(&ws(), &proj())
+            .await
+            .unwrap()
+            .root
+            .expect("the premise: the scope is stored sharded")
+            .clone();
+        assert!(
+            root.shards.len() >= 3,
+            "the premise: 60 paths must spread over several shards, got {}",
+            root.shards.len()
+        );
+
+        let path = PagePath::new(&paths[0]).unwrap();
+        let entry = root
+            .shard(manifest_shard_index(path.as_str()))
+            .expect("the premise: the path's shard is materialised")
+            .clone();
+        let manifest_key = store.layout().manifest(&ws(), &proj());
+
+        bucket.reset();
+        let page = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.path, path, "the read still answers about the path");
+        let mut touched = bucket.completed();
+        touched.sort();
+        let mut expected = vec![
+            manifest_key.clone(),
+            entry.key.clone(),
+            store
+                .layout()
+                .page_version(&ws(), &proj(), &path, &page.page_id),
+        ];
+        expected.sort();
+        assert_eq!(
+            touched,
+            expected,
+            "a path read is the root, the one shard holding the path, and the version \
+             it points at — never the {} other shards",
+            root.shards.len() - 1
+        );
+
+        bucket.reset();
+        let recent = store
+            .recent_pages(&ws(), &proj(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            recent.len(),
+            paths.len(),
+            "the listing still sees every path"
+        );
+        let mut touched = bucket.completed();
+        touched.sort();
+        let mut expected = vec![manifest_key];
+        expected.extend(root.shards.iter().map(|reference| reference.key.clone()));
+        expected.sort();
+        assert_eq!(
+            touched, expected,
+            "a listing orders by time across the whole scope, so it needs every shard"
+        );
+        assert!(
+            recent.len() > root.shards.len(),
+            "the contrast is only meaningful while one shard holds several paths"
+        );
+    }
+
+    /// The per-object ceilings, and that they refuse rather than truncate.
+    #[tokio::test]
+    async fn a_shard_over_the_ceiling_is_refused_before_anything_is_written() {
+        let bucket = CountingStore::new();
+        let store = shard_machine(&as_store(&bucket));
+        store
+            .commit_page(request("mbp-a", "notes/small.md", "body", 1_000))
+            .await
+            .unwrap();
+        let before = all_keys(&as_store(&bucket)).await;
+        let entry = before
+            .iter()
+            .filter(|key| key.contains("/versions/"))
+            .count();
+        assert_eq!(entry, 1, "the premise: one page version is committed");
+
+        let title = "t".repeat(MANIFEST_MAX_BYTES);
+        let error = store
+            .commit_page(titled("mbp-a", "notes/huge.md", &title, "body", 2_000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::ManifestTooLarge { paths, limit, .. }
+                if *paths == 1 && *limit == MANIFEST_MAX_BYTES),
+            "the shard's own ceiling must refuse this, naming the one path: {error}"
+        );
+        assert_eq!(
+            all_keys(&as_store(&bucket)).await,
+            before,
+            "a refused commit writes nothing: no page version, no WAL record, no shard"
+        );
+    }
+
+    /// How much room the root pointer can possibly need, measured.
+    #[test]
+    fn a_root_with_every_shard_fits_under_its_ceiling() {
+        let layout = KeyLayout::new("v1");
+        let root = ManifestRoot {
+            shards: (0..qm_core::MANIFEST_SHARD_COUNT)
+                .map(|index| ShardRef {
+                    shard: index,
+                    key: layout.manifest_shard(&ws(), &proj(), &"f".repeat(64)),
+                    content_hash: "f".repeat(64),
+                    path_count: usize::MAX,
+                })
+                .collect(),
+            ..ManifestRoot::empty(ws(), proj())
+        };
+        assert_eq!(
+            root.shards.len(),
+            usize::from(qm_core::MANIFEST_SHARD_COUNT)
+        );
+        let bytes = encode_root(&ws(), &proj(), &root).unwrap();
+        println!("root bytes with a full split = {}", bytes.len());
+        assert!(
+            bytes.len() <= MANIFEST_ROOT_MAX_BYTES,
+            "the fixed split bounds the root, so the worst case has to fit: {} > {}",
+            bytes.len(),
+            MANIFEST_ROOT_MAX_BYTES
+        );
+    }
+
+    /// The whole form refuses what two shards fit — which is the reason the
+    /// sharded form exists at all.
+    #[test]
+    fn two_shards_can_hold_what_one_whole_manifest_cannot() {
+        let a = PagePath::new("notes/a.md").unwrap();
+        let b = PagePath::new("notes/b.md").unwrap();
+        let big = "t".repeat(MANIFEST_MAX_BYTES / 2 + 1_000);
+        let entry = |path: &PagePath| PageEntry {
+            page_id: derive_page_id(path, &big, "body", None),
+            seq: 1,
+            created_at_ms: 1_000,
+            writer_id: WriterId::new("mbp-a").unwrap(),
+            title: big.clone(),
+            supersedes: None,
+        };
+
+        let mut one = ManifestShard::empty(ws(), proj(), manifest_shard_index(a.as_str()));
+        one.pages.insert(a.as_str().to_string(), entry(&a));
+        let mut two = ManifestShard::empty(ws(), proj(), manifest_shard_index(b.as_str()));
+        two.pages.insert(b.as_str().to_string(), entry(&b));
+        assert_ne!(
+            one.shard, two.shard,
+            "the fixture needs two different shards"
+        );
+        let first = encode_shard(&ws(), &proj(), &one).expect("one shard fits");
+        let second = encode_shard(&ws(), &proj(), &two).expect("the other shard fits");
+
+        let mut whole = Manifest::empty(ws(), proj());
+        whole.pages.extend(one.pages.clone());
+        whole.pages.extend(two.pages.clone());
+        let error = encode_manifest(&ws(), &proj(), &whole).unwrap_err();
+        assert!(
+            matches!(&error, StoreError::ManifestTooLarge { paths, .. } if *paths == 2),
+            "the whole form must refuse the two together: {error}"
+        );
+        assert!(
+            first.len() + second.len() > MANIFEST_MAX_BYTES,
+            "the premise: the two shards really do add up past one object"
+        );
     }
 }

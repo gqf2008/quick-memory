@@ -60,11 +60,33 @@ impl ProjectStore {
         keys.insert(layout.manifest(workspace_id, project_id));
         let loaded = self.load(workspace_id, project_id).await?;
 
+        // The sharded commit point names its shards, and they are live for
+        // exactly as long as it does. Missing one here would collect a shard
+        // the manifest still points at, which is the worst thing a reclaimer
+        // can do; the archive a migration wrote is live too, because it is what
+        // `predecessor` names and the only copy of the pre-migration body.
+        if let Some(root) = &loaded.root {
+            for reference in &root.shards {
+                keys.insert(reference.key.clone());
+            }
+            if let Some(predecessor) = &root.predecessor {
+                keys.insert(predecessor.key.clone());
+            }
+        }
+
         for (path, entry) in &loaded.manifest.pages {
             let page_path = PagePath::new(path)?;
             keys.insert(layout.page_version(workspace_id, project_id, &page_path, &entry.page_id));
+            // The head is already in hand from the manifest read above, so the
+            // chain walk skips a commit-point read per path — which in the
+            // sharded form would be a root read plus a shard read, each.
             for wal in self
-                .page_history(workspace_id, project_id, &page_path)
+                .page_history_from_head(
+                    workspace_id,
+                    project_id,
+                    &page_path,
+                    Some(entry.page_id.clone()),
+                )
                 .await?
             {
                 keys.insert(layout.wal_entry(workspace_id, project_id, wal.event_id()));

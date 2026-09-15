@@ -38,6 +38,8 @@ pub struct VerifyReport {
     pub sessions: usize,
     /// Splits referenced by the catalog.
     pub splits: usize,
+    /// Shards the commit point names (0 for the whole-object form).
+    pub shards: usize,
     /// Everything that is inconsistent.
     pub problems: Vec<Problem>,
 }
@@ -76,11 +78,65 @@ impl ProjectStore {
                     pages: 0,
                     sessions: 0,
                     splits: 0,
+                    shards: 0,
                     problems,
                 });
             }
         };
+        let shards = loaded.root.as_ref().map_or(0, |root| root.shards.len());
+        let root = loaded.root;
         let manifest = loaded.manifest;
+
+        // The sharded layout is checked here rather than left to the read path,
+        // because these are the two ways a root can advertise a state it does
+        // not actually have: a shard filed under a key that is not its content
+        // hash (so the hash check the reader makes is checking the wrong
+        // thing), and a `predecessor` whose archive is gone (so the recovery
+        // point the root claims does not exist).
+        if let Some(root) = &root {
+            for reference in &root.shards {
+                let canonical =
+                    self.layout()
+                        .manifest_shard(workspace_id, project_id, &reference.content_hash);
+                if reference.key != canonical {
+                    problems.push(Problem {
+                        kind: "manifest_shard_key".into(),
+                        subject: reference.key.clone(),
+                        detail: format!(
+                            "shard {} is filed under a key that is not its content hash \
+                             (expected {canonical})",
+                            reference.shard
+                        ),
+                    });
+                }
+            }
+            if let Some(predecessor) = &root.predecessor {
+                match self.cas().read(&predecessor.key).await {
+                    Ok((bytes, _)) => {
+                        let actual = qm_core::content_hash(&bytes);
+                        if actual != predecessor.content_hash {
+                            problems.push(Problem {
+                                kind: "manifest_predecessor".into(),
+                                subject: predecessor.key.clone(),
+                                detail: format!(
+                                    "the archived whole manifest hashes to {actual}, but the \
+                                     root records {}",
+                                    predecessor.content_hash
+                                ),
+                            });
+                        }
+                    }
+                    Err(error) => problems.push(Problem {
+                        kind: "manifest_predecessor".into(),
+                        subject: predecessor.key.clone(),
+                        detail: format!(
+                            "the root names a predecessor at seq {} that cannot be read: {error}",
+                            predecessor.seq
+                        ),
+                    }),
+                }
+            }
+        }
 
         // Pages: every head must resolve, and each chain must walk cleanly.
         for (path, entry) in &manifest.pages {
@@ -96,7 +152,12 @@ impl ProjectStore {
                 }
             };
             match self
-                .page_history(workspace_id, project_id, &page_path)
+                .page_history_from_head(
+                    workspace_id,
+                    project_id,
+                    &page_path,
+                    Some(entry.page_id.clone()),
+                )
                 .await
             {
                 Ok(history) => {
@@ -183,6 +244,7 @@ impl ProjectStore {
 
         Ok(VerifyReport {
             manifest_seq: manifest.seq,
+            shards,
             pages: manifest.pages.len(),
             sessions: sessions.len(),
             splits: splits_checked,

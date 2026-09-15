@@ -152,6 +152,69 @@ pub enum StoreError {
         /// The limit those bytes exceeded.
         limit: usize,
     },
+    /// A sharded root pointer outgrew the ceiling it is allowed.
+    ///
+    /// Refused before anything is written, exactly like
+    /// [`StoreError::ManifestTooLarge`]. A root's size is bounded by the fixed
+    /// split, so reaching this means the layout itself is wrong rather than
+    /// that the project is large.
+    #[error(
+        "refusing to commit: the sharded root for {workspace_id}/{project_id} names {shards} \
+         shards and encodes to {bytes} bytes, over the {limit}-byte limit of the root pointer"
+    )]
+    ManifestRootTooLarge {
+        /// Workspace whose root was refused.
+        workspace_id: String,
+        /// Project whose root was refused.
+        project_id: String,
+        /// Shards the refused root named.
+        shards: usize,
+        /// Bytes the refused root encoded to.
+        bytes: usize,
+        /// The limit those bytes exceeded.
+        limit: usize,
+    },
+    /// A write asked for one storage form while the scope is stored in the
+    /// other, in the one direction that would lose data.
+    ///
+    /// Writing sharded commits into a scope that is stored whole is refused
+    /// rather than upgraded: the new root would name only the shards this
+    /// commit wrote, so every path committed before it would vanish from the
+    /// project. Upgrading is a migration, and a migration is what the operator
+    /// has to ask for.
+    #[error(
+        "refusing to commit into {workspace_id}/{project_id} in format {requested} while the scope \
+         is stored in format {stored}: the new root would publish a project with none of its \
+         {paths} existing paths in it. Run `qm migrate-manifest` first, or write in format {stored}."
+    )]
+    ManifestFormMismatch {
+        /// Workspace the refused commit targeted.
+        workspace_id: String,
+        /// Project the refused commit targeted.
+        project_id: String,
+        /// Form the write asked for.
+        requested: u32,
+        /// Form the scope is stored in.
+        stored: u32,
+        /// Paths the scope currently commits.
+        paths: usize,
+    },
+    /// A rollback was refused because the scope was never migrated.
+    ///
+    /// A root carries `predecessor` only when a migration produced it, so its
+    /// absence is what distinguishes "migrated, roll back if you want" from
+    /// "born sharded, there is nothing behind it". Rolling back the second kind
+    /// would have to invent a predecessor.
+    #[error(
+        "refusing to roll back {workspace_id}/{project_id}: its root names no whole-manifest \
+         predecessor, so it was never migrated"
+    )]
+    ManifestNotMigrated {
+        /// Workspace the refused rollback targeted.
+        workspace_id: String,
+        /// Project the refused rollback targeted.
+        project_id: String,
+    },
     /// Any other backend failure.
     #[error("object store error: {0}")]
     Backend(String),
@@ -185,9 +248,9 @@ pub use digest::{Digest, SessionSummary, handoff_activity_ms};
 pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
-    LeaseGuard, LoadedCatalog, LoadedManifest, MANIFEST_MAX_BYTES, ProjectStore, ProposalRequest,
-    PublishOutcome, ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome,
-    plan_retention,
+    LeaseGuard, LoadedCatalog, LoadedManifest, MANIFEST_MAX_BYTES, MANIFEST_ROOT_MAX_BYTES,
+    MigrateOutcome, PathState, ProjectStore, ProposalRequest, PublishOutcome,
+    ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
 };
 pub use verify::{Problem, VerifyReport};
 
