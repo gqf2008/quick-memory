@@ -19,8 +19,14 @@
 //! signatures, latency, quotas, region behaviour and R2's own XML variants
 //! (see `docs/design.md` §5.1 and §11).
 
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use qm_probe::s3_stub::{Fault, RecordedRequest, S3Stub, StubOptions};
 
@@ -38,6 +44,22 @@ const SHARED: &str = "zephyrquill";
 /// The pages the corpus is made of. The last one matters most: a listing that
 /// stops after its first page is exactly a reader that never hears about it.
 const PATHS: [&str; 3] = ["notes/alpha.md", "notes/beta.md", "notes/gamma.md"];
+
+/// The far end of the vector chain: process A writes under this scope and a
+/// fresh process B resolves the same scope from the same S3 stub.
+const VECTOR_WORKSPACE: &str = "probe-vector-ws";
+const VECTOR_PROJECT: &str = "probe-vector-proj";
+const VECTOR_MODEL_A: &str = "vector-model-a";
+const VECTOR_MODEL_B: &str = "vector-model-b";
+const VECTOR_DIM: usize = 4;
+const VECTOR_KEY: &str = "vector-stub-key";
+const VECTOR_TARGET_PATH: &str = "notes/agreement.md";
+const VECTOR_TARGET_TITLE: &str = "Distributed agreement";
+const VECTOR_TARGET_BODY: &str = "A protocol for choosing one coordinator and ordering updates.";
+const VECTOR_DISTRACTOR_PATH: &str = "notes/bread.md";
+const VECTOR_DISTRACTOR_TITLE: &str = "Sourdough schedule";
+const VECTOR_DISTRACTOR_BODY: &str = "Feed the starter and preheat the oven.";
+const VECTOR_QUERY: &str = "How do machines reach shared decisions?";
 
 /// One JSONL corpus, `PATHS.len()` pages, every one carrying [`SHARED`].
 fn corpus_jsonl() -> String {
@@ -65,13 +87,43 @@ fn write_corpus(dir: &Path) -> std::path::PathBuf {
     docs
 }
 
+/// Source pages for `vector-publish`: no page id or embedding is supplied by
+/// the caller; the authority commit and the configured provider produce both.
+fn vector_corpus_jsonl() -> String {
+    let mut out = String::new();
+    for (path, title, body) in [
+        (VECTOR_TARGET_PATH, VECTOR_TARGET_TITLE, VECTOR_TARGET_BODY),
+        (
+            VECTOR_DISTRACTOR_PATH,
+            VECTOR_DISTRACTOR_TITLE,
+            VECTOR_DISTRACTOR_BODY,
+        ),
+    ] {
+        let page = serde_json::json!({
+            "path": path,
+            "title": title,
+            "body": body,
+        });
+        out.push_str(&page.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn write_vector_corpus(dir: &Path) -> std::path::PathBuf {
+    let docs = dir.join("vector-machine-a.jsonl");
+    std::fs::write(&docs, vector_corpus_jsonl()).expect("writing the vector corpus");
+    docs
+}
+
 /// Run the `search-probe` binary against `stub`, hermetically.
 ///
 /// The probe processes are the thing under test here: each call is a fresh
 /// OS process with an empty environment, so nothing it knows can come from
 /// this one.
-fn probe(stub: &S3Stub, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_search-probe"))
+fn probe_with_env(stub: &S3Stub, args: &[&str], extra_env: &[(&str, String)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_search-probe"));
+    command
         .args(args)
         .env_clear()
         .env("QM_S3_ENDPOINT", stub.endpoint())
@@ -81,9 +133,15 @@ fn probe(stub: &S3Stub, args: &[&str]) -> Output {
         .env("QM_S3_FORCE_PATH_STYLE", "true")
         // The probe logs tracing to stdout and prints its answer there too;
         // silence the logs rather than pattern-match around them.
-        .env("RUST_LOG", "off")
-        .output()
-        .expect("running the search-probe binary")
+        .env("RUST_LOG", "off");
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command.output().expect("running the search-probe binary")
+}
+
+fn probe(stub: &S3Stub, args: &[&str]) -> Output {
+    probe_with_env(stub, args, &[])
 }
 
 /// `search-probe --split-prefix split-a build <docs>` in its own process.
@@ -172,6 +230,196 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingRequest {
+    model: String,
+    inputs: Vec<String>,
+}
+
+fn target_embedding_text() -> String {
+    format!("{VECTOR_TARGET_TITLE}\n\n{VECTOR_TARGET_BODY}")
+}
+
+fn distractor_embedding_text() -> String {
+    format!("{VECTOR_DISTRACTOR_TITLE}\n\n{VECTOR_DISTRACTOR_BODY}")
+}
+
+/// A hand-written "model": the target and the query point the same way, the
+/// distractor is orthogonal, and every other input is refused rather than
+/// silently given a fallback vector.
+fn vector_for(input: &str) -> Option<Vec<f32>> {
+    if input == target_embedding_text() || input == VECTOR_QUERY {
+        Some(vec![1.0, 0.0, 0.0, 0.0])
+    } else if input == distractor_embedding_text() {
+        Some(vec![0.0, 1.0, 0.0, 0.0])
+    } else {
+        None
+    }
+}
+
+/// A real HTTP OpenAI-compatible embeddings stub in the test process.
+///
+/// The child probes are separate OS processes; this listener is the only way
+/// they can obtain a query or page vector, so a successful run proves the
+/// provider was reached over HTTP rather than substituted in-process.
+struct EmbeddingStub {
+    address: SocketAddr,
+    seen: Arc<Mutex<Vec<EmbeddingRequest>>>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EmbeddingStub {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binding the embedding stub");
+        let address = listener.local_addr().expect("the embedding stub's address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let serve_seen = Arc::clone(&seen);
+        let serve_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            loop {
+                if serve_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let (stream, _) = listener.accept().expect("accepting an embedding request");
+                if serve_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Err(error) = handle_embedding_connection(stream, &serve_seen) {
+                    eprintln!("embedding stub request failed: {error}");
+                }
+            }
+        });
+        Self {
+            address,
+            seen,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn seen(&self) -> Vec<EmbeddingRequest> {
+        self.seen.lock().expect("embedding request log").clone()
+    }
+
+    fn shutdown(mut self) -> Vec<EmbeddingRequest> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.seen()
+    }
+}
+
+fn handle_embedding_connection(
+    mut stream: TcpStream,
+    seen: &Mutex<Vec<EmbeddingRequest>>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    if !request_line.starts_with("POST /embeddings ") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected request line: {request_line:?}"),
+        ));
+    }
+
+    let mut content_length = None;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some(value) = header
+            .split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim())
+        {
+            content_length = Some(value.parse::<usize>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("bad content-length {value:?}: {error}"),
+                )
+            })?);
+        }
+    }
+    let content_length = content_length.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "embedding request had no content-length",
+        )
+    })?;
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body)?;
+    let request: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("embedding request was not JSON: {error}"),
+        )
+    })?;
+    let model = request["model"]
+        .as_str()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedding request had no model",
+            )
+        })?
+        .to_string();
+    let inputs: Vec<String> = match request.get("input") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "embedding input was not a string",
+                    )
+                })
+            })
+            .collect::<std::io::Result<_>>()?,
+        Some(serde_json::Value::String(value)) => vec![value.clone()],
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedding request had no input",
+            ));
+        }
+    };
+    let mut data = Vec::with_capacity(inputs.len());
+    for input in &inputs {
+        let vector = vector_for(input).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("stub received an unknown input: {input:?}"),
+            )
+        })?;
+        data.push(serde_json::json!({ "embedding": vector }));
+    }
+    seen.lock()
+        .expect("embedding request log")
+        .push(EmbeddingRequest { model, inputs });
+
+    let response_body = serde_json::json!({ "data": data }).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }
 
 /// The positive leg, with the bucket paginating one object per page so the
@@ -385,6 +633,187 @@ fn a_reader_that_receives_truncated_objects_refuses_the_index() {
     );
 
     broken.shutdown();
+}
+
+/// Process A commits and embeds a vector-bearing project through a real HTTP
+/// provider; process B, with its own handle and an empty local cache, queries
+/// the same S3 stub. The query has no lexical overlap with either page, so the
+/// only stream that can recall the target is `vector`.
+#[test]
+fn a_second_process_recalls_a_synonym_page_only_through_the_vector_stream_over_real_http() {
+    let stub =
+        S3Stub::start_with(StubOptions::default().with_page_size(1)).expect("starting the S3 stub");
+    let embeddings = EmbeddingStub::start();
+    let workdir = tempfile::TempDir::new().expect("creating a work directory");
+    let docs = write_vector_corpus(workdir.path());
+    let docs_path = docs.to_str().expect("the corpus path is UTF-8");
+
+    let embedding_env = vec![
+        ("QM_EMBEDDING_BASE_URL", embeddings.base_url()),
+        ("QM_EMBEDDING_API_KEY", VECTOR_KEY.to_string()),
+        ("QM_EMBEDDING_MODEL", VECTOR_MODEL_A.to_string()),
+        ("QM_EMBEDDING_DIM", VECTOR_DIM.to_string()),
+    ];
+
+    // Machine A: authoritative commits, a real embedding call, and a real
+    // S3 PUT sequence. The process exits before machine B starts.
+    let publish = probe_with_env(
+        &stub,
+        &[
+            "vector-publish",
+            docs_path,
+            "--workspace",
+            VECTOR_WORKSPACE,
+            "--project",
+            VECTOR_PROJECT,
+            "--writer",
+            "probe-vector-machine-a",
+            "--now-ms",
+            "100",
+        ],
+        &embedding_env,
+    );
+    assert!(publish.status.success(), "{}", combined(&publish));
+
+    let objects = stub.objects();
+    assert!(
+        objects
+            .keys()
+            .any(|key| key.ends_with("embedding-identity.json")),
+        "the published split must carry its embedding identity: {objects:#?}"
+    );
+    assert!(
+        objects.keys().any(|key| key.ends_with("manifest.json")),
+        "the pages must be authoritative, not only indexed: {objects:#?}"
+    );
+    let after_publish = stub.requests();
+
+    // Machine B: its own process, its own S3 client and cache. It knows only
+    // the bucket coordinates and the query text.
+    let answer = probe_with_env(
+        &stub,
+        &[
+            "vector-query",
+            "--workspace",
+            VECTOR_WORKSPACE,
+            "--project",
+            VECTOR_PROJECT,
+            VECTOR_QUERY,
+        ],
+        &embedding_env,
+    );
+    assert!(answer.status.success(), "{}", combined(&answer));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&answer.stdout).expect("the vector answer must be JSON");
+    let hits = parsed["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer must carry hits: {}", combined(&answer)));
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the synonym page should be recalled: {parsed:#?}"
+    );
+    assert_eq!(hits[0]["path"], serde_json::json!(VECTOR_TARGET_PATH));
+    assert_eq!(
+        hits[0]["streams"],
+        serde_json::json!(["vector"]),
+        "the hit must be recalled only by the vector stream: {parsed:#?}"
+    );
+    assert_eq!(
+        parsed["streams_active"],
+        serde_json::json!(["vector"]),
+        "no keyword stream may be active for this query: {parsed:#?}"
+    );
+    assert_eq!(parsed["stream_candidates"]["vector"], serde_json::json!(1));
+    assert_eq!(
+        parsed["stream_candidates"]["body"],
+        serde_json::json!(0),
+        "the body stream must have returned no candidate: {parsed:#?}"
+    );
+
+    // The S3 stub saw the second process read the catalog/authority/split over
+    // a real HTTP connection; the process did not share an in-memory backend.
+    let served = stub.requests();
+    let reader_phase = &served[after_publish.len()..];
+    let reads = object_gets(reader_phase);
+    assert!(
+        !reads.is_empty(),
+        "the second process must have fetched objects over HTTP: {reader_phase:#?}"
+    );
+
+    // Control 1: no provider is a configuration failure, not a silent
+    // keyword-only fallback. It fails before making an embedding request.
+    let no_provider = probe(
+        &stub,
+        &[
+            "vector-query",
+            "--workspace",
+            VECTOR_WORKSPACE,
+            "--project",
+            VECTOR_PROJECT,
+            VECTOR_QUERY,
+        ],
+    );
+    assert!(
+        !no_provider.status.success(),
+        "a vector query without a provider must fail closed:\n{}",
+        combined(&no_provider)
+    );
+    assert!(
+        String::from_utf8_lossy(&no_provider.stderr).contains("QM_EMBEDDING_BASE_URL"),
+        "the missing-provider error must name the missing setting:\n{}",
+        combined(&no_provider)
+    );
+
+    // Control 2: an equal-width model change is refused before the query is
+    // embedded, so unrelated coordinates can never be ranked as if they were
+    // comparable. The stub would happily answer model B; the identity guard is
+    // what has to stop it.
+    let mismatch_env = vec![
+        ("QM_EMBEDDING_BASE_URL", embeddings.base_url()),
+        ("QM_EMBEDDING_API_KEY", VECTOR_KEY.to_string()),
+        ("QM_EMBEDDING_MODEL", VECTOR_MODEL_B.to_string()),
+        ("QM_EMBEDDING_DIM", VECTOR_DIM.to_string()),
+    ];
+    let mismatch = probe_with_env(
+        &stub,
+        &[
+            "vector-query",
+            "--workspace",
+            VECTOR_WORKSPACE,
+            "--project",
+            VECTOR_PROJECT,
+            VECTOR_QUERY,
+        ],
+        &mismatch_env,
+    );
+    assert!(
+        !mismatch.status.success(),
+        "a model mismatch must fail closed:\n{}",
+        combined(&mismatch)
+    );
+    let mismatch_stderr = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(
+        mismatch_stderr.contains(VECTOR_MODEL_A) && mismatch_stderr.contains(VECTOR_MODEL_B),
+        "the mismatch error must name both models:\n{}",
+        combined(&mismatch)
+    );
+
+    let seen = embeddings.shutdown();
+    assert_eq!(
+        seen.len(),
+        2,
+        "only the publish and the positive query may reach the provider: {seen:#?}"
+    );
+    assert_eq!(seen[0].model, VECTOR_MODEL_A);
+    assert_eq!(
+        seen[0].inputs,
+        vec![target_embedding_text(), distractor_embedding_text()]
+    );
+    assert_eq!(seen[1].model, VECTOR_MODEL_A);
+    assert_eq!(seen[1].inputs, vec![VECTOR_QUERY.to_string()]);
+
+    stub.shutdown();
 }
 
 /// The multi-machine scenario (`search-probe project`) over the same socket:

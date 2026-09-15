@@ -19,10 +19,20 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+/// Upper bound on one OpenAI-compatible embedding request.
+///
+/// This is a liveness boundary, not a latency target: without it a provider
+/// that accepts a connection and never answers would park the read path (and
+/// any publish sharing it) indefinitely. The value is deliberately generous so
+/// a healthy slow request is not mistaken for a dead one, while still bounding
+/// the wait when the provider is actually stuck.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Environment names for the OpenAI-compatible provider. Kept as named
 // constants so the missing/partial-configuration tests refer to them, not to
@@ -156,18 +166,40 @@ impl OpenAiCompatEmbedder {
     /// vector cannot be compared, so it is a configuration error rather than a
     /// degenerate-but-valid embedder.
     pub fn new(base_url: &str, api_key: &str, model: &str, dim: usize) -> Result<Self> {
+        Self::with_timeout(base_url, api_key, model, dim, REQUEST_TIMEOUT)
+    }
+
+    /// Build an embedder with an explicit request timeout.
+    ///
+    /// Private so the production timeout stays one policy rather than a knob
+    /// every caller has to remember; the timeout test uses it to keep the
+    /// stalled-provider control fast and deterministic.
+    fn with_timeout(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        dim: usize,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         if base_url.trim().is_empty() || api_key.trim().is_empty() || model.trim().is_empty() {
             bail!("embedding provider needs a base url, an api key and a model");
         }
         if dim == 0 {
             bail!("embedding provider needs a non-zero dimension");
         }
+        if request_timeout.is_zero() {
+            bail!("embedding provider needs a non-zero request timeout");
+        }
+        let client = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .build()
+            .context("building the embedding HTTP client")?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             dim,
-            client: reqwest::Client::new(),
+            client,
         })
     }
 
@@ -385,6 +417,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_embedding_endpoint_times_out_instead_of_waiting_forever() {
+        let server = stall_server();
+        let embedder = OpenAiCompatEmbedder::with_timeout(
+            &format!("http://{}", server.address),
+            "k",
+            "m",
+            3,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let texts = vec!["alpha".to_string()];
+
+        let result = tokio::time::timeout(Duration::from_secs(2), embedder.embed(&texts)).await;
+        match result {
+            Ok(Err(error)) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("timed out") || message.contains("timeout"),
+                    "the request must fail with a timeout, got: {message}"
+                );
+            }
+            Ok(Ok(_)) => panic!("a stalled provider must not answer successfully"),
+            Err(_) => panic!(
+                "the embedder must enforce its own request timeout; the outer test deadline fired first"
+            ),
+        }
+        server.join();
+    }
+
+    #[tokio::test]
     async fn a_wrong_count_response_surfaces_as_an_error_through_embed() {
         let body = server_once(r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#, |_| {});
         let embedder =
@@ -471,6 +533,60 @@ mod tests {
         assert!(OpenAiCompatEmbedder::new("http://x", "  ", "m", 3).is_err());
         assert!(OpenAiCompatEmbedder::new("http://x", "k", "", 3).is_err());
         assert!(OpenAiCompatEmbedder::new("http://x", "k", "m", 0).is_err());
+    }
+
+    /// A server that accepts one request and then never answers it.
+    ///
+    /// It stays open until the owning test stops it, so the endpoint really is
+    /// a stall rather than a slow response. The stop flag exists so a failed
+    /// assertion can join the helper instead of leaking its thread.
+    struct StallServer {
+        address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StallServer {
+        fn join(mut self) {
+            self.stop();
+        }
+
+        fn stop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for StallServer {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn stall_server() -> StallServer {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let serve_stop = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            while !serve_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        StallServer {
+            address,
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// A one-shot HTTP server: accepts a single request, asserts its shape with

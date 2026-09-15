@@ -141,6 +141,12 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   全部取回并命中全量页面。测试断言的是 stub **收到**的 PUT/GET（每个 key 都被第二个进程取过），而不是
   探针自称的数字；stub 刻意按每页 1 个对象分页，所以"读到全量"必须真的跟着 `continuation-token` 走。
   多机目录场景（`search-probe project`：三写一读、旧版本被目录过滤掉）也在同一 socket 上跑通。
+- **向量链也是真 HTTP、跨进程的**：`search-probe vector-publish` 在一个进程里经真实 HTTP
+  embedding stub 生成向量、提交权威页面并把分片 PUT 到 S3 stub；进程退出后，
+  `search-probe vector-query` 只带桶坐标、自己的缓存和查询文本启动，从同一个 S3 stub 取回目录、权威
+  与分片，并把一个**与页面无词法重合**的查询召回为目标页。测试断言命中的 `streams` 和
+  `streams_active` 都只有 `vector`，且无 provider 时命令硬失败、同宽换模型在查询向量生成前被身份守卫拒绝；
+  它不是产品 CLI，而是探针的协议层证据。见 `crates/qm-probe/tests/search_probe_stub.rs`。
 - **两个检索侧的故障注入对照**：stub 把 listing 的第一页当成完整答案（`--fault truncate-listing`）→
   读者只被告知 1 个对象、材料化出来的目录缺 `meta.json`，`query` 必须退出非零且不打印命中；
   stub 把每个 `GET` 的 body 截成 1 字节、`content-length` 仍然诚实（`--fault truncate-read-body`）→
@@ -171,8 +177,9 @@ HTTP `409 Conflict` 被 `object_store` 映射成 `Error::AlreadyExists`，`qm-st
   它证明的是"客户端在真实 HTTP 往返下的行为"，不是"R2 真的这样回答"。
 - **服务端签名校验**：stub 记录并忽略 `Authorization`；签名是否正确，只有真后端才能拒。
 - **R2 的延迟、配额、区域行为、一致性、错误 XML 变体**：stub 一律立刻回答、无错误变体。
-- **检索路径同样只有 stub 级证据**：`search-probe` 的 build/query 与 project 已经真打 socket，但**没有
-  在真 R2 上跑过**（§11 第 2 项）；`project` 里的"多台机器"是同一进程内的并发任务，只有桶访问是跨进程的。
+- **检索与向量路径同样只有 stub 级证据**：`search-probe` 的 build/query、project 以及
+  vector-publish/vector-query 已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、5 项）；`project`
+  里的“多台机器”是同一进程内的并发任务，只有桶访问是跨进程的，向量闭环则另有独立进程的 A/B 证据。
 - **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
   所以"大对象"这条路径没有被覆盖。
 - **真实网络故障**：重试/退避只被单元测试覆盖，stub 不制造超时、5xx 或连接断裂。
@@ -263,9 +270,17 @@ QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_
   就会**静默消失**（关键词那几路仍然正常）。所以压缩路径同样接入 provider，并有测试守着这一点。
 - **换 provider 需要重新嵌入**：publish 的 watermark 记录了"这一版是否带向量"，所以
   配置 provider 之后第一次 publish 会重发全部页面（序号没动，但内容需要重算）。
+- **请求有界**：`OpenAiCompatEmbedder` 对一次 HTTP embedding 请求设置 30 秒总超时。一个接受连接后
+  永不回答的确定性 stall endpoint 会让调用返回超时错误，而不是让读/发布路径永久挂住；测试用短超时
+  跑这条阳性对照，生产值只在一个常量里。
 
-已知取舍：embedding 服务是**读路径上的一个外部依赖**——配置了它，检索就会等它。这是 fail-closed
-的代价，换来的是"索引里的向量一定与查询向量同源、同宽"。
+**协议层（stub）已经证明，真 R2 仍未验证**：上面的向量闭环跨两个独立 `search-probe` 进程、经由真实
+HTTP embedding stub 与 `S3Stub` 完成，能证明客户端在真实 HTTP 往返上的组合行为；它不是 R2 观测，
+没有覆盖 R2 的签名校验、延迟、配额、一致性或错误 XML 变体。真 R2 上仍应跑一次
+`vector-publish` + `vector-query`，并保留无 provider / 换模型两条 fail-closed 对照。
+
+已知取舍：embedding 服务是**读路径上的一个外部依赖**——配置了它，检索就可能等它，最多等到 30 秒超时。
+这是 fail-closed 的代价，换来的是"索引里的向量一定与查询向量同源、同宽"。
 
 ## 6.4 与 Quickwit 的格式兼容（已用真分片验证）
 
@@ -1193,3 +1208,6 @@ mTLS 之外的完整读写链路、多机协作语义。
    ~~格式版本是否兼容~~ —— **源码核对一致**（fork 0.26.0，`INDEX_FORMAT_VERSION = 7`，与本仓 tantivy 0.26.2 相同）；
    仅剩**真实字节**验证，需要 `QW_BIN`（本机下载被限速，见 §6.4）；
 4. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`。
+5. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
+   `search-probe vector-query`，并把无 provider / 同宽换模型两条 fail-closed 对照一起跑一遍——
+   **协议层（stub）已验证，真 R2 待验证**（无凭据）。见 §5.1 与 §6.20。

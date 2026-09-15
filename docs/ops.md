@@ -139,17 +139,21 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 多机检索与过期过滤、采集→编译→检索、跨机器读写与 handoff、export/import、`verify --strict`。
 细节与原始数字见 `design.md` §10.5。
 
-仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）与 **Quickwit 二进制产出的真实分片**。
-有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这两类后端差异。
+仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**Quickwit 二进制产出的真实分片**，
+以及**向量检索链在真 R2 上的行为**。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，
+它专门盯前两类后端差异；向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点。
 
 没有凭据时能走多远：`qm-probe` 里有一个进程内的最小 S3 stub（`s3-stub` 二进制 / `qm_probe::s3_stub`），
-探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页与跨进程检索（见 `design.md` §5.1）。
+探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页、跨进程检索，以及“独立进程 A 经真实 HTTP
+embedding stub 发布向量、独立进程 B 只靠 `vector` 流召回”的闭环（见 `design.md` §5.1 / §6.20）。
 但它只是「协议层」，不是真桶，有两条读法要记住：
 
 - 它**不建模条件读**：带 `If-Match`/`If-None-Match` 的 `GET`/`HEAD` 一律回 `501 NotImplemented`。
   真实 S3/R2 命中时本该是 `304`（带 ETag），这层语义**没有建模，也没有被验证**——`501` 是「我们还没做」，
   不要当成后端行为。
 - 它**不校验签名**：请求里的 `AWS4-HMAC-SHA256` 只被记录、不被验算，签名对不对只有真后端能拒。
+- 向量闭环的“真 HTTP”指 embedding stub 与 S3 stub 都走本地 socket；它仍没有证明 R2 的
+  latency/quota/一致性，也没有把真 provider 的网络故障形态纳入。
 
 ## 完整性自检
 
