@@ -356,6 +356,10 @@ mod tests {
         assert_eq!(report.commits, 12);
         assert_eq!(report.pages, 3);
         assert_eq!(report.wal_records, 12);
+        // A lower bound, not evidence of contention: every commit costs at
+        // least one attempt, so this can never fail. The probe prints whether a
+        // conflict actually happened instead of asserting it, because that is
+        // decided by the scheduler and the network.
         assert!(report.attempts >= 12);
         // 12 page versions + 12 WAL records + 12 commit records + the manifest.
         assert_eq!(

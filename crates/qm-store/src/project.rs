@@ -2178,9 +2178,11 @@ mod tests {
         // code under test: on a fast in-memory backend these tasks are often
         // serialised and every commit wins on its first attempt. Such an
         // assertion fails on a fraction of runs for a reason that says nothing
-        // about correctness. The property that matters -- a superseded manifest
-        // version is refused at the commit point -- is pinned deterministically
-        // by `a_stale_manifest_version_is_rejected_at_the_commit_point`. What
+        // about correctness. The guard that makes retrying safe -- a superseded
+        // manifest version is refused at the commit point -- is pinned
+        // deterministically by
+        // `a_stale_manifest_version_is_rejected_at_the_commit_point`; the
+        // retry loop itself only runs when the scheduler interleaves. What
         // stays here are the properties that hold however the runtime schedules
         // the tasks: no lost write, a complete chain per path, and a WAL with
         // exactly one record per committed version.
@@ -2282,9 +2284,13 @@ mod tests {
         // publish. There is deliberately no assertion that a head CAS conflict
         // was observed: eight publishes are frequently serialised by the
         // scheduler, so "saw more than eight attempts" is a coin flip, not a
-        // property of the code. The retry path it was trying to reach is pinned
-        // deterministically by
-        // `a_stale_manifest_version_is_rejected_at_the_commit_point`.
+        // property of the code. What is pinned deterministically is the *guard*
+        // that makes retrying safe -- a superseded version is refused at a
+        // commit point -- by
+        // `a_stale_manifest_version_is_rejected_at_the_commit_point`, which
+        // exercises the manifest commit point; this test's contention is on the
+        // catalog head, which uses the same CAS primitive. The retry loop
+        // itself is only covered when the scheduler actually interleaves.
         for task in tasks {
             task.await.unwrap();
         }
