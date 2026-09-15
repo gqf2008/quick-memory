@@ -161,13 +161,19 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 - R2 出口免费，读分片不产生出口费；写入按 Class A 操作计费。
 - 一次 `qm capture` = 1 段 + 1 个 head CAS；一次 `qm publish` = 分片文件数 + 1 个 catalog + 1 次 CAS。
 - 分片随发布次数增长，压缩把 N 个分片并回 1 个；检索成本 ≈ 分片数 × 流数（3）。
-- `qm digest` / `qm log` / `qm history` / `qm read-page --as-of`（`memory_digest` /
-  `memory_log` / `memory_read_page`）读**整条 commit log**：读的对象数随提交数**线性**增长
-  （N 条提交 = N 次对象读），并发上限 16，所以延迟约 `⌈N/16⌉ × RTT`，而不是 `N × RTT`。
+- 一次 `qm digest` 的**三段都读整份对象**，读的对象数各自随对象数**线性**增长，并发上限统一是
+  **16**，所以每段延迟约 `⌈N/16⌉ × RTT`，而不是 `N × RTT`：
+  - **pages**：整条 commit log（N 条提交 = N 次对象读）。`qm log` / `qm history` /
+    `qm read-page --as-of`（`memory_log` / `memory_read_page`）走的是同一段；
+  - **sessions**：每个会话一个 head（N 个会话 = N 次对象读）；
+  - **handoffs**：每个交接棒一个对象（N 个交接棒 = N 次对象读）。`qm handoff list`
+    （`memory_handoff_list`）走的是同一段，而且没有窗口，列多少就读多少。
   这是**有界并发**，不是 O(1)：`--limit` 只封顶返回几条，不封顶读几条，窗口里没有变化时
   也要付这个代价。代价换来的是「刚启动的机器和有缓存的机器看到同一个答案」。
-- 这一批读**任一失败就整次失败**，不会返回半条日志；报出的是**listing 序里最小的那个 key** 的失败，
+- 这三批读**任一失败就整次失败**，不会返回部分结果；报出的是**listing 序里最小的那个 key** 的失败，
   而不是先失败的那条，所以同一个桶坏掉几条对象时，每次报错都说同一个 key。
+  唯独**会话被删**是容忍的：head 在 listing 之后被删除是快照读的正常竞争，digest 跳过它而不是
+  整次失败。交接棒对象被删仍是失败——它从来不是「列了又没了也照样算」的那种读。
 - 桶内对象布局见 `design.md` §4；用 `qm status --json` 看当前规模。
 
 ## manifest 的规模上限
