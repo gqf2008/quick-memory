@@ -142,6 +142,9 @@ pub enum Command {
         /// Ignore how recently a page changed when ranking.
         #[arg(long, default_value_t = false)]
         no_recency: bool,
+        /// Do not expand results with pages that link to the matches.
+        #[arg(long, default_value_t = false)]
+        no_neighbors: bool,
     },
     /// Rebuild this machine's split from the current pages and publish it.
     Publish,
@@ -622,16 +625,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             limit,
             global,
             no_recency,
+            no_neighbors,
         } => {
             // Freshness helps but must not dominate relevance: the boost is
             // bounded, and --no-recency turns it off entirely.
-            let tuning = if *no_recency {
-                qm_search::SearchTuning::default()
-            } else {
-                qm_search::SearchTuning {
-                    now_ms: ctx.now_ms,
-                    ..Default::default()
-                }
+            let tuning = qm_search::SearchTuning {
+                now_ms: if *no_recency { 0 } else { ctx.now_ms },
+                neighbor_expansion: !*no_neighbors,
+                ..Default::default()
             };
             let outcome = if *global {
                 let projects = ctx

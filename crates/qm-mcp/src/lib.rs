@@ -311,9 +311,10 @@ impl MemoryServer {
             query: args.query,
             limit: args.limit.unwrap_or(10),
             global: args.global.unwrap_or(false),
-            // Agents get the same freshness tie-breaker the CLI does; it is
-            // bounded, reported per hit, and cannot overturn stream agreement.
+            // Agents get the same freshness tie-breaker and neighbour expansion
+            // the CLI does; both are bounded and reported per hit.
             no_recency: false,
+            no_neighbors: false,
         })
         .await
     }

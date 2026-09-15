@@ -119,6 +119,9 @@ fn schema() -> Schema {
     builder.add_text_field("body", TEXT);
     builder.add_text_field("entities", TEXT | STORED);
     builder.add_text_field("links", TEXT | STORED);
+    // Same values, raw tokenizer and one value per link: neighbour lookup asks
+    // "who links to exactly this path", which a tokenised field cannot answer.
+    builder.add_text_field("links_exact", STRING | STORED);
     builder.add_i64_field("updated_at_ms", FAST | STORED);
     builder.build()
 }
@@ -135,18 +138,23 @@ pub fn build_index(dir: &Path, docs: &[PageDoc]) -> Result<()> {
         .context("opening index writer")?;
     let s = index.schema();
     let f = |name: &str| s.get_field(name).expect("schema field");
+    let links_exact = f("links_exact");
     for page in docs {
-        writer.add_document(doc!(
-            f("workspace_id") => page.workspace_id.clone(),
-            f("project_id") => page.project_id.clone(),
-            f("path") => page.path.clone(),
-            f("page_id") => page.page_id.clone(),
-            f("title") => page.title.clone(),
-            f("body") => page.body.clone(),
-            f("entities") => page.entities.join(" "),
-            f("links") => page.links.join(" "),
-            f("updated_at_ms") => page.updated_at_ms,
-        ))?;
+        let mut document = tantivy::TantivyDocument::default();
+        document.add_text(f("workspace_id"), &page.workspace_id);
+        document.add_text(f("project_id"), &page.project_id);
+        document.add_text(f("path"), &page.path);
+        document.add_text(f("page_id"), &page.page_id);
+        document.add_text(f("title"), &page.title);
+        document.add_text(f("body"), &page.body);
+        document.add_text(f("entities"), page.entities.join(" "));
+        document.add_text(f("links"), page.links.join(" "));
+        // One stored value per link, so an exact-path term exists for each.
+        for link in &page.links {
+            document.add_text(links_exact, link);
+        }
+        document.add_i64(f("updated_at_ms"), page.updated_at_ms);
+        writer.add_document(document)?;
     }
     writer.commit().context("committing index")?;
     Ok(())
@@ -349,6 +357,88 @@ pub fn search_stream(
     Ok(hits)
 }
 
+/// Search a field for any of `terms`, as exact terms rather than parsed text.
+///
+/// Used by neighbour lookup: "which pages link to exactly this path" is a set
+/// membership question, and handing it to the query parser would reintroduce
+/// the tokenisation that makes paths ambiguous.
+///
+/// # Errors
+/// Propagates index-open and query failures.
+pub fn search_terms(
+    dir: &Path,
+    field: &str,
+    terms: &[String],
+    stream: &str,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    use tantivy::Term;
+    use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+    use tantivy::schema::IndexRecordOption;
+
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = Index::open_in_dir(dir).context("opening index")?;
+    let s = index.schema();
+    let Some(field_ref) = s.get_field(field).ok() else {
+        return Ok(Vec::new());
+    };
+    let subqueries: Vec<(Occur, Box<dyn Query>)> = terms
+        .iter()
+        .map(|term| {
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field_ref, term),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            )
+        })
+        .collect();
+    let query = BooleanQuery::new(subqueries);
+
+    let reader = index.reader().context("opening reader")?;
+    let searcher = reader.searcher();
+    let top = searcher
+        .search(&query, &TopDocs::with_limit(limit).order_by_score())
+        .context("running term query")?;
+    let optional = |name: &str| s.get_field(name).ok();
+    let path_field = optional("path");
+    let page_field = optional("page_id");
+    let workspace_field = optional("workspace_id");
+    let project_field = optional("project_id");
+    let title_field = optional("title");
+    let updated_field = optional("updated_at_ms");
+    let mut hits = Vec::with_capacity(top.len());
+    for (score, addr) in top {
+        let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
+        let get = |field: Option<tantivy::schema::Field>| {
+            field
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        hits.push(Hit {
+            workspace_id: get(workspace_field),
+            project_id: get(project_field),
+            path: get(path_field),
+            page_id: get(page_field),
+            title: get(title_field),
+            score,
+            fused_score: score,
+            recency_multiplier: 1.0,
+            updated_at_ms: updated_field
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            streams: vec![stream.to_string()],
+        });
+    }
+    Ok(hits)
+}
+
 /// Deterministic content hash of an index directory.
 ///
 /// Covers file names and bytes in sorted order, so two machines that build the
@@ -503,10 +593,19 @@ pub async fn materialize_splits_cached(
 /// to score highly. Ties break on page id to keep output stable.
 #[must_use]
 pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
+    fuse_rrf_weighted(lists.into_iter().map(|list| (list, 1.0)).collect(), k)
+}
+
+/// Reciprocal-rank fusion with a per-list weight.
+///
+/// Neighbour hits arrive through a weaker signal than direct matches, so their
+/// list contributes less and they land behind the pages that actually matched.
+#[must_use]
+pub fn fuse_rrf_weighted(lists: Vec<(Vec<Hit>, f32)>, k: f32) -> Vec<Hit> {
     let mut scores: HashMap<String, (Hit, f32)> = HashMap::new();
-    for list in lists {
+    for (list, weight) in lists {
         for (rank, hit) in list.into_iter().enumerate() {
-            let weight = 1.0 / (k + rank as f32 + 1.0);
+            let contribution = weight / (k + rank as f32 + 1.0);
             // Our splits identify a page by id; a foreign split has none, so
             // fall back to the path and then the title rather than collapsing
             // every hit into one bucket.
@@ -520,7 +619,7 @@ pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
             scores
                 .entry(key)
                 .and_modify(|(existing, score)| {
-                    *score += weight;
+                    *score += contribution;
                     existing.score = existing.score.max(hit.score);
                     for stream in &hit.streams {
                         if !existing.streams.contains(stream) {
@@ -528,7 +627,7 @@ pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                         }
                     }
                 })
-                .or_insert((hit, weight));
+                .or_insert((hit, contribution));
         }
     }
     let mut fused: Vec<Hit> = scores
@@ -660,6 +759,12 @@ pub struct SearchTuning {
     pub max_boost: f32,
     /// Reference time; hits newer than this get the full boost.
     pub now_ms: i64,
+    /// Recall pages that link to the pages which matched ("second hop").
+    pub neighbor_expansion: bool,
+    /// How many top hits seed the neighbour lookup.
+    pub neighbor_seeds: usize,
+    /// Weight of the neighbour list in the fusion (direct matches are 1.0).
+    pub neighbor_weight: f32,
 }
 
 impl Default for SearchTuning {
@@ -668,6 +773,9 @@ impl Default for SearchTuning {
             recency_half_life_ms: 30 * 24 * 60 * 60 * 1_000,
             max_boost: 0.5,
             now_ms: 0,
+            neighbor_expansion: true,
+            neighbor_seeds: 3,
+            neighbor_weight: 0.4,
         }
     }
 }
@@ -940,12 +1048,38 @@ pub async fn search_project_tuned(
             }
         }
     }
+    // Neighbour expansion: pages that link to the pages which matched. The
+    // seed paths come from a provisional fusion of the direct streams; the
+    // neighbour list joins the real fusion with a lower weight so it can add
+    // recall without displacing direct matches.
+    let mut weighted: Vec<(Vec<Hit>, f32)> =
+        lists.iter().cloned().map(|list| (list, 1.0)).collect();
+    if tuning.neighbor_expansion {
+        let provisional = fuse_rrf(lists.clone(), 60.0);
+        let seeds: Vec<String> = provisional
+            .iter()
+            .take(tuning.neighbor_seeds)
+            .filter(|hit| !hit.path.is_empty())
+            .map(|hit| hit.path.clone())
+            .collect();
+        if !seeds.is_empty() {
+            for dir in &dirs {
+                let neighbors = search_terms(dir, "links_exact", &seeds, "neighbors", limit)?;
+                if !neighbors.is_empty() {
+                    *stream_candidates
+                        .entry("neighbors".to_string())
+                        .or_insert(0) += neighbors.len();
+                    weighted.push((neighbors, tuning.neighbor_weight));
+                }
+            }
+        }
+    }
     let streams_active: Vec<String> = stream_candidates
         .iter()
         .filter(|(_, count)| **count > 0)
         .map(|(stream, _)| stream.clone())
         .collect();
-    let fused = fuse_rrf(lists, 60.0);
+    let fused = fuse_rrf_weighted(weighted, 60.0);
 
     let manifest = project_store
         .load(workspace_id, project_id)
@@ -1353,6 +1487,7 @@ mod tests {
             recency_half_life_ms: half_life,
             max_boost: 0.5,
             now_ms: 10 * half_life,
+            ..Default::default()
         };
         // Brand new: the full boost, never more.
         assert!((tuning.multiplier(tuning.now_ms) - 1.5).abs() < 1e-6);
@@ -1369,6 +1504,138 @@ mod tests {
         };
         assert_eq!(disabled.multiplier(tuning.now_ms), 1.0);
         assert!(disabled.is_disabled());
+    }
+
+    /// Second-hop recall: a page that *links to* the page you matched should be
+    /// found too, ranked behind it, and only when the neighbour is still
+    /// current according to the manifest.
+    #[tokio::test]
+    async fn link_neighbors_are_recalled_behind_the_direct_hit() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let writer = WriterId::new("mbp-a").unwrap();
+        let build_root = TempDir::new().unwrap();
+
+        // A answers the query; B only links to A. The link target deliberately
+        // avoids the query term: if it contained it, B would be a direct hit and
+        // the test would prove nothing about neighbour expansion.
+        let pages = [
+            ("notes/raft.md", "consensus algorithms in one place"),
+            ("notes/index.md", "see [[notes/raft.md]] for the details"),
+            (
+                "notes/unrelated.md",
+                "caching notes that link nowhere relevant",
+            ),
+        ];
+        let mut docs = Vec::new();
+        for (seq, (path, body)) in pages.iter().enumerate() {
+            let page_path = PagePath::new(*path).unwrap();
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: page_path.clone(),
+                    title: (*path).to_string(),
+                    body: (*body).to_string(),
+                    writer_id: writer.clone(),
+                    now_ms: seq as i64 + 1,
+                })
+                .await
+                .unwrap();
+            let page = project
+                .read_page(&workspace, &project_id, &page_path)
+                .await
+                .unwrap()
+                .unwrap();
+            let doc = PageDoc::from_version(&workspace, &project_id, &page, seq as i64 + 1);
+            assert_eq!(
+                doc.links.iter().any(|link| link == "notes/raft.md"),
+                *path == "notes/index.md",
+                "only the index page links to the answer: {doc:?}"
+            );
+            assert!(
+                !doc.body.contains("consensus") || *path == "notes/raft.md",
+                "only the answer may mention the query term: {doc:?}"
+            );
+            docs.push(doc);
+        }
+        publish_split_index(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            &writer,
+            1,
+            &docs,
+            &build_root.path().join("s"),
+            1,
+        )
+        .await
+        .unwrap();
+
+        let tuning = SearchTuning {
+            now_ms: 100,
+            ..Default::default()
+        };
+        let outcome = search_project_tuned(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "consensus",
+            10,
+            &tuning,
+        )
+        .await
+        .unwrap();
+        let order: Vec<&str> = outcome.hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(order.first(), Some(&"notes/raft.md"), "{order:?}");
+        let neighbor = outcome
+            .hits
+            .iter()
+            .position(|hit| hit.path == "notes/index.md");
+        assert!(
+            neighbor.is_some(),
+            "the linking page must be recalled: {order:?}"
+        );
+        assert!(
+            neighbor.unwrap() > 0,
+            "and ranked behind the page it links to"
+        );
+        assert!(
+            outcome.hits[neighbor.unwrap()]
+                .streams
+                .contains(&"neighbors".to_string()),
+            "the hit must say which stream found it: {:?}",
+            outcome.hits[neighbor.unwrap()]
+        );
+        assert!(
+            !order.contains(&"notes/unrelated.md"),
+            "a page that links nowhere relevant must not be pulled in: {order:?}"
+        );
+
+        // With the expansion off, only the direct hit remains.
+        let off = SearchTuning {
+            neighbor_expansion: false,
+            ..tuning
+        };
+        let outcome = search_project_tuned(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "consensus",
+            10,
+            &off,
+        )
+        .await
+        .unwrap();
+        let order: Vec<&str> = outcome.hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(order, vec!["notes/raft.md"], "{order:?}");
     }
 
     /// What the recency prior actually promises, checked as three properties:
