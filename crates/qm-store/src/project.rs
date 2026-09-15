@@ -4237,6 +4237,152 @@ mod tests {
         assert_eq!(windowed_ms, vec![200_000, 199_000, 198_000]);
     }
 
+    /// The WAL read is the last listing-then-reading fan-out in the store, and
+    /// it hits the same bound as the digest's three sections.
+    ///
+    /// Same fixture and same shape of assertion as the sections above: the
+    /// records really exist first, then how many objects were read, then how
+    /// many were ever in flight, and only then the answer those reads produced.
+    #[tokio::test]
+    async fn read_wal_reads_every_record_with_bounded_overlap() {
+        const COMMITS: i64 = 200;
+
+        let counter = CountingStore::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=COMMITS {
+            store
+                .commit_page(request(
+                    "mbp-1",
+                    &format!("notes/n{index}.md"),
+                    "body",
+                    index * 1_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Premise before conclusion: two hundred WAL records under the prefix
+        // the reader is about to walk, so neither number below can be explained
+        // away by an empty listing.
+        let prefix = store.layout().wal_prefix(&ws(), &proj());
+        let listed = store.cas.list(&prefix).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            COMMITS as usize,
+            "the premise: every committed version left a WAL record"
+        );
+
+        // One `read_wal`, nothing else, so every read it issues is its own.
+        counter.reset();
+        let wal = store.read_wal(&ws(), &proj()).await.unwrap();
+
+        assert_eq!(
+            counter.reads(),
+            COMMITS as usize,
+            "one object per WAL record is read, and nothing else is"
+        );
+        assert!(
+            counter
+                .completed()
+                .iter()
+                .all(|key| key.starts_with(prefix.as_str())),
+            "every read belongs to the WAL prefix"
+        );
+        let max = counter.max_in_flight();
+        assert!(
+            max <= CONCURRENT_READ_LIMIT,
+            "at most {CONCURRENT_READ_LIMIT} reads may be in flight, saw {max}"
+        );
+        assert_eq!(
+            max, 16,
+            "WAL records are read concurrently, not one at a time; changing the \
+             bound is a deliberate edit to this line, not a silent one"
+        );
+
+        // Reading out of order is invisible in the answer: one entry per
+        // committed version, none of them twice, in page-id order.
+        assert_eq!(
+            wal.len(),
+            COMMITS as usize,
+            "every committed version is in the WAL"
+        );
+        let ids: Vec<&str> = wal.iter().map(|entry| entry.page_id.as_str()).collect();
+        assert_eq!(
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            COMMITS as usize,
+            "no duplicate WAL records"
+        );
+        let mut ordered = ids.clone();
+        ordered.sort_unstable();
+        assert_eq!(ids, ordered, "the WAL comes back ordered by page id");
+    }
+
+    /// The WAL is a *set* ordered by page id, and the sort is what decides that
+    /// — not the order the reads come back in.
+    ///
+    /// The fixture hands the records back in the reverse of the listing and the
+    /// premise below shows it really did. The listing is the bucket's key order
+    /// (`InMemory` lists sorted), so a reader that appended results as they
+    /// arrived and dropped the sort would answer in reverse, and only the
+    /// assertion at the end would notice.
+    #[tokio::test]
+    async fn read_wal_orders_its_answer_by_page_id_however_the_reads_arrive() {
+        const COMMITS: i64 = 6;
+
+        let counter = CountingStore::newest_first();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=COMMITS {
+            store
+                .commit_page(request(
+                    "mbp-1",
+                    &format!("notes/n{index}.md"),
+                    "body",
+                    index * 1_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let prefix = store.layout().wal_prefix(&ws(), &proj());
+        let keys: Vec<String> = store
+            .cas
+            .list(&prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            COMMITS as usize,
+            "the premise: every committed version left a WAL record"
+        );
+
+        counter.reset();
+        let wal = store.read_wal(&ws(), &proj()).await.unwrap();
+
+        // Premise before conclusion: the records really came back in the
+        // reverse of the listing, so an answer that merely kept the order they
+        // arrived in could not pass the ordering assertion below by luck.
+        let mut reversed = keys.clone();
+        reversed.reverse();
+        assert_eq!(
+            counter.completed(),
+            reversed,
+            "the fixture must hand the records back in the reverse of the listing"
+        );
+
+        let ids: Vec<&str> = wal.iter().map(|entry| entry.page_id.as_str()).collect();
+        let mut ordered = ids.clone();
+        ordered.sort_unstable();
+        assert_eq!(
+            ids, ordered,
+            "the WAL is ordered by page id, not by the order the reads finished"
+        );
+    }
+
     /// A session head can be deleted between the listing and the read — a
     /// retention pass racing a digest. That race is tolerated, and it has to
     /// stay tolerated once the reads overlap. A handoff is the opposite: a
