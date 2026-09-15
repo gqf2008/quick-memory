@@ -26,5 +26,7 @@ walkdir = { workspace = true }
 object_store = { workspace = true }
 
 [dev-dependencies]
+async-trait = "0.1"
+futures = { workspace = true }
 object_store = { workspace = true }
 qm-probe = { path = "../qm-probe" }

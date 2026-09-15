@@ -1406,7 +1406,9 @@ name = "qm-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "futures",
  "object_store",
  "qm-core",
  "qm-probe",

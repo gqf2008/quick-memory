@@ -143,7 +143,7 @@ pub enum Command {
         /// `rules`, or `llm` (which falls back to rules on failure).
         #[arg(long, default_value = "auto")]
         compiler: String,
-        /// Maximum number of spooled events to attempt before consolidating.
+        /// Maximum current-scope spooled events to attempt before consolidating.
         #[arg(long, default_value_t = HOOK_DRAIN_DEFAULT_LIMIT)]
         drain_limit: usize,
     },
@@ -862,22 +862,19 @@ async fn publish_project(ctx: &Context) -> Result<PublishReport> {
     )
     .await?;
     write_watermark(&watermark_path, loaded.manifest.seq, embedded)?;
-    let current_manifest = ctx
-        .project
-        .load(&ctx.workspace, &ctx.project_id)
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let current_catalog = ctx
-        .project
-        .load_catalog(&ctx.workspace, &ctx.project_id)
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // Keep the old `qm publish` report contract: the manifest sequence is the
+    // one this invocation loaded before publishing. Re-reading after the
+    // watermark write would add a failure point after the publish already
+    // committed. The split count is a best-effort snapshot derived from the
+    // pre-publish catalog plus this publish outcome; a concurrent publisher
+    // can make it conservative, but it cannot make the publish look failed.
+    let splits = catalog.catalog.splits.len() + usize::from(!outcome.already_present);
     Ok(PublishReport {
         reason: None,
         already_present: outcome.already_present,
         pages: docs.len(),
-        manifest_seq: current_manifest.manifest.seq,
-        splits: current_catalog.catalog.splits.len(),
+        manifest_seq: loaded.manifest.seq,
+        splits,
         generation: outcome.generation,
         embedded,
         full_publish: bucket_has_no_splits,
@@ -898,7 +895,8 @@ pub struct MaintainSessionFailure {
 pub struct MaintainReport {
     /// Spool entries successfully ingested.
     pub drained: usize,
-    /// Spool entries left for a later pass.
+    /// All spool entries not successfully processed: other scopes, entries
+    /// beyond the current-scope limit, invalid files, and failed replays.
     pub spool_kept: usize,
     /// Sessions listed after the drain.
     pub sessions: usize,
@@ -908,6 +906,8 @@ pub struct MaintainReport {
     pub already_up_to_date: usize,
     /// Sessions skipped because another machine held the consolidation lease.
     pub skipped_locked: usize,
+    /// Sessions with no observations to compile.
+    pub skipped_empty: usize,
     /// Sessions whose consolidation failed.
     pub failed: usize,
     /// Details for each failed session.
@@ -924,7 +924,8 @@ pub struct MaintainReport {
     pub manifest_seq: u64,
     /// Catalog generation after the pass, when readable.
     pub generation: u64,
-    /// Number of splits in the catalog after the pass, when readable.
+    /// Best-effort split count derived from the pre-publish catalog and the
+    /// publish outcome; a concurrent publisher can make this conservative.
     pub splits: usize,
 }
 
@@ -938,7 +939,7 @@ impl MaintainReport {
     fn render(&self) -> String {
         let mut out = format!(
             "drained {} spooled event(s), kept {}\n\
-             sessions {}: consolidated {}, already up to date {}, skipped locked {}, failed {}\n\
+             sessions {}: consolidated {}, already up to date {}, skipped locked {}, skipped empty {}, failed {}\n\
              published: {} ({} page(s), generation {}, already present {})\n\
              manifest: seq {}, {} split(s)",
             self.drained,
@@ -947,6 +948,7 @@ impl MaintainReport {
             self.consolidated,
             self.already_up_to_date,
             self.skipped_locked,
+            self.skipped_empty,
             self.failed,
             if self.published { "yes" } else { "no" },
             self.published_pages,
@@ -1013,6 +1015,7 @@ async fn maintain(
     let mut consolidated = 0usize;
     let mut already_up_to_date = 0usize;
     let mut skipped_locked = 0usize;
+    let mut skipped_empty = 0usize;
     let mut failures = Vec::new();
     for session_id in &session_ids {
         let result = consolidate_session_with(
@@ -1029,7 +1032,8 @@ async fn maintain(
         )
         .await;
         match result {
-            Ok(outcome) if outcome.skipped => skipped_locked += 1,
+            Ok(outcome) if outcome.lease_held => skipped_locked += 1,
+            Ok(outcome) if outcome.nothing_to_compile => skipped_empty += 1,
             Ok(outcome) if outcome.already_up_to_date => already_up_to_date += 1,
             Ok(_) => consolidated += 1,
             Err(error) => failures.push(MaintainSessionFailure {
@@ -1069,6 +1073,7 @@ async fn maintain(
         consolidated,
         already_up_to_date,
         skipped_locked,
+        skipped_empty,
         failed: failures.len(),
         failures,
         published: publish.published(),
@@ -1185,6 +1190,8 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             Ok(if ctx.json {
                 serde_json::json!({
                     "skipped": outcome.skipped,
+                    "lease_held": outcome.lease_held,
+                    "nothing_to_compile": outcome.nothing_to_compile,
                     "already_up_to_date": outcome.already_up_to_date,
                     "page_id": outcome.page_id,
                     "observations": outcome.observations,
@@ -1193,8 +1200,10 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "used_fallback": outcome.used_fallback,
                 })
                 .to_string()
-            } else if outcome.skipped {
-                "nothing to compile (or another machine holds the lease)".to_string()
+            } else if outcome.lease_held {
+                "another machine holds the consolidation lease".to_string()
+            } else if outcome.nothing_to_compile {
+                "nothing to compile (the session has no observations)".to_string()
             } else if outcome.already_up_to_date {
                 format!(
                     "page already current ({} observations)",
@@ -2637,6 +2646,10 @@ fn spool_observation(ctx: &Context, observation: &Observation) -> Result<PathBuf
 }
 
 /// Replay spooled events, deleting each one only after it is stored.
+///
+/// The limit is applied after filtering to the caller's scope. Entries for
+/// other scopes and current-scope entries beyond the limit are all returned in
+/// the `kept` count.
 async fn drain_spool(ctx: &Context, limit: usize) -> Result<(usize, usize)> {
     let Ok(entries) = std::fs::read_dir(&ctx.spool_dir) else {
         return Ok((0, 0));
@@ -2648,9 +2661,9 @@ async fn drain_spool(ctx: &Context, limit: usize) -> Result<(usize, usize)> {
         .collect();
     files.sort();
 
-    let mut drained = 0usize;
     let mut kept = 0usize;
-    for path in files.into_iter().take(limit) {
+    let mut current_scope = Vec::new();
+    for path in files {
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let entry: SpoolEntry = match serde_json::from_slice(&bytes) {
             Ok(entry) => entry,
@@ -2666,6 +2679,16 @@ async fn drain_spool(ctx: &Context, limit: usize) -> Result<(usize, usize)> {
             kept += 1;
             continue;
         }
+        current_scope.push((path, entry));
+    }
+
+    // The limit is a budget for this scope, not a scan window over the whole
+    // shared spool directory. Filter first so entries for another scope cannot
+    // hide current-scope work behind the limit.
+    let attempted = current_scope.len().min(limit);
+    kept += current_scope.len() - attempted;
+    let mut drained = 0usize;
+    for (path, entry) in current_scope.into_iter().take(attempted) {
         let request = IngestObservationsRequest {
             workspace_id: ctx.workspace.clone(),
             project_id: ctx.project_id.clone(),
@@ -2763,6 +2786,156 @@ mod tests {
                     .unwrap_or_else(|| panic!("maintain failed outside its report: {error}"));
                 TestMaintainResult::Failure(serde_json::from_str(failure.report()).unwrap())
             }
+        }
+    }
+
+    fn write_spool_entry(
+        path: &std::path::Path,
+        workspace: &str,
+        project: &str,
+        session: &str,
+        text: &str,
+        at_ms: i64,
+    ) {
+        let session_id = SessionId::new(session).unwrap();
+        let observation = Observation {
+            schema: MANIFEST_SCHEMA,
+            observation_id: qm_core::derive_observation_id(
+                &session_id,
+                "test",
+                "message",
+                text,
+                at_ms,
+            ),
+            session_id,
+            actor: "test".to_string(),
+            kind: "message".to_string(),
+            text: text.to_string(),
+            created_at_ms: at_ms,
+        };
+        let entry = SpoolEntry {
+            workspace: workspace.to_string(),
+            project: project.to_string(),
+            observation,
+        };
+        std::fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    }
+
+    /// A store that refuses reads after the catalog head has been committed.
+    ///
+    /// This is the regression seam for the publish report: a successful
+    /// publish must not turn into an error merely because a subsequent status
+    /// read fails.
+    #[derive(Debug)]
+    struct FailReadsAfterCatalogHead {
+        inner: Arc<dyn ObjectStore>,
+        fail_reads: Arc<std::sync::atomic::AtomicBool>,
+        post_publish_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailReadsAfterCatalogHead {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                fail_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                post_publish_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn post_publish_reads(&self) -> usize {
+            self.post_publish_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn saw_catalog_commit(&self) -> bool {
+            self.fail_reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn refused_read() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "fail-reads-after-publish-test",
+                source: Box::new(std::io::Error::other("post-publish read refused")),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FailReadsAfterCatalogHead {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("FailReadsAfterCatalogHead")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailReadsAfterCatalogHead {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let is_catalog_head = location.as_ref().ends_with("/index/head.json");
+            let result = self.inner.put_opts(location, payload, options).await;
+            if is_catalog_head && result.is_ok() {
+                self.fail_reads
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                self.post_publish_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(Self::refused_read());
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
         }
     }
 
@@ -3924,6 +4097,52 @@ mod tests {
         assert_eq!(catalog.catalog.splits.len(), 2);
     }
 
+    #[tokio::test]
+    async fn publish_success_does_not_read_back_after_committing_the_catalog_head() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(FailReadsAfterCatalogHead::new(Arc::clone(&raw)));
+        let bucket: Arc<dyn ObjectStore> = fault.clone();
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/one.md",
+                "--body",
+                "first page",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let seq_before = context(Arc::clone(&bucket), &cache)
+            .project
+            .load(
+                &WorkspaceId::new("acme").unwrap(),
+                &ProjectId::new("ai-memory").unwrap(),
+            )
+            .await
+            .unwrap()
+            .manifest
+            .seq;
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 2_000;
+        let report = publish_project(&ctx).await.unwrap();
+        assert_eq!(report.manifest_seq, seq_before);
+        assert_eq!(report.splits, 1);
+        assert!(
+            fault.saw_catalog_commit(),
+            "the premise: the publish must have committed the catalog head"
+        );
+        assert_eq!(
+            fault.post_publish_reads(),
+            0,
+            "a successful publish must not add a post-commit status read"
+        );
+    }
+
     /// The watermark records what *this machine* published into *one bucket*.
     /// Sharing a cache directory must not let one bucket's position suppress a
     /// publish into another: the second bucket's index stays empty and search
@@ -4775,6 +4994,7 @@ mod tests {
         assert_eq!(first.consolidated, 1);
         assert_eq!(first.already_up_to_date, 0);
         assert_eq!(first.skipped_locked, 0);
+        assert_eq!(first.skipped_empty, 0);
         assert_eq!(first.failed, 0, "{first:?}");
         assert!(first.published, "{first:?}");
         assert_eq!(first.published_pages, 1);
@@ -4809,14 +5029,24 @@ mod tests {
             .unwrap()
             .manifest
             .seq;
-        let first_splits = state
+        let first_catalog = state
             .project
             .load_catalog(&state.workspace, &state.project_id)
             .await
+            .unwrap();
+        let first_splits = first_catalog.catalog.splits.len();
+        let split_prefix = first_catalog.catalog.splits[0].prefix.clone();
+        let split_objects_before = qm_store::CasStore::new(Arc::clone(&bucket), "")
+            .list(&split_prefix)
+            .await
             .unwrap()
-            .catalog
-            .splits
-            .len();
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert!(
+            !split_objects_before.is_empty(),
+            "the premise: the first pass must have uploaded raw split objects"
+        );
         let history = execute(
             &cli(&["history", "--path", "sessions/sess-maintain.md", "--json"]),
             context(Arc::clone(&bucket), &cache),
@@ -4840,10 +5070,22 @@ mod tests {
         assert_eq!(second.consolidated, 0);
         assert_eq!(second.already_up_to_date, 1);
         assert_eq!(second.skipped_locked, 0);
+        assert_eq!(second.skipped_empty, 0);
         assert_eq!(second.failed, 0);
         assert!(!second.published, "{second:?}");
         assert_eq!(second.manifest_seq, first_seq);
         assert_eq!(second.splits, first_splits);
+        let split_objects_after = qm_store::CasStore::new(Arc::clone(&bucket), "")
+            .list(&split_prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            split_objects_after, split_objects_before,
+            "the second maintain pass must not add raw split objects"
+        );
 
         let history = execute(
             &cli(&["history", "--path", "sessions/sess-maintain.md", "--json"]),
@@ -4911,11 +5153,105 @@ mod tests {
         assert_eq!(report.sessions, 1);
         assert_eq!(report.consolidated, 0);
         assert_eq!(report.skipped_locked, 1);
+        assert_eq!(report.skipped_empty, 0);
         assert_eq!(report.failed, 0);
         assert!(!report.published);
         assert_eq!(
             report.splits, 0,
             "nothing was consolidated, so nothing was published"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_counts_an_empty_session_separately_from_a_held_lease() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        let ctx = context(Arc::clone(&bucket), &cache);
+        let session_id = SessionId::new("sess-empty").unwrap();
+        ctx.project
+            .ingest_observations(IngestObservationsRequest {
+                workspace_id: ctx.workspace.clone(),
+                project_id: ctx.project_id.clone(),
+                session_id,
+                writer_id: ctx.writer.clone(),
+                observations: Vec::new(),
+                now_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        let mut maintenance_ctx = context(Arc::clone(&bucket), &cache);
+        maintenance_ctx.now_ms = 2_000;
+        let report = match run_maintain(maintenance_ctx).await {
+            TestMaintainResult::Success(report) => report,
+            TestMaintainResult::Failure(report) => {
+                panic!("an empty session is not a failure: {report:?}")
+            }
+        };
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.skipped_locked, 0);
+        assert_eq!(report.skipped_empty, 1);
+        assert_eq!(report.consolidated, 0);
+        assert_eq!(report.failed, 0);
+        assert!(!report.published);
+    }
+
+    #[tokio::test]
+    async fn drain_spool_filters_scope_before_applying_the_limit() {
+        let spool = TempDir::new().unwrap();
+        let mut ctx = context(Arc::new(InMemory::new()), &TempDir::new().unwrap());
+        ctx.spool_dir = spool.path().to_path_buf();
+        write_spool_entry(
+            &spool.path().join("000-other.json"),
+            "other-workspace",
+            "other-project",
+            "sess-other",
+            "not ours",
+            1,
+        );
+        write_spool_entry(
+            &spool.path().join("001-current.json"),
+            "acme",
+            "ai-memory",
+            "sess-current",
+            "ours",
+            2,
+        );
+
+        let (drained, kept) = drain_spool(&ctx, 1).await.unwrap();
+        assert_eq!((drained, kept), (1, 1));
+        assert!(
+            !spool.path().join("001-current.json").exists(),
+            "the current-scope entry must be attempted even though another scope sorts first"
+        );
+        assert!(
+            spool.path().join("000-other.json").exists(),
+            "another scope must remain for its own drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_spool_counts_current_scope_entries_left_above_the_limit() {
+        let spool = TempDir::new().unwrap();
+        let mut ctx = context(Arc::new(InMemory::new()), &TempDir::new().unwrap());
+        ctx.spool_dir = spool.path().to_path_buf();
+        for (index, name) in ["000.json", "001.json", "002.json"].into_iter().enumerate() {
+            write_spool_entry(
+                &spool.path().join(name),
+                "acme",
+                "ai-memory",
+                &format!("sess-{index}"),
+                name,
+                index as i64,
+            );
+        }
+
+        let (drained, kept) = drain_spool(&ctx, 1).await.unwrap();
+        assert_eq!((drained, kept), (1, 2));
+        let remaining = std::fs::read_dir(spool.path()).unwrap().count();
+        assert_eq!(
+            remaining, 2,
+            "the two unprocessed current-scope entries must remain"
         );
     }
 
@@ -4960,6 +5296,8 @@ mod tests {
         assert_eq!(report.sessions, 2);
         assert_eq!(report.consolidated, 1);
         assert_eq!(report.failed, 1, "{report:?}");
+        assert_eq!(report.skipped_locked, 0);
+        assert_eq!(report.skipped_empty, 0);
         assert_eq!(report.failures[0].session, "sess-broken");
         assert!(
             report.published,

@@ -24,6 +24,10 @@ use crate::compile::{
 pub struct ConsolidateOutcome {
     /// True when another machine held the lease or there was nothing to compile.
     pub skipped: bool,
+    /// True when the lease was held by another machine.
+    pub lease_held: bool,
+    /// True when the session had no observations to compile.
+    pub nothing_to_compile: bool,
     /// True when the chain fingerprint already matched the committed page.
     pub already_up_to_date: bool,
     /// Committed page version, when this run produced one.
@@ -91,7 +95,7 @@ pub async fn consolidate_session_with(
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?
     else {
-        return Ok(skipped_outcome(0, 0, 0));
+        return Ok(skipped_outcome(0, 0, 0, true, false));
     };
 
     let chain = project_store
@@ -114,7 +118,7 @@ pub async fn consolidate_session_with(
             .release(project_store, now_ms)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        return Ok(skipped_outcome(0, chain.len(), manifest_seq));
+        return Ok(skipped_outcome(0, chain.len(), manifest_seq, false, true));
     }
 
     let path = PagePath::new(format!("sessions/{session_id}.md"))?;
@@ -134,6 +138,8 @@ pub async fn consolidate_session_with(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(ConsolidateOutcome {
             skipped: false,
+            lease_held: false,
+            nothing_to_compile: false,
             already_up_to_date: true,
             page_id: Some(current.page_id.as_str().to_string()),
             observations: observations.len(),
@@ -196,6 +202,8 @@ pub async fn consolidate_session_with(
 
     Ok(ConsolidateOutcome {
         skipped: false,
+        lease_held: false,
+        nothing_to_compile: false,
         already_up_to_date: false,
         page_id: Some(outcome.page_id.as_str().to_string()),
         observations: observations.len(),
@@ -234,9 +242,17 @@ pub async fn consolidate_session(
     .await
 }
 
-fn skipped_outcome(observations: usize, segments: usize, manifest_seq: u64) -> ConsolidateOutcome {
+fn skipped_outcome(
+    observations: usize,
+    segments: usize,
+    manifest_seq: u64,
+    lease_held: bool,
+    nothing_to_compile: bool,
+) -> ConsolidateOutcome {
     ConsolidateOutcome {
         skipped: true,
+        lease_held,
+        nothing_to_compile,
         already_up_to_date: false,
         page_id: None,
         observations,

@@ -22,20 +22,24 @@ hook 仍保持原有的 fire-and-forget 契约，绝不在 agent 生命周期钩
 
 ```bash
 qm maintain --json
-qm maintain --compiler rules --drain-limit 100   # 默认 auto；spool 每次最多处理 100 条
+qm maintain --compiler rules --drain-limit 100   # 默认 auto；每次最多处理 100 条当前 scope 条目
 ```
 
-- 先 drain 当前 scope 的 spool；本机其他 scope 的条目保留。
+- 先 drain 当前 scope 的 spool；`--drain-limit` 只约束当前 scope，其他 scope 的条目既不
+  消耗预算也不被删除。
 - 再逐个编译当前 scope 的会话。单个会话失败会记录错误后继续处理其余会话，最后非零退出。
 - consolidate 后调用同一条 typed publish 路径；没有新页面时 publish 是 no-op。
 - 会话租约被其他机器占用时计入 `skipped_locked`，不算失败。
+- 空 session（没有可编译观测）计入 `skipped_empty`，不计入 `skipped_locked`。
 - 第二次运行不会新增 manifest `seq`、重复页面版本或重复分片；未变化会话计入
   `already_up_to_date`。
 
 `--json` 的稳定字段包括 `drained / spool_kept / sessions / consolidated /
-already_up_to_date / skipped_locked / failed / failures / published /
+already_up_to_date / skipped_locked / skipped_empty / failed / failures / published /
 published_pages / publish_already_present / publish_error / manifest_seq /
-generation / splits`。即使存在会话失败或 publish 失败，完整报告仍写入 stdout，
+generation / splits`。`spool_kept` 是所有未成功处理的剩余条目总数（其他 scope、当前
+scope 超过 limit 的条目和坏条目）；`published` 只表示本次是否真的新增了 split。
+即使存在会话失败或 publish 失败，完整报告仍写入 stdout，
 进程以非零状态退出，便于调度器报警。
 
 ## 回收（GC）

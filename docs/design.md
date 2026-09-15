@@ -593,7 +593,10 @@ qm sessions
 - `--json` 输出机器可读结果，便于被 agent 或脚本直接消费。
 - `maintain` 是 CLI 运维面的一次性闭环：drain spool → 当前 scope 的所有会话
   consolidate → publish。它不是 daemon，也不进入 hook 的 200ms 快速路径；单个会话失败会继续、
-  汇总后非零退出，租约冲突按 `skipped_locked` 计数。连续运行是幂等的，不重复版本或分片。
+  汇总后非零退出，租约冲突按 `skipped_locked`、空 session 按 `skipped_empty` 计数。
+  `--drain-limit` 先按当前 scope 过滤再应用；其他 scope 不消耗预算。`spool_kept` 是其他
+  scope、超过 limit 的当前 scope 条目、坏条目和重放失败的总数；`published` 只表示本次真的
+  新增 split。连续运行是幂等的，不重复版本或分片。
 - 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
   页面的写/读/删、status/sessions、作用域解析。
 
@@ -1182,7 +1185,8 @@ mTLS 之外的完整读写链路、多机协作语义。
 - **脱敏在入口生效**：调用方直接塞 `api_key=abcd1234` 也存不进秘密，且落库的 `observation_id` 与落库字节一致。
 - 会话互相独立：三会话并存可按 LIST 发现；只有段没有 head 的会话**不可见**。
 - 编译：3 条观测 → 一页 `sessions/<sid>.md`（正文含全部文本）→ 发布分片后**可被检索**；
-  链没变时重编译 `already_up_to_date` 且不消耗 manifest `seq`；另一台从未见过该状态的机器可编译；租约被占则 `skipped`。
+  链没变时重编译 `already_up_to_date` 且不消耗 manifest `seq`；另一台从未见过该状态的机器可编译；
+  空 session 报 `nothing_to_compile`，租约被占报 `lease_held`，两者都不写页面。
 
 **S3（删除与压缩）**
 

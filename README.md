@@ -40,7 +40,7 @@ crates/qm-mcp     `qm-mcp` MCP stdio 服务器（25 个 memory_* 工具）
 | 子命令 | 作用 |
 |---|---|
 | `capture` / `consolidate` / `sessions` | 记观测 / 编译会话页 / 列会话 |
-| `maintain` | 一次性收口：drain spool → 编译当前 scope 的所有会话 → 需要时 publish；适合 cron/launchd/CI |
+| `maintain` | 一次性收口：drain 当前 scope 的 spool（`--drain-limit` 只计当前 scope）→ 编译所有会话 → 需要时 publish；适合 cron/launchd/CI |
 | `compact-session` | 收敛会话链里的旧观测（默认 dry run，`--apply` 才写） |
 | `search` | 检索：`--global` 跨项目；`--no-recency` / `--no-neighbors` / `--no-vector` 各关一路信号 |
 | `publish` / `compact` | 发布本机增量分片 / 从权威页面整体重建索引（租约保护） |
@@ -70,6 +70,9 @@ qm digest --hours 24                     # 最近变化摘要：提交（含删�
 # 可选语义检索：QM_EMBEDDING_BASE_URL / QM_EMBEDDING_API_KEY / QM_EMBEDDING_MODEL
 # （宽度用可选的 QM_EMBEDDING_DIM，默认 1536）。未配置时这一路自动不跑，不是错误。
 ```
+
+`qm maintain` 的 `--drain-limit` 只约束当前 scope；`spool_kept` 是所有未成功处理的剩余
+条目总数。真实租约冲突计入 `skipped_locked`，空 session 计入 `skipped_empty`，两者都不算失败。
 
 更完整的用法：
 

@@ -59,8 +59,11 @@ QM_WRITER=mbp-1 qm maintain --json
 它先 drain 本地 hook spool，再编译当前 scope 的所有会话，最后复用普通
 `publish` 路径发布变化。命令只跑一次，不是 daemon；连续跑第二次时，
 未变化的会话计入 `already_up_to_date`，不会新增 manifest `seq`，不会生成重复页面版本，
-也不会重复发布分片。`--json` 会给出 `drained / sessions / consolidated /
-already_up_to_date / skipped_locked / failed / published / manifest_seq / splits`；
+也不会重复发布分片。`--json` 会给出 `drained / spool_kept / sessions / consolidated /
+already_up_to_date / skipped_locked / skipped_empty / failed / published / manifest_seq /
+splits`；`spool_kept` 统计所有未成功处理的剩余条目（其他 scope、超过
+`--drain-limit` 的当前 scope 条目以及坏条目），而 limit 只约束当前 scope。
+真实租约冲突只计入 `skipped_locked`，空 session 计入 `skipped_empty`。
 某个会话坏掉时会继续处理其他会话，但仍以非零状态结束。
 
 定时执行示例（把环境文件保存为 `~/.config/quick-memory/env`）：
