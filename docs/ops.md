@@ -170,6 +170,78 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
   而不是先失败的那条，所以同一个桶坏掉几条对象时，每次报错都说同一个 key。
 - 桶内对象布局见 `design.md` §4；用 `qm status --json` 看当前规模。
 
+## manifest 的规模上限
+
+一个 project 的提交点是**单个对象** `manifest.json`：它装下该 scope 全部 path 的当前版本，
+所以**每次提交都要重写整个对象**，规模随 project 增长而不是随本次提交增长。这个上限以前只是
+`design.md` 里的一句提醒，现在是实测数字加一条会拒绝提交的守卫。
+
+### 实测
+
+    cargo test -p qm-store --lib manifest_size_is_linear_in_paths -- --nocapture
+
+形状（`manifest_with_paths` 的夹具）：path 31 B、title 40 B（含 CJK）、`page_id` 64 位 hex、
+`writer_id` 5 B、`created_at_ms` 13 位、`supersedes: null`。
+
+| path 数 | manifest 字节 | 边际 B/path | 平均 B/path |
+|---:|---:|---:|---:|
+| 100 | 24 217 | — | 242 |
+| 1 000 | 242 019 | 242 | 242 |
+| 10 000 | 2 429 021 | 243 | 242 |
+| 100 000 | 24 389 023 | 244 | 243 |
+| 10 000（每条都带 `supersedes`） | 3 049 021 | 305 | 304 |
+
+边际成本随 `seq` 位数每涨一个数量级只加 1 B（242 → 243 → 244），所以**这是这个形状的数字，
+不是通用常数**：title 每多一字节就多一字节，`supersedes` 从 `null` 变成 64 位 hex 是 +62 B/path。
+
+单条构成（`manifest_bytes_are_accounted_for_field_by_field` 逐字段实测；entry JSON 各字段相加
+**恰好**等于实测的 205 B，多于或少于都会让该测试红）：
+
+| 构成 | 字节 |
+|---|---:|
+| `"<path>"`（31 + 2 引号） | 33 |
+| 键与值的冒号 | 1 |
+| JSON 骨架（字段名、引号、括号、冒号） | 78 |
+| `page_id`（64 hex） | 64 |
+| `title` | 40 |
+| `created_at_ms`（13 位） | 13 |
+| `writer_id` | 5 |
+| `seq`（本行按 1 位算） | 1 |
+| `supersedes` | 4（`null`；`Some(<64 hex>)` 是 66） |
+| 分隔逗号 | 1 |
+| **合计** | **240**（seq 为 1 位时；1 000–10 000 条量级的实测边际是 242–243，差别来自 seq 位数） |
+
+### 两个口径
+
+| 口径 | 字节 | 能装多少 path |
+|---|---:|---:|
+| 提交点上限 `qm_store::MANIFEST_MAX_BYTES` | 1 048 576（1 MiB） | **4 319**（每条都重写过则 **3 441**） |
+| R2/S3 单对象上限 | 5 GiB | ~2.2×10⁷（重写 ~1.8×10⁷） |
+
+第二行是**实测外推，不是承诺**：没有真的构建过 5 GiB 的 manifest，而且单对象上限根本不是这里的
+约束——约束是"每次提交重写整个对象"，所以提交点上限按 1 MiB 定，而不是按桶能收多大定。
+
+### 超限会发生什么
+
+提交被**拒绝**：不截断，也不静默继续。报文同时给出条数与阈值——4 320 条、1 048 779 B 时是：
+
+    refusing to commit: manifest for acme/ai-memory holds 4320 paths and encodes to 1048779 bytes,
+    over the 1048576-byte limit of the single-object commit point
+
+拒绝发生在**写出任何对象之前**，所以被拒的提交是干净的空操作：不留孤立 page 对象，也不留 WAL
+记录（`a_manifest_at_the_ceiling_commits_and_one_path_past_it_is_refused` 用桶内对象列表钉住这一点）。
+
+**删除路径不受这条上限约束**：删除是当前唯一能缩减 manifest 的操作，卡住它会让一个已经超限的
+scope 再也修不回来。代价是超限的 scope 仍可能被写入略大的对象（tombstone 可能比它替换掉的
+entry 大几个字节），这是刻意选的（守卫见 `encode_manifest`，豁免见 `encode_manifest_for_delete`）。
+
+### 离上限还有多远
+
+现在没有直接报 manifest 字节数的命令；`qm status --json` 给出 `pages` 与 `tombstones`，
+把两者之和乘以上表的 B/path 即可估算。**达到上限的出路**：scope 是 project 级的，把一个 project
+的内容拆成两个是最直接的解法；真正的解法是按 path 前缀分片 manifest，设计见 `design.md` §6.21
+（**未实现**）。
+
 ## 空输出：`--limit 0` 的两种口径
 
 "你要了零条"在两个输出面上**故意表现不同**，不必去读源码才能知道：
