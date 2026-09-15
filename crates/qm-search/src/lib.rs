@@ -3923,7 +3923,11 @@ mod tests {
                         // Bound the read: a client that connects and stops
                         // talking would otherwise pin this loop, and the parent
                         // has no deadline of its own to fall back on.
-                        let _ = stream.set_read_timeout(Some(STUB_READ_TIMEOUT));
+                        stream.set_read_timeout(Some(STUB_READ_TIMEOUT)).expect(
+                            "the stub must take a read deadline: a platform that refuses one \
+                             leaves a client that stalls mid-request able to park this accept \
+                             loop for good, and nothing else in this suite would notice",
+                        );
                         let (record, response) = answer(&read_request(&mut stream));
                         seen.lock().expect("the stub's request log").push(record);
                         // Answer before anything else can go wrong here: a
