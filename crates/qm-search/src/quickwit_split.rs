@@ -252,6 +252,8 @@ mod tests {
             title: "Quickwit splits".into(),
             body: "tantivy splits stored in object storage".into(),
             updated_at_ms: 1,
+            entities: Vec::new(),
+            links: Vec::new(),
         }];
         super::super::build_index(build.path(), &docs).unwrap();
 

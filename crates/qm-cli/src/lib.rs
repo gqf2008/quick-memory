@@ -459,12 +459,20 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "hits": outcome.hits,
                     "splits_searched": outcome.splits_searched,
                     "filtered_out": outcome.filtered_out,
+                    "streams_active": outcome.streams_active,
+                    "stream_candidates": outcome.stream_candidates,
                 })
                 .to_string()
             } else if outcome.hits.is_empty() {
                 format!(
-                    "no hits ({} split(s) searched, {} filtered)",
-                    outcome.splits_searched, outcome.filtered_out
+                    "no hits ({} split(s) searched, {} filtered, streams: {})",
+                    outcome.splits_searched,
+                    outcome.filtered_out,
+                    if outcome.streams_active.is_empty() {
+                        "none".to_string()
+                    } else {
+                        outcome.streams_active.join(", ")
+                    }
                 )
             } else {
                 outcome
@@ -472,10 +480,11 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .iter()
                     .map(|hit| {
                         format!(
-                            "{:.4}\t{}\t{}",
+                            "{:.4}\t{}\t{}\t[{}]",
                             hit.score,
                             hit.path,
-                            hit.title.replace('\n', " ")
+                            hit.title.replace('\n', " "),
+                            hit.streams.join(",")
                         )
                     })
                     .collect::<Vec<_>>()

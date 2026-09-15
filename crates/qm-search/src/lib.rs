@@ -43,6 +43,12 @@ pub struct PageDoc {
     pub body: String,
     /// Last update time in milliseconds since the Unix epoch.
     pub updated_at_ms: i64,
+    /// Identifiers the page declares (wiki links, backticked tokens, paths, tags).
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Link targets the page points at.
+    #[serde(default)]
+    pub links: Vec<String>,
 }
 
 impl PageDoc {
@@ -62,6 +68,8 @@ impl PageDoc {
             title: page.title.clone(),
             body: page.body.clone(),
             updated_at_ms,
+            entities: entities::extract(&page.body).entities,
+            links: entities::extract(&page.body).links,
         }
     }
 }
@@ -77,6 +85,9 @@ pub struct Hit {
     pub title: String,
     /// BM25 score.
     pub score: f32,
+    /// Retrieval streams that produced this hit, e.g. `body` and `entities`.
+    #[serde(default)]
+    pub streams: Vec<String>,
 }
 
 fn schema() -> Schema {
@@ -87,6 +98,8 @@ fn schema() -> Schema {
     builder.add_text_field("page_id", STRING | STORED);
     builder.add_text_field("title", TEXT | STORED);
     builder.add_text_field("body", TEXT);
+    builder.add_text_field("entities", TEXT | STORED);
+    builder.add_text_field("links", TEXT | STORED);
     builder.add_i64_field("updated_at_ms", FAST | STORED);
     builder.build()
 }
@@ -111,6 +124,8 @@ pub fn build_index(dir: &Path, docs: &[PageDoc]) -> Result<()> {
             f("page_id") => page.page_id.clone(),
             f("title") => page.title.clone(),
             f("body") => page.body.clone(),
+            f("entities") => page.entities.join(" "),
+            f("links") => page.links.join(" "),
             f("updated_at_ms") => page.updated_at_ms,
         ))?;
     }
@@ -215,13 +230,42 @@ pub async fn materialize(store: &dyn ObjectStore, prefix: &str, dest: &Path) -> 
 /// # Errors
 /// Propagates index-open/query failures.
 pub fn search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
+    search_stream(dir, &["title", "body"], "body", query, limit)
+}
+
+/// Search one field set, labelling the hits with the stream that found them.
+///
+/// Fields are named rather than passed as a slice of `Field`s so callers (and
+/// tests) can talk about streams the same way the outcome does.
+///
+/// # Errors
+/// Propagates index-open and query failures.
+pub fn search_stream(
+    dir: &Path,
+    fields: &[&str],
+    stream: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Hit>> {
     let index = Index::open_in_dir(dir).context("opening index")?;
     let s = index.schema();
     let title = s.get_field("title").expect("title field");
     let body = s.get_field("body").expect("body field");
+    let entities_field = s.get_field("entities").expect("entities field");
+    let links_field = s.get_field("links").expect("links field");
+    let selected: Vec<tantivy::schema::Field> = fields
+        .iter()
+        .map(|name| match *name {
+            "title" => title,
+            "body" => body,
+            "entities" => entities_field,
+            "links" => links_field,
+            other => panic!("unknown search field {other}"),
+        })
+        .collect();
     let reader = index.reader().context("opening reader")?;
     let searcher = reader.searcher();
-    let parser = QueryParser::for_index(&index, vec![title, body]);
+    let parser = QueryParser::for_index(&index, selected);
     let parsed = parser.parse_query(query).context("parsing query")?;
     let top = searcher
         .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
@@ -242,6 +286,7 @@ pub fn search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
             page_id: get(page_field),
             title: get(title),
             score,
+            streams: vec![stream.to_string()],
         });
     }
     Ok(hits)
@@ -351,6 +396,11 @@ pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                 .and_modify(|(existing, score)| {
                     *score += weight;
                     existing.score = existing.score.max(hit.score);
+                    for stream in &hit.streams {
+                        if !existing.streams.contains(stream) {
+                            existing.streams.push(stream.clone());
+                        }
+                    }
                 })
                 .or_insert((hit, weight));
         }
@@ -382,6 +432,10 @@ pub struct SearchOutcome {
     pub candidates: usize,
     /// Candidates the manifest rejected as stale, deleted, or unknown.
     pub filtered_out: usize,
+    /// Streams that returned at least one candidate, e.g. `body`, `entities`.
+    pub streams_active: Vec<String>,
+    /// Candidate count per stream, for diagnosing recall.
+    pub stream_candidates: std::collections::BTreeMap<String, usize>,
 }
 
 /// What a compaction did.
@@ -535,17 +589,38 @@ pub async fn search_project(
             splits_searched: 0,
             candidates: 0,
             filtered_out: 0,
+            streams_active: Vec::new(),
+            stream_candidates: std::collections::BTreeMap::new(),
         });
     }
 
+    // Three streams per split, fused together. Entities and links are declared
+    // by the page rather than merely mentioned in prose, so a match there is a
+    // stronger signal; RRF lets that show up without hand-tuned weights.
+    let streams: [(&str, &[&str]); 3] = [
+        ("body", &["title", "body"]),
+        ("entities", &["entities"]),
+        ("links", &["links"]),
+    ];
     let dirs = materialize_splits(store, &prefixes, cache_root).await?;
-    let mut lists = Vec::with_capacity(dirs.len());
+    let mut lists = Vec::new();
     let mut candidates = 0usize;
+    let mut stream_candidates = std::collections::BTreeMap::new();
     for dir in &dirs {
-        let hits = search(dir, query, limit)?;
-        candidates += hits.len();
-        lists.push(hits);
+        for (stream, fields) in streams {
+            let hits = search_stream(dir, fields, stream, query, limit)?;
+            candidates += hits.len();
+            *stream_candidates.entry(stream.to_string()).or_insert(0) += hits.len();
+            if !hits.is_empty() {
+                lists.push(hits);
+            }
+        }
     }
+    let streams_active: Vec<String> = stream_candidates
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(stream, _)| stream.clone())
+        .collect();
     let fused = fuse_rrf(lists, 60.0);
 
     let manifest = project_store
@@ -571,11 +646,14 @@ pub async fn search_project(
         splits_searched: dirs.len(),
         candidates,
         filtered_out,
+        streams_active,
+        stream_candidates,
     })
 }
 
 pub mod compile;
 pub mod consolidate;
+pub mod entities;
 pub mod quickwit_split;
 
 #[cfg(test)]
@@ -666,6 +744,8 @@ mod tests {
                 title: "Raft consensus".into(),
                 body: "leader election and log replication".into(),
                 updated_at_ms: 1,
+                entities: Vec::new(),
+                links: Vec::new(),
             },
             PageDoc {
                 workspace_id: "acme".into(),
@@ -675,6 +755,8 @@ mod tests {
                 title: "Quickwit splits".into(),
                 body: "tantivy splits stored in object storage".into(),
                 updated_at_ms: 2,
+                entities: Vec::new(),
+                links: Vec::new(),
             },
         ]
     }
@@ -838,6 +920,101 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.hits, second.hits);
+    }
+
+    /// Multi-stream retrieval: a page that *declares* the identifier should
+    /// outrank one that merely mentions it in prose.
+    #[tokio::test]
+    async fn declared_entities_outrank_body_only_mentions() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let writer = WriterId::new("mbp-a").unwrap();
+        let build_root = TempDir::new().unwrap();
+
+        // Both bodies contain the word; only one declares it as an entity
+        // (a backticked identifier), which extraction picks up automatically.
+        let pages = [
+            ("notes/engine.md", "Search engine", "we run `tantivy` here"),
+            (
+                "notes/other.md",
+                "Other notes",
+                "a passing mention of tantivy in prose",
+            ),
+        ];
+        for (seq, (path, title, body)) in pages.iter().enumerate() {
+            let page_path = PagePath::new(*path).unwrap();
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: page_path.clone(),
+                    title: (*title).to_string(),
+                    body: (*body).to_string(),
+                    writer_id: writer.clone(),
+                    now_ms: seq as i64,
+                })
+                .await
+                .unwrap();
+            let page = project
+                .read_page(&workspace, &project_id, &page_path)
+                .await
+                .unwrap()
+                .unwrap();
+            let doc = PageDoc::from_version(&workspace, &project_id, &page, seq as i64);
+            assert_eq!(
+                doc.entities.contains(&"tantivy".to_string()),
+                seq == 0,
+                "only the declaring page should carry the entity: {doc:?}"
+            );
+            publish_split_index(
+                bucket.as_ref(),
+                &project,
+                &workspace,
+                &project_id,
+                &writer,
+                seq as u64 + 1,
+                &[doc],
+                &build_root.path().join(format!("s{seq}")),
+                seq as i64,
+            )
+            .await
+            .unwrap();
+        }
+
+        let outcome = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "tantivy",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.hits.len(), 2, "{:?}", outcome.hits);
+        assert!(
+            outcome.streams_active.contains(&"entities".to_string()),
+            "the entity stream must have contributed: {:?}",
+            outcome.streams_active
+        );
+        assert_eq!(
+            outcome.hits[0].path, "notes/engine.md",
+            "the declaring page must rank first: {:?}",
+            outcome.hits
+        );
+        assert!(
+            outcome.hits[0].streams.contains(&"entities".to_string()),
+            "and the hit must say why: {:?}",
+            outcome.hits[0].streams
+        );
+        assert!(
+            outcome.hits[1].streams == vec!["body".to_string()],
+            "the prose-only page matched the body stream alone: {:?}",
+            outcome.hits[1].streams
+        );
     }
 
     /// S3 acceptance: compaction shrinks the split set without changing what
