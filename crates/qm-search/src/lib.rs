@@ -2622,6 +2622,19 @@ mod tests {
         query: &str,
         embedder: Option<&dyn Embedder>,
     ) -> SearchOutcome {
+        search_with_embedder_result(bucket, workspace, project_id, query, embedder)
+            .await
+            .unwrap()
+    }
+
+    /// The same search, but a caller that expects the read path to refuse.
+    async fn search_with_embedder_result(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+        query: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<SearchOutcome> {
         // No recency prior: these tests are about recall, not ranking drift.
         let tuning = SearchTuning {
             now_ms: 0,
@@ -2639,7 +2652,68 @@ mod tests {
             embedder,
         )
         .await
-        .unwrap()
+    }
+
+    /// How many splits the catalog currently names.
+    async fn splits_in_catalog(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> usize {
+        reader(bucket)
+            .load_catalog(workspace, project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits
+            .len()
+    }
+
+    /// Publish one more split of the manifest's live pages, embedded by
+    /// `embedder` when one is given.
+    ///
+    /// Nothing new is committed: this is what a machine does when it
+    /// re-publishes the same authoritative pages under a different embedding
+    /// model.
+    async fn publish_generation(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+        build_dir: &Path,
+        writer: &str,
+        seq: u64,
+        embedder: Option<&dyn Embedder>,
+    ) {
+        let project = reader(bucket);
+        let loaded = project.load(workspace, project_id).await.unwrap();
+        let mut docs = Vec::with_capacity(loaded.manifest.pages.len());
+        for (path, entry) in &loaded.manifest.pages {
+            let page_path = PagePath::new(path).unwrap();
+            let page = project
+                .read_page_version(workspace, project_id, &page_path, &entry.page_id)
+                .await
+                .unwrap();
+            docs.push(PageDoc::from_version(
+                workspace,
+                project_id,
+                &page,
+                entry.created_at_ms,
+            ));
+        }
+        let docs = attach_embeddings(docs, embedder).await.unwrap();
+        publish_split_index(
+            bucket,
+            &project,
+            workspace,
+            project_id,
+            &WriterId::new(writer).unwrap(),
+            seq,
+            &docs,
+            build_dir,
+            1,
+        )
+        .await
+        .unwrap();
     }
 
     const QUERY: &str = "consensus";
@@ -3105,6 +3179,129 @@ mod tests {
                 .iter()
                 .any(|hit| hit.path == PARAPHRASE.0 && hit.streams.contains(&"vector".to_string())),
             "the rebuilt split must still carry embeddings: {outcome:?}"
+        );
+    }
+
+    /// A model change is a re-embedding, not a republish.
+    ///
+    /// Publishing appends, so a second generation of vectors lands as a second
+    /// split and the catalog then names two widths. Every search fails closed
+    /// at that point rather than comparing coordinates from two models. Only a
+    /// compaction replaces the catalog and drops the old generation, which is
+    /// what `docs/ops.md` tells operators to run after a model change — this
+    /// test is what keeps that instruction honest.
+    #[tokio::test]
+    async fn a_dimension_change_needs_a_compaction_because_publishing_appends() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let project = reader(&bucket);
+
+        // The authoritative pages both generations will embed.
+        for (index, (path, title, body)) in corpus().iter().enumerate() {
+            project
+                .commit_page(CommitPageRequest {
+                    workspace_id: workspace.clone(),
+                    project_id: project_id.clone(),
+                    path: PagePath::new(*path).unwrap(),
+                    title: (*title).to_string(),
+                    body: (*body).to_string(),
+                    writer_id: WriterId::new("mbp-a").unwrap(),
+                    now_ms: index as i64 + 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        // First generation: the pages embedded by a four-wide model.
+        let four = FakeEmbedder::new(4, orthogonal());
+        publish_generation(
+            &bucket,
+            &workspace,
+            &project_id,
+            &build_root.path().join("gen-4"),
+            "mbp-a",
+            1,
+            Some(&four),
+        )
+        .await;
+        assert_eq!(
+            splits_in_catalog(&bucket, &workspace, &project_id).await,
+            1,
+            "the first generation is one split"
+        );
+
+        // A different model over the same pages. Publishing appends, so the
+        // four-wide generation is still in the catalog.
+        let eight = FakeEmbedder::new(8, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        publish_generation(
+            &bucket,
+            &workspace,
+            &project_id,
+            &build_root.path().join("gen-8"),
+            "mbp-b",
+            2,
+            Some(&eight),
+        )
+        .await;
+        assert_eq!(
+            splits_in_catalog(&bucket, &workspace, &project_id).await,
+            2,
+            "publishing appends: the old generation is still in the catalog"
+        );
+
+        // An eight-wide query against a four-wide stored vector is an error.
+        // Skipping the split instead would answer from half the corpus and
+        // look like a working search.
+        let error =
+            search_with_embedder_result(&bucket, &workspace, &project_id, QUERY, Some(&eight))
+                .await
+                .expect_err("a mixed-width catalog must fail closed, not answer");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot compare embeddings of different widths"),
+            "the failure must name the mismatch: {message}"
+        );
+        assert!(
+            message.contains("query has 8") && message.contains("stored value has 4"),
+            "the error must name both widths: {message}"
+        );
+
+        // Compaction rebuilds every live page into one split and replaces the
+        // catalog pointer, so the old generation leaves the index.
+        let outcome = compact_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            &WriterId::new("compactor").unwrap(),
+            &build_root.path().join("compact"),
+            100,
+            60_000,
+            Some(&eight),
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.skipped, "{outcome:?}");
+        assert_eq!(outcome.splits_before, 2, "{outcome:?}");
+        assert_eq!(
+            outcome.splits_after, 1,
+            "compaction replaces the catalog rather than appending to it: {outcome:?}"
+        );
+        assert_eq!(
+            splits_in_catalog(&bucket, &workspace, &project_id).await,
+            1,
+            "the old generation must be gone from the catalog"
+        );
+
+        // The same query that failed a moment ago now answers.
+        let after =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&eight)).await;
+        assert_eq!(after.splits_searched, 1, "{after:?}");
+        assert!(
+            after.hits.iter().any(|hit| hit.path == KEYWORD.0),
+            "the rebuilt index must still answer: {after:?}"
         );
     }
 
