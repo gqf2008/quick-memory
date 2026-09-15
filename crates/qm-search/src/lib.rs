@@ -3869,6 +3869,11 @@ mod tests {
     /// the child with no deadline of its own. The deadline turns that stall into
     /// a short request, which [`answer`] turns into a 400 the child fails on.
     /// Generous next to a loopback round trip, so a healthy run cannot reach it.
+    ///
+    /// This is the value the chain test runs with.
+    /// [`a_client_that_stalls_mid_request_is_answered_not_waited_on`] proves the
+    /// deadline is there at all, on a short one of its own so that the everyday
+    /// loop does not pay this one waiting for a timeout it already knows about.
     const STUB_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// One request, as it arrived.
@@ -3907,6 +3912,16 @@ mod tests {
 
     impl StubModel {
         fn start() -> Self {
+            Self::with_read_deadline(STUB_READ_TIMEOUT)
+        }
+
+        /// A stub that waits `read_deadline` for each request to finish.
+        ///
+        /// The deadline is a parameter only so the stall test can use a short
+        /// one: what it checks is that a half-sent request is answered rather
+        /// than parked on, and a smaller deadline checks that without spending
+        /// [`STUB_READ_TIMEOUT`] of the suite's time on it.
+        fn with_read_deadline(read_deadline: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("binding the stub endpoint");
             let address = listener.local_addr().expect("the stub's address");
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -3923,7 +3938,7 @@ mod tests {
                         // Bound the read: a client that connects and stops
                         // talking would otherwise pin this loop, and the parent
                         // has no deadline of its own to fall back on.
-                        stream.set_read_timeout(Some(STUB_READ_TIMEOUT)).expect(
+                        stream.set_read_timeout(Some(read_deadline)).expect(
                             "the stub must take a read deadline: a platform that refuses one \
                              leaves a client that stalls mid-request able to park this accept \
                              loop for good, and nothing else in this suite would notice",
@@ -4277,6 +4292,73 @@ mod tests {
                 "recovered"
             ]),
             "{report}"
+        );
+    }
+
+    /// A client that starts a request and then stops talking must be answered,
+    /// not waited on.
+    ///
+    /// The stub's read deadline is what stands between a half-sent request and
+    /// an accept loop parked for good, and the chain test above waits on its
+    /// child with no deadline of its own — so a fixture that lost the deadline
+    /// would hang a gate instead of failing it. That is the kind of guard that
+    /// cannot be checked by reading the constant back: what has to be shown is
+    /// that a stalled client gets a 400.
+    ///
+    /// The stub is given a short deadline here on purpose. The property is that
+    /// the deadline exists and is enforced, and waiting [`STUB_READ_TIMEOUT`]
+    /// to watch it fire would cost the everyday loop five seconds for nothing.
+    #[test]
+    fn a_client_that_stalls_mid_request_is_answered_not_waited_on() {
+        /// Long enough that a merely loaded machine cannot deliver the request
+        /// head after it, and short enough that the suite pays a second rather
+        /// than the five the chain test runs with. A deadline that fires early
+        /// would still answer, but with an empty request, and the assertions
+        /// below ask for the head.
+        const STALL_DEADLINE: Duration = Duration::from_secs(1);
+        /// Above the stub's deadline, so the stub is what ends the wait; below
+        /// a gate's patience, so a stub *without* a deadline fails this test
+        /// instead of hanging it.
+        const CLIENT_DEADLINE: Duration = Duration::from_secs(3);
+
+        let stub = StubModel::with_read_deadline(STALL_DEADLINE);
+        let mut client = TcpStream::connect(stub.address).expect("connecting to the stub");
+        client
+            .set_read_timeout(Some(CLIENT_DEADLINE))
+            .expect("the stalled client needs a deadline of its own to fail rather than hang");
+
+        // Headers that promise a body, and then no body at all: the accept loop
+        // is inside `read_request`'s body loop when the deadline fires.
+        client
+            .write_all(b"POST /v1/embeddings HTTP/1.1\r\ncontent-length: 4096\r\n\r\n")
+            .expect("writing the request head");
+        client.flush().expect("flushing the request head");
+        let mut response = [0_u8; 64];
+        let read = client.read(&mut response).unwrap_or_else(|error| {
+            panic!(
+                "a stalled client must be answered within {CLIENT_DEADLINE:?}, not waited on: \
+                 {error} (the stub's read deadline is {STALL_DEADLINE:?})"
+            )
+        });
+        assert!(read > 0, "the stub closed the connection without answering");
+        let first_line = String::from_utf8_lossy(&response[..read]).to_string();
+        assert!(
+            first_line.starts_with("HTTP/1.1 400 "),
+            "a request cut short must be refused, not answered or dropped: {first_line}"
+        );
+
+        // The request really did reach the loop, so the 400 above is the stub's
+        // answer to *this* request rather than a connection it never read.
+        let seen = stub.finish();
+        assert_eq!(seen.len(), 1, "the stub must have logged the short request");
+        assert_eq!(
+            seen[0].line, "POST /v1/embeddings HTTP/1.1",
+            "the request line is read before the body it never sent"
+        );
+        assert!(
+            seen[0].body.is_empty(),
+            "the deadline fired inside the body, not after it: {:?}",
+            seen[0].body
         );
     }
 
