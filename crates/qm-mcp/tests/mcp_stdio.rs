@@ -148,6 +148,10 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_compact",
         "memory_sessions",
         "memory_status",
+        "memory_handoff_open",
+        "memory_handoff_list",
+        "memory_handoff_claim",
+        "memory_handoff_done",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -195,6 +199,46 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
     );
     let text = tool_text(&searched);
     assert!(text.contains("sessions/sess-mcp.md"), "{text}");
+
+    // Handoffs: open, list, claim, and refuse a second claim — over the wire.
+    let opened = client.call_tool(
+        8,
+        "memory_handoff_open",
+        serde_json::json!({
+            "title": "finish the rebuild",
+            "body": "compaction is pending"
+        }),
+    );
+    // MCP tools answer in JSON, so an agent can act on the result directly.
+    let opened_text = tool_text(&opened);
+    let opened_json: serde_json::Value = serde_json::from_str(&opened_text)
+        .unwrap_or_else(|error| panic!("open must be JSON: {error}: {opened_text}"));
+    assert_eq!(opened_json["title"], "finish the rebuild", "{opened_json}");
+    assert_eq!(opened_json["claimed_by"], serde_json::Value::Null);
+    let opened_id = opened_json["id"].as_str().expect("handoff id").to_string();
+
+    let listed = client.call_tool(
+        9,
+        "memory_handoff_list",
+        serde_json::json!({"state": "all"}),
+    );
+    let listed_text = tool_text(&listed);
+    let handoffs: serde_json::Value = serde_json::from_str(&listed_text)
+        .unwrap_or_else(|error| panic!("list must be JSON: {error}: {listed_text}"));
+    let id = handoffs[0]["id"].as_str().expect("handoff id").to_string();
+    assert_eq!(
+        id, opened_id,
+        "the listed handoff must be the one just opened"
+    );
+
+    client.call_tool(10, "memory_handoff_claim", serde_json::json!({"id": id}));
+    let second_claim =
+        client.call_tool_raw(11, "memory_handoff_claim", serde_json::json!({"id": id}));
+    assert!(
+        !second_claim["error"].is_null(),
+        "a second claim must fail: {second_claim}"
+    );
+    client.call_tool(12, "memory_handoff_done", serde_json::json!({"id": id}));
 
     // A tool that fails must report the failure rather than invent success.
     let bad = client.call_tool_raw(

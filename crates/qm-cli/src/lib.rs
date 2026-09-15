@@ -17,7 +17,8 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use object_store::ObjectStore;
 use qm_core::{
-    MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId,
+    HandoffState, MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId, WorkspaceId,
+    WriterId,
 };
 use qm_search::consolidate::consolidate_session;
 use qm_search::{PageDoc, compact_project, publish_split_index, search_project};
@@ -44,6 +45,38 @@ pub struct Cli {
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Handoff operations.
+#[derive(Debug, Subcommand)]
+pub enum HandoffAction {
+    /// Leave a baton for whoever comes next.
+    Open {
+        /// Short title.
+        #[arg(long)]
+        title: String,
+        /// What the next session needs to know; reads stdin when omitted.
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// List handoffs (default: only the open ones).
+    List {
+        /// Filter: `all`, `open`, `claimed`, or `done`.
+        #[arg(long, default_value = "open")]
+        state: String,
+    },
+    /// Claim a handoff; exactly one machine can win.
+    Claim {
+        /// Handoff id.
+        #[arg(long)]
+        id: String,
+    },
+    /// Finish a handoff you claimed.
+    Done {
+        /// Handoff id.
+        #[arg(long)]
+        id: String,
+    },
 }
 
 /// Every command the surface exposes.
@@ -109,6 +142,11 @@ pub enum Command {
         /// Maximum number of spooled events to attempt.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Leave, list, claim, or finish a handoff.
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffAction,
     },
     /// Reclaim unreachable objects (dry run unless `--apply`).
     Gc {
@@ -568,6 +606,91 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             let (drained, kept) = drain_spool(&ctx, *limit).await?;
             Ok(format!("drained {drained} spooled event(s), kept {kept}"))
         }
+        Command::Handoff { action } => match action {
+            HandoffAction::Open { title, body } => {
+                let body = match body {
+                    Some(body) => body.clone(),
+                    None => read_stdin()?,
+                };
+                let (handoff, created) = ctx
+                    .project
+                    .open_handoff(
+                        &ctx.workspace,
+                        &ctx.project_id,
+                        title,
+                        &body,
+                        &ctx.writer,
+                        ctx.now_ms,
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(if ctx.json {
+                    serde_json::to_string(&handoff)?
+                } else {
+                    format!(
+                        "{} handoff {}: {}",
+                        if created { "opened" } else { "already open" },
+                        &handoff.id[..12.min(handoff.id.len())],
+                        handoff.title
+                    )
+                })
+            }
+            HandoffAction::List { state } => {
+                let wanted = match state.as_str() {
+                    "all" => None,
+                    "open" => Some(HandoffState::Open),
+                    "claimed" => Some(HandoffState::Claimed),
+                    "done" => Some(HandoffState::Done),
+                    other => bail!("unknown state {other:?}: use all, open, claimed or done"),
+                };
+                let handoffs = ctx
+                    .project
+                    .list_handoffs(&ctx.workspace, &ctx.project_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let filtered: Vec<&qm_core::Handoff> = handoffs
+                    .iter()
+                    .filter(|handoff| wanted.as_ref().is_none_or(|want| handoff.state() == *want))
+                    .collect();
+                Ok(if ctx.json {
+                    serde_json::to_string(&filtered)?
+                } else if filtered.is_empty() {
+                    "no handoffs".to_string()
+                } else {
+                    filtered
+                        .iter()
+                        .map(|handoff| {
+                            format!("{:?}\t{}\t{}", handoff.state(), handoff.id, handoff.title)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            HandoffAction::Claim { id } => {
+                let handoff = ctx
+                    .project
+                    .claim_handoff(&ctx.workspace, &ctx.project_id, id, &ctx.writer, ctx.now_ms)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(if ctx.json {
+                    serde_json::to_string(&handoff)?
+                } else {
+                    format!("claimed {}", handoff.id)
+                })
+            }
+            HandoffAction::Done { id } => {
+                let handoff = ctx
+                    .project
+                    .finish_handoff(&ctx.workspace, &ctx.project_id, id, &ctx.writer, ctx.now_ms)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                Ok(if ctx.json {
+                    serde_json::to_string(&handoff)?
+                } else {
+                    format!("finished {}", handoff.id)
+                })
+            }
+        },
         Command::Gc { apply, grace_ms } => {
             let outcome = ctx
                 .project
@@ -1204,6 +1327,80 @@ mod tests {
         assert_eq!(observed.len(), 1);
         assert!(observed[0].text.contains("cargo t passed"));
         assert_eq!(observed[0].actor, "codex");
+    }
+
+    #[tokio::test]
+    async fn handoffs_flow_open_claim_done_through_the_cli() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        let out = execute(
+            &cli(&[
+                "handoff",
+                "open",
+                "--title",
+                "finish the rebuild",
+                "--body",
+                "compaction is pending",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("opened handoff"), "{out}");
+
+        let listed = execute(
+            &cli(&["handoff", "list", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: Vec<qm_core::Handoff> = serde_json::from_str(&listed).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let id = parsed[0].id.clone();
+
+        // A different machine claims it; the first can no longer do so.
+        let mut other = context(Arc::clone(&bucket), &cache);
+        other.writer = WriterId::new("mbp-b").unwrap();
+        other.now_ms = 2_000;
+        let claimed = execute(&cli(&["handoff", "claim", "--id", &id]), other)
+            .await
+            .unwrap();
+        assert!(claimed.contains("claimed"), "{claimed}");
+
+        let mut third = context(Arc::clone(&bucket), &cache);
+        third.writer = WriterId::new("mbp-c").unwrap();
+        third.now_ms = 3_000;
+        let refused = execute(&cli(&["handoff", "claim", "--id", &id]), third)
+            .await
+            .expect_err("a claimed handoff must not be claimable again");
+        assert!(refused.to_string().contains("not open"), "{refused}");
+
+        // Only the claimer can finish it.
+        let mut owner = context(Arc::clone(&bucket), &cache);
+        owner.writer = WriterId::new("mbp-b").unwrap();
+        owner.now_ms = 4_000;
+        let done = execute(&cli(&["handoff", "done", "--id", &id]), owner)
+            .await
+            .unwrap();
+        assert!(done.contains("finished"), "{done}");
+
+        let open_now = execute(
+            &cli(&["handoff", "list"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(open_now, "no handoffs", "a finished handoff is not open");
+        let all = execute(
+            &cli(&["handoff", "list", "--state", "all", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: Vec<qm_core::Handoff> = serde_json::from_str(&all).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].state(), HandoffState::Done);
     }
 
     #[test]

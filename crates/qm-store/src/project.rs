@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use qm_core::{
-    CatalogHead, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest, Observation,
-    ObservationSegment, PageEntry, PagePath, PageVersion, ProjectId, SessionHead, SessionId,
-    SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash, derive_page_id,
-    derive_segment_id,
+    CatalogHead, Handoff, HandoffState, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest,
+    Observation, ObservationSegment, PageEntry, PagePath, PageVersion, ProjectId, SessionHead,
+    SessionId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash,
+    derive_handoff_id, derive_page_id, derive_segment_id,
 };
 
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -382,6 +382,177 @@ impl ProjectStore {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Leave a handoff for whoever comes next.
+    ///
+    /// Re-opening an identical note is a no-op: the id is content-derived, so a
+    /// retry cannot leave two copies of the same baton.
+    ///
+    /// # Errors
+    /// Propagates backend failures.
+    pub async fn open_handoff(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        title: &str,
+        body: &str,
+        created_by: &WriterId,
+        now_ms: i64,
+    ) -> Result<(Handoff, bool), StoreError> {
+        let id = derive_handoff_id(title, body, now_ms);
+        let key = self.layout.handoff(workspace_id, project_id, &id);
+        let handoff = Handoff {
+            schema: MANIFEST_SCHEMA,
+            id: id.clone(),
+            title: title.to_string(),
+            body: body.to_string(),
+            created_by: created_by.clone(),
+            created_at_ms: now_ms,
+            claimed_by: None,
+            claimed_at_ms: None,
+            finished_at_ms: None,
+        };
+        match self.create_or_verify(&key, &handoff).await {
+            Ok(created) => Ok((handoff, created)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Read one handoff.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the id does not exist.
+    pub async fn read_handoff(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+    ) -> Result<(Handoff, ObjectVersion), StoreError> {
+        let key = self.layout.handoff(workspace_id, project_id, id);
+        let (bytes, version) = self.cas.read(&key).await?;
+        let handoff: Handoff = decode(&bytes, &key)?;
+        if handoff.id != id {
+            return Err(StoreError::Corrupt(format!(
+                "{key} holds handoff {}",
+                handoff.id
+            )));
+        }
+        Ok((handoff, version))
+    }
+
+    /// List every handoff of a project, oldest first.
+    ///
+    /// # Errors
+    /// Propagates listing and decode failures.
+    pub async fn list_handoffs(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Handoff>, StoreError> {
+        let prefix = self.layout.handoff_prefix(workspace_id, project_id);
+        let listed = self.cas.list(&prefix).await?;
+        let mut handoffs = Vec::with_capacity(listed.len());
+        for (key, _) in listed {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            let (bytes, _) = self.cas.read(&key).await?;
+            handoffs.push(decode::<Handoff>(&bytes, &key)?);
+        }
+        handoffs.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(handoffs)
+    }
+
+    /// Claim a handoff. Exactly one machine can win.
+    ///
+    /// # Errors
+    /// [`StoreError::HandoffNotOpen`] when someone already took it or finished
+    /// it, plus backend failures.
+    pub async fn claim_handoff(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+        claimant: &WriterId,
+        now_ms: i64,
+    ) -> Result<Handoff, StoreError> {
+        let key = self.layout.handoff(workspace_id, project_id, id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let (mut handoff, version) = self.read_handoff(workspace_id, project_id, id).await?;
+            if handoff.state() != HandoffState::Open {
+                return Err(StoreError::HandoffNotOpen {
+                    id: id.to_string(),
+                    state: handoff.state(),
+                });
+            }
+            handoff.claimed_by = Some(claimant.clone());
+            handoff.claimed_at_ms = Some(now_ms);
+            match self.cas.update(&key, encode(&handoff)?, &version).await {
+                Ok(_) => return Ok(handoff),
+                Err(StoreError::Precondition | StoreError::NotFound) => {
+                    // Someone else moved it; re-read and report their win.
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Finish a handoff, but only the machine that claimed it.
+    ///
+    /// # Errors
+    /// [`StoreError::HandoffOwnedByAnother`] when the caller is not the claimer,
+    /// [`StoreError::HandoffNotOpen`] when it was never claimed.
+    pub async fn finish_handoff(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        id: &str,
+        owner: &WriterId,
+        now_ms: i64,
+    ) -> Result<Handoff, StoreError> {
+        let key = self.layout.handoff(workspace_id, project_id, id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let (mut handoff, version) = self.read_handoff(workspace_id, project_id, id).await?;
+            match handoff.claimed_by.as_ref() {
+                Some(claimer) if claimer == owner => {}
+                Some(claimer) => {
+                    return Err(StoreError::HandoffOwnedByAnother {
+                        id: id.to_string(),
+                        owner: claimer.to_string(),
+                    });
+                }
+                None => {
+                    return Err(StoreError::HandoffNotOpen {
+                        id: id.to_string(),
+                        state: handoff.state(),
+                    });
+                }
+            }
+            handoff.finished_at_ms = Some(now_ms);
+            match self.cas.update(&key, encode(&handoff)?, &version).await {
+                Ok(_) => return Ok(handoff),
+                Err(StoreError::Precondition | StoreError::NotFound) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -1514,6 +1685,95 @@ mod tests {
         assert!(
             !sessions.iter().any(|s| s.as_str() == "sess-orphan"),
             "a session without a committed head must stay invisible"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_is_claimed_exactly_once() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let opener = machine(&bucket);
+        let writer = WriterId::new("mbp-a").unwrap();
+
+        let (handoff, created) = opener
+            .open_handoff(
+                &ws(),
+                &proj(),
+                "finish the index rebuild",
+                "tantivy splits are published; compaction is pending",
+                &writer,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(created);
+
+        // Re-opening the same note is a no-op, not a second baton.
+        let (same, created) = opener
+            .open_handoff(
+                &ws(),
+                &proj(),
+                "finish the index rebuild",
+                "tantivy splits are published; compaction is pending",
+                &writer,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(same.id, handoff.id);
+        assert_eq!(opener.list_handoffs(&ws(), &proj()).await.unwrap().len(), 1);
+
+        // Two machines race for it: exactly one wins.
+        let racer_a = machine(&bucket);
+        let racer_b = machine(&bucket);
+        let owner_a = WriterId::new("mbp-a").unwrap();
+        let owner_b = WriterId::new("mbp-b").unwrap();
+        let id = handoff.id.clone();
+        let (workspace, project_id) = (ws(), proj());
+        let (a, b) = tokio::join!(
+            racer_a.claim_handoff(&workspace, &project_id, &id, &owner_a, 20),
+            racer_b.claim_handoff(&workspace, &project_id, &id, &owner_b, 21),
+        );
+        let winners = [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(
+            winners, 1,
+            "a handoff must have exactly one claimer: {a:?} {b:?}"
+        );
+        let loser = if a.is_err() { a } else { b };
+        assert!(
+            matches!(loser, Err(StoreError::HandoffNotOpen { .. })),
+            "the loser must be told it is not open: {loser:?}"
+        );
+
+        // Only the claimer can finish it.
+        let (claimed, _) = racer_a.read_handoff(&ws(), &proj(), &id).await.unwrap();
+        let claimer = claimed.claimed_by.clone().unwrap();
+        let intruder = if claimer == owner_a {
+            &owner_b
+        } else {
+            &owner_a
+        };
+        let refused = racer_b
+            .finish_handoff(&ws(), &proj(), &id, intruder, 30)
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::HandoffOwnedByAnother { .. })),
+            "{refused:?}"
+        );
+
+        let finished = opener
+            .finish_handoff(&ws(), &proj(), &id, &claimer, 40)
+            .await
+            .unwrap();
+        assert_eq!(finished.state(), HandoffState::Done);
+
+        // A finished handoff cannot be claimed again.
+        let too_late = opener
+            .claim_handoff(&ws(), &proj(), &id, &owner_a, 50)
+            .await;
+        assert!(
+            matches!(too_late, Err(StoreError::HandoffNotOpen { .. })),
+            "{too_late:?}"
         );
     }
 

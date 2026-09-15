@@ -12,9 +12,10 @@ mod model;
 mod scrub;
 
 pub use model::{
-    CatalogHead, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment,
-    PageEntry, PageVersion, SessionHead, SplitEntry, Tombstone, WalEntry, content_hash,
-    derive_observation_id, derive_page_id, derive_segment_id,
+    CatalogHead, Handoff, HandoffState, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest,
+    Observation, ObservationSegment, PageEntry, PageVersion, SessionHead, SplitEntry, Tombstone,
+    WalEntry, content_hash, derive_handoff_id, derive_observation_id, derive_page_id,
+    derive_segment_id,
 };
 pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 
@@ -301,6 +302,18 @@ impl KeyLayout {
             "{}/{session}/segments/{segment_id}.json",
             self.session_prefix(ws, proj)
         )
+    }
+
+    /// Immutable-per-state handoff object; claiming it is a CAS on this key.
+    #[must_use]
+    pub fn handoff(&self, ws: &WorkspaceId, proj: &ProjectId, id: &str) -> String {
+        format!("{}/handoffs/{id}.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Prefix holding every handoff of a project.
+    #[must_use]
+    pub fn handoff_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/handoffs", self.scope_prefix(ws, proj))
     }
 
     /// Lease object guarding an optional, abandonable job (compaction, GC).

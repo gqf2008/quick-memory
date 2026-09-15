@@ -420,6 +420,73 @@ pub struct SessionHead {
     pub updated_at_ms: i64,
 }
 
+/// State of a handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffState {
+    /// Waiting for someone to pick it up.
+    Open,
+    /// Exactly one machine took it.
+    Claimed,
+    /// The claimer finished it.
+    Done,
+}
+
+/// A baton passed between sessions or machines.
+///
+/// Pages are shared; a baton is owned. The whole point is that taking one is a
+/// single atomic act, so two machines racing for the same handoff cannot both
+/// believe they own it — the CAS on this object is that act, and it needs no
+/// second guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Content-derived id.
+    pub id: String,
+    /// Short title.
+    pub title: String,
+    /// What the next session needs to know.
+    pub body: String,
+    /// Who left the handoff.
+    pub created_by: WriterId,
+    /// When it was created, in milliseconds.
+    pub created_at_ms: i64,
+    /// Who claimed it, if anyone.
+    pub claimed_by: Option<WriterId>,
+    /// When it was claimed, in milliseconds.
+    pub claimed_at_ms: Option<i64>,
+    /// When it was finished, in milliseconds.
+    pub finished_at_ms: Option<i64>,
+}
+
+impl Handoff {
+    /// Current state, derived from the timestamps so the two cannot disagree.
+    #[must_use]
+    pub fn state(&self) -> HandoffState {
+        if self.finished_at_ms.is_some() {
+            HandoffState::Done
+        } else if self.claimed_by.is_some() {
+            HandoffState::Claimed
+        } else {
+            HandoffState::Open
+        }
+    }
+}
+
+/// Derive a handoff id from its content, so re-opening the same note is idempotent.
+#[must_use]
+pub fn derive_handoff_id(title: &str, body: &str, created_at_ms: i64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"quick-memory/handoff/v1\0");
+    hasher.update(title.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(body.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(created_at_ms.to_le_bytes());
+    hex(&hasher.finalize())
+}
+
 /// A lease on an optional, abandonable job (compaction, garbage collection).
 ///
 /// Leases exist so that "only one machine at a time" is expressible without a

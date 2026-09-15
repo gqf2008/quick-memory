@@ -105,6 +105,22 @@ pub enum StoreError {
     /// A stored object was unreadable, mismatched, or otherwise inconsistent.
     #[error("corrupt object: {0}")]
     Corrupt(String),
+    /// The handoff is no longer open (someone else took it, or it is done).
+    #[error("handoff {id} is not open (state: {state:?})")]
+    HandoffNotOpen {
+        /// Handoff id.
+        id: String,
+        /// State it is in now.
+        state: qm_core::HandoffState,
+    },
+    /// The handoff belongs to another machine's claim.
+    #[error("handoff {id} is claimed by {owner}")]
+    HandoffOwnedByAnother {
+        /// Handoff id.
+        id: String,
+        /// Current claimer.
+        owner: String,
+    },
     /// Any other backend failure.
     #[error("object store error: {0}")]
     Backend(String),

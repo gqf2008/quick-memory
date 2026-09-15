@@ -44,6 +44,11 @@ cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
 # 自动采集：把 harness 的 lifecycle hook 指向它，事件 JSON 走 stdin
 echo "rolled back the index change" | cargo run -p qm-cli --bin qm -- hook --session sess-1
 cargo run -p qm-cli --bin qm -- hook-drain    # 桶恢复后重投本地 spool
+
+# 交接棒：只能被认领一次
+cargo run -p qm-cli --bin qm -- handoff open --title "finish the rebuild" --body "compaction pending"
+cargo run -p qm-cli --bin qm -- handoff list
+cargo run -p qm-cli --bin qm -- handoff claim --id <id>
 ```
 
 作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，
@@ -72,7 +77,8 @@ cargo run -p qm-cli --bin qm -- hook-drain    # 桶恢复后重投本地 spool
 
 工具：`memory_capture` / `memory_consolidate` / `memory_search` / `memory_write_page` /
 `memory_read_page` / `memory_delete_page` / `memory_publish` / `memory_compact` /
-`memory_sessions` / `memory_status`。它们与 `qm` 命令共用同一份实现。
+`memory_sessions` / `memory_status` / `memory_handoff_open` / `memory_handoff_list` /
+`memory_handoff_claim` / `memory_handoff_done`。它们与 `qm` 命令共用同一份实现，返回 JSON。
 
 本地试协议用 `qm-mcp --synthetic-bucket`（内存、非持久，仅用于冒烟）。
 

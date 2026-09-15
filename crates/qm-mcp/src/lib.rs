@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use qm_cli::{Cli, Command, Context as CommandContext, execute};
+use qm_cli::{Cli, Command, Context as CommandContext, HandoffAction, execute};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -65,6 +65,30 @@ pub struct WritePageArgs {
     /// Page title; defaults to the path.
     #[serde(default)]
     pub title: Option<String>,
+}
+
+/// Arguments for `memory_handoff_open`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HandoffOpenArgs {
+    /// Short title.
+    pub title: String,
+    /// What the next session needs to know.
+    pub body: String,
+}
+
+/// Arguments for `memory_handoff_list`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HandoffListArgs {
+    /// Filter: `all`, `open`, `claimed`, or `done`.
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Arguments for handoff-addressed tools.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HandoffIdArgs {
+    /// Handoff id.
+    pub id: String,
 }
 
 /// Arguments for page-addressed tools.
@@ -258,6 +282,73 @@ impl MemoryServer {
     )]
     async fn memory_compact(&self) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Compact).await
+    }
+
+    /// Leave a handoff for whoever comes next.
+    #[tool(
+        description = "Leave a handoff (a baton) for the next session or another \
+                       machine. Use it to hand over work that is in flight, with \
+                       enough context that the next session can continue without \
+                       re-reading the whole history."
+    )]
+    async fn memory_handoff_open(
+        &self,
+        Parameters(args): Parameters<HandoffOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Handoff {
+            action: HandoffAction::Open {
+                title: args.title,
+                body: Some(args.body),
+            },
+        })
+        .await
+    }
+
+    /// List handoffs.
+    #[tool(description = "List handoffs. Defaults to the open ones; pass state \
+                       \"all\" to see claimed and finished handoffs too. Call this \
+                       at the START of a session to pick up in-flight work.")]
+    async fn memory_handoff_list(
+        &self,
+        Parameters(args): Parameters<HandoffListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Handoff {
+            action: HandoffAction::List {
+                state: args.state.unwrap_or_else(|| "open".to_string()),
+            },
+        })
+        .await
+    }
+
+    /// Claim a handoff, exactly once.
+    #[tool(
+        description = "Claim a handoff. Exactly one machine can win: a handoff \
+                       already claimed (or finished) returns an error, so two \
+                       agents racing for the same baton cannot both proceed."
+    )]
+    async fn memory_handoff_claim(
+        &self,
+        Parameters(args): Parameters<HandoffIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Handoff {
+            action: HandoffAction::Claim { id: args.id },
+        })
+        .await
+    }
+
+    /// Finish a handoff you claimed.
+    #[tool(
+        description = "Finish a handoff. Only the machine that claimed it can \
+                       finish it; anyone else gets an error."
+    )]
+    async fn memory_handoff_done(
+        &self,
+        Parameters(args): Parameters<HandoffIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::Handoff {
+            action: HandoffAction::Done { id: args.id },
+        })
+        .await
     }
 
     /// Report what the project currently contains.

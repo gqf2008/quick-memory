@@ -216,6 +216,27 @@ qm sessions
 - 该测试用 `--synthetic-bucket`（进程内、非持久、**不是后端**，启动时向 stderr 打警告）。
   真后端仍由三个探针在带凭据时验证。
 
+## 6.10 交接棒（handoff）：只能被认领一次
+
+ai-memory 里最值得搬的一条并发语义是"页面共享、接力棒自有"。在对象存储上它反而比 SQL 更简单：
+**认领就是一次 CAS**，不需要第二道守卫。
+
+```bash
+qm handoff open --title "finish the rebuild" --body "compaction is pending"
+qm handoff list [--state open|claimed|done|all]     # 默认只看 open
+qm handoff claim --id <id>                          # 恰好一台机器能赢
+qm handoff done  --id <id>                          # 只有认领者能收尾
+```
+
+- 对象：`handoffs/<id>.json`，`id` 由 `(title, body, created_at_ms)` 派生 → 重复 open 同一张便条是 **no-op**，
+  不会留下两个棒。
+- 状态从字段推导（`claimed_by` / `finished_at_ms`），不存冗余 state 字段，避免自相矛盾。
+- **认领 = 对同一对象的 `If-Match` CAS**：两台机器同时 claim 只有一个成功，输家收到
+  `handoff ... is not open`；已认领/已完成的棒不能再被认领（有测试盯着）。
+- 收尾要求 `claimed_by == 调用者`，别人来收尾会被拒——"棒是自有的"这条不变量的落点。
+- 测试：open（含重复 open 幂等）→ 两台机器并发 claim（恰好一个赢、输家报 not open）→ 第三方想收尾被拒
+  → 认领者收尾成功 → 已完成的棒不能再次被认领；CLI 与 MCP 两条面各有一条端到端用例。
+
 ## 6.9 自动采集（hook）与 fire-and-forget 契约
 
 记忆不应该依赖 agent"记得去记"。`qm hook` 从 stdin 读一个事件并落进会话链：
@@ -286,7 +307,7 @@ echo "rolled back the index change" | qm hook --session sess-1
 
 ## 10. 从 ai-memory 借的思想
 
-保留：`(workspace, project, path)` 三元身份、观测→页面的"编译而非检索"、supersession 链、handoff 只被认领一次、
+保留（均已实现）：`(workspace, project, path)` 三元身份、观测→页面的"编译而非检索"、supersession 链、handoff 只被认领一次、
 sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-closed 的 scope 解析、MCP 工具面。
 
 替换：SQLite（→ CAS 对象 + 派生索引）、git 工作树（→ 不可变版本 + manifest 链）、fs watcher（→ 发布/重建作业）、
@@ -302,7 +323,9 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
 
-**S5（agent 可用面、自动采集与回收，进行中）**
+**S5（agent 可用面、自动采集、交接棒与回收，进行中）**
+
+- 交接棒：`handoff open/list/claim/done`，CAS 保证恰好一次认领、只有认领者能收尾。
 
 - 自动采集：`qm hook` + `qm hook-drain`，fire-and-forget 契约（超时即 spool，永不阻塞 agent）。
 
