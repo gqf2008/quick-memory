@@ -2728,6 +2728,107 @@ mod tests {
         assert_eq!(outcome.hits[0].path, KEYWORD.0, "{outcome:?}");
     }
 
+    /// The vector stream proposes candidates; the manifest still decides.
+    ///
+    /// The first review of the vector stream verified this order with a
+    /// throwaway probe. It belongs in the suite: a page only its embedding can
+    /// reach must vanish the moment it is superseded, even though the split
+    /// that still holds it is never rebuilt. Otherwise the index would be
+    /// answering questions about the corpus, which is authority's job.
+    #[tokio::test]
+    async fn a_superseded_page_is_filtered_even_when_only_the_vector_stream_recalls_it() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        let project = reader(&bucket);
+        let writer = WriterId::new("mbp-a").unwrap();
+        let path = PagePath::new(PARAPHRASE.0).unwrap();
+
+        // The page shares no words with the query, so only its embedding can
+        // put it in front of the filter: a body hit would explain the recall.
+        assert!(
+            !text_for(PARAPHRASE.1, PARAPHRASE.2).contains(QUERY),
+            "the page must not contain the query word, or the vector stream \
+             would not be what found it"
+        );
+        let embedder = FakeEmbedder::new(4, orthogonal())
+            .answer(QUERY, vec![query_vector()])
+            .answer(&text_for(PARAPHRASE.1, PARAPHRASE.2), vec![near_query()]);
+
+        // Publish a split that holds the first version, embeddings included.
+        let commit = |body: &str, now_ms: i64| CommitPageRequest {
+            workspace_id: workspace.clone(),
+            project_id: project_id.clone(),
+            path: path.clone(),
+            title: PARAPHRASE.1.to_string(),
+            body: body.to_string(),
+            writer_id: writer.clone(),
+            now_ms,
+        };
+        project.commit_page(commit(PARAPHRASE.2, 1)).await.unwrap();
+        let first = project
+            .read_page(&workspace, &project_id, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let doc = PageDoc::from_version(&workspace, &project_id, &first, 1);
+        let docs = attach_embeddings(vec![doc], Some(&embedder)).await.unwrap();
+        publish_split_index(
+            &bucket,
+            &project,
+            &workspace,
+            &project_id,
+            &writer,
+            1,
+            &docs,
+            &build_root.path().join("split"),
+            1,
+        )
+        .await
+        .unwrap();
+
+        // Premise: while the first version is authoritative the vector stream
+        // is what finds the page, and the page is returned.
+        let live =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&embedder)).await;
+        assert!(
+            live.stream_candidates.get("vector").copied().unwrap_or(0) >= 1,
+            "the premise: only the vector stream can reach this page: {live:?}"
+        );
+        assert_eq!(live.hits.len(), 1, "{live:?}");
+        assert_eq!(live.hits[0].page_id, first.page_id.as_str());
+
+        // Supersede the path without republishing. The split still holds the
+        // old page_id — exactly what a reader sees between a write and the
+        // next publish.
+        let outcome = project
+            .commit_page(commit("a cluster elects one node for each term", 2))
+            .await
+            .unwrap();
+        assert_ne!(
+            outcome.page_id, first.page_id,
+            "the second commit must be a new version"
+        );
+
+        let stale =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&embedder)).await;
+        assert!(
+            stale.stream_candidates.get("vector").copied().unwrap_or(0) >= 1,
+            "the vector stream must still propose the stale copy; that is the \
+             point of the test: {stale:?}"
+        );
+        assert!(
+            stale.hits.is_empty(),
+            "the manifest superseded this page, so nothing may be returned: {stale:?}"
+        );
+        assert!(
+            stale.filtered_out >= 1,
+            "the stale candidate must be counted as filtered, not silently \
+             dropped: {stale:?}"
+        );
+    }
+
     /// The other half of the acceptance case: with no vector stream running —
     /// because no provider is configured, or because the split was published
     /// without one — the paraphrase must not appear at all.
