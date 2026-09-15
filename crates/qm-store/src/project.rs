@@ -23,6 +23,7 @@ use qm_core::{
     WorkspaceId, WriterId, content_hash, derive_handoff_id, derive_page_id, derive_proposal_id,
     derive_segment_id,
 };
+use serde::de::DeserializeOwned;
 
 use crate::digest::{Digest, SessionSummary, handoff_activity_ms};
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -59,6 +60,32 @@ const CONCURRENT_READ_LIMIT: usize = 16;
 /// `manifest_size_is_linear_in_paths`, which pins the documented range and
 /// fails if a `PageEntry` grows enough to move it.
 pub const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+
+/// How a fan-out over a listing treats a key the listing named but the bucket
+/// no longer has.
+///
+/// A listing and the reads that follow it are not one snapshot, so an object
+/// can be gone by the time it is read. Whether that is a race to tolerate or a
+/// failure is the caller's call, not the reader's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingKey {
+    /// Tolerate it and report `None` for that key.
+    Skip,
+    /// Treat it as a failing read, the way a single [`CasStore::read`] would.
+    Fail,
+}
+
+/// The `.json` objects among a listing, in the order the listing handed them
+/// back — which is key order, because [`CasStore::list`] sorts.
+///
+/// Every fan-out here keeps only `.json` keys: the bucket holds lock and
+/// marker objects too, and those are not records of anything.
+fn json_keys(listed: Vec<(String, ObjectVersion)>) -> Vec<String> {
+    listed
+        .into_iter()
+        .filter_map(|(key, _)| key.ends_with(".json").then_some(key))
+        .collect()
+}
 
 /// How hard to fight for the commit point before giving up.
 #[derive(Debug, Clone)]
@@ -671,23 +698,23 @@ impl ProjectStore {
 
     /// List every handoff of a project, oldest first.
     ///
+    /// Listed and read whole — there is no `limit` here to cap either — with
+    /// the reads overlapping up to [`CONCURRENT_READ_LIMIT`]. The order comes
+    /// from the sort below, never from the order the reads finish in.
+    ///
     /// # Errors
-    /// Propagates listing and decode failures.
+    /// Propagates listing and decode failures, and a failing read fails the
+    /// whole call: a partial list is never returned. As in
+    /// [`ProjectStore::read_commit_log`], the failure reported is the smallest
+    /// failing key's, so which read finished first decides nothing.
     pub async fn list_handoffs(
         &self,
         workspace_id: &WorkspaceId,
         project_id: &ProjectId,
     ) -> Result<Vec<Handoff>, StoreError> {
         let prefix = self.layout.handoff_prefix(workspace_id, project_id);
-        let listed = self.cas.list(&prefix).await?;
-        let mut handoffs = Vec::with_capacity(listed.len());
-        for (key, _) in listed {
-            if !key.ends_with(".json") {
-                continue;
-            }
-            let (bytes, _) = self.cas.read(&key).await?;
-            handoffs.push(decode::<Handoff>(&bytes, &key)?);
-        }
+        let keys = json_keys(self.cas.list(&prefix).await?);
+        let mut handoffs: Vec<Handoff> = self.read_all(keys).await?;
         handoffs.sort_by(|a, b| {
             a.created_at_ms
                 .cmp(&b.created_at_ms)
@@ -738,14 +765,28 @@ impl ProjectStore {
         pages.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| b.seq.cmp(&a.seq)));
         pages.truncate(limit);
 
+        // One head per session, read with the same bound as the pages above.
+        // The heads are paired back with the ids the listing produced — by
+        // position, which is exactly why `read_overlapping` files each read
+        // under its own key instead of appending them as they arrive. The id on
+        // a summary is therefore still the one from the key, not the one the
+        // head claims.
         let mut sessions = Vec::new();
-        for session_id in self.list_sessions(workspace_id, project_id).await? {
-            // Listed a moment ago and gone now is a normal race for a
-            // snapshot read; skip it rather than failing the whole digest.
-            let Some((head, _)) = self
-                .load_session_head(workspace_id, project_id, &session_id)
-                .await?
-            else {
+        let session_ids = self.list_sessions(workspace_id, project_id).await?;
+        let head_keys: Vec<String> = session_ids
+            .iter()
+            .map(|session_id| {
+                self.layout
+                    .session_head(workspace_id, project_id, session_id)
+            })
+            .collect();
+        // Listed a moment ago and gone now is a normal race for a snapshot
+        // read; skip it rather than failing the whole digest.
+        let heads = self
+            .read_overlapping::<SessionHead>(head_keys, MissingKey::Skip)
+            .await?;
+        for (session_id, head) in session_ids.into_iter().zip(heads) {
+            let Some(head) = head else {
                 continue;
             };
             if head.updated_at_ms >= since_ms {
@@ -1891,14 +1932,108 @@ impl ProjectStore {
         self.create_or_verify(&key, &record).await.map(|_| ())
     }
 
+    /// Read every key, overlapping the requests up to
+    /// [`CONCURRENT_READ_LIMIT`], and require all of them to be there.
+    ///
+    /// The objects come back in the order the keys were given, never in the
+    /// order the reads finished. Callers sort the answer themselves, so a batch
+    /// that arrived scrambled would be ordered by whatever the bucket's network
+    /// happened to do. A failure is a failure of the whole batch rather than a
+    /// partial answer.
+    ///
+    /// # Errors
+    /// Propagates the failing read belonging to the *smallest* key, so a bucket
+    /// that fails several reads at once still produces the same error every
+    /// run: which read finishes first decides nothing (see
+    /// [`ProjectStore::read_commit_log`]).
+    async fn read_all<T>(&self, keys: Vec<String>) -> Result<Vec<T>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        // `MissingKey::Fail` turns an absent object into a failed read, so a
+        // batch that returned `Ok` has nothing missing left in it.
+        Ok(self
+            .read_overlapping(keys, MissingKey::Fail)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Read every key, overlapping the requests up to
+    /// [`CONCURRENT_READ_LIMIT`] — the same bound and the same contract as
+    /// [`ProjectStore::read_all`], except that a key the listing named and the
+    /// bucket no longer has is reported as `None` instead of failing the batch.
+    ///
+    /// The results come back **one slot per key, in the order the keys were
+    /// given** — not in the order the reads finished. Callers that have no
+    /// field of their own to sort on (the sessions section of a digest, whose
+    /// ids come from the listing) pair the slots with the listing positionally,
+    /// so this has to be true of *this function* and not merely of the bucket.
+    /// `buffer_unordered` hands reads back in whatever order they finish, and
+    /// each one is filed under the key it was started for.
+    ///
+    /// # Errors
+    /// Propagates decode and backend failures, choosing the *smallest* failing
+    /// key's error exactly as [`ProjectStore::read_all`] does.
+    async fn read_overlapping<T>(
+        &self,
+        keys: Vec<String>,
+        missing: MissingKey,
+    ) -> Result<Vec<Option<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        // The objects are immutable and independent, so overlapping their reads
+        // cannot change the answer — but only because every read lands in its
+        // own key's slot. Completion order is not an order: appending here would
+        // hand a caller that pairs positionally one key's object as another
+        // key's object, which is what the sessions section of a digest does.
+        let slots = keys.len();
+        let mut objects: Vec<Option<T>> = std::iter::repeat_with(|| None).take(slots).collect();
+        let mut failures: Vec<(String, StoreError)> = Vec::new();
+        let mut reads = futures::stream::iter(keys.into_iter().enumerate())
+            .map(|(index, key)| async move {
+                let outcome = async {
+                    let (bytes, _) = self.cas.read(&key).await?;
+                    decode::<T>(&bytes, &key)
+                }
+                .await;
+                (index, key, outcome)
+            })
+            .buffer_unordered(CONCURRENT_READ_LIMIT);
+        // A failing read is collected rather than returned on the spot: the
+        // failure to report is the smallest failing key below, not whichever
+        // failure the bucket happened to hand back first. That keeps the rest of
+        // the batch being read after a failure — a few hundred bytes per
+        // object, still overlapped up to the bound above — and it is what makes
+        // the error the same on every run.
+        while let Some((index, key, outcome)) = reads.next().await {
+            match outcome {
+                Ok(object) => objects[index] = Some(object),
+                // A tolerated absence leaves the slot empty, which is exactly
+                // what the caller asked for.
+                Err(StoreError::NotFound) if missing == MissingKey::Skip => {}
+                Err(error) => failures.push((key, error)),
+            }
+        }
+        if let Some((_, error)) = failures
+            .into_iter()
+            .min_by(|left, right| left.0.cmp(&right.0))
+        {
+            return Err(error);
+        }
+        Ok(objects)
+    }
+
     /// Read the commit log, newest first, up to `limit` records.
     ///
     /// Advisory metadata: entries can be missing (a crash between the commit
     /// and this write), and nothing authoritative depends on them.
     ///
     /// The whole log is listed and read — `limit` caps the answer, not the
-    /// work — but the reads overlap up to a fixed bound. The order comes from
-    /// the sort below, never from the order the reads finish in.
+    /// work — but the reads overlap up to [`CONCURRENT_READ_LIMIT`]. The order
+    /// comes from the sort below, never from the order the reads finish in.
     ///
     /// # Errors
     /// Propagates listing failures, and propagates a failing read as a failure
@@ -1914,45 +2049,8 @@ impl ProjectStore {
         limit: usize,
     ) -> Result<Vec<CommitRecord>, StoreError> {
         let prefix = self.layout.commit_prefix(workspace_id, project_id);
-        let listed = self.cas.list(&prefix).await?;
-        let keys: Vec<String> = listed
-            .into_iter()
-            .filter_map(|(key, _)| key.ends_with(".json").then_some(key))
-            .collect();
-        // Records are immutable and independent, so overlapping their reads
-        // cannot change the answer: the order below comes from the sort, never
-        // from the order the reads happen to finish in. Only the number of
-        // requests in flight is bounded.
-        let mut records = Vec::with_capacity(keys.len());
-        let mut failures: Vec<(String, StoreError)> = Vec::new();
-        let mut reads = futures::stream::iter(keys)
-            .map(|key| async move {
-                let outcome = async {
-                    let (bytes, _) = self.cas.read(&key).await?;
-                    decode::<CommitRecord>(&bytes, &key)
-                }
-                .await;
-                (key, outcome)
-            })
-            .buffer_unordered(CONCURRENT_READ_LIMIT);
-        // A failing read is collected rather than returned on the spot: the
-        // failure to report is the smallest failing key below, not whichever
-        // failure the bucket happened to hand back first. That keeps the rest of
-        // the log being read after a failure — a few hundred bytes per record,
-        // still overlapped up to the bound above — and it is what makes the
-        // error the same on every run.
-        while let Some((key, outcome)) = reads.next().await {
-            match outcome {
-                Ok(record) => records.push(record),
-                Err(error) => failures.push((key, error)),
-            }
-        }
-        if let Some((_, error)) = failures
-            .into_iter()
-            .min_by(|left, right| left.0.cmp(&right.0))
-        {
-            return Err(error);
-        }
+        let keys = json_keys(self.cas.list(&prefix).await?);
+        let mut records: Vec<CommitRecord> = self.read_all(keys).await?;
         records.sort_by_key(|record| std::cmp::Reverse(record.seq));
         records.truncate(limit);
         Ok(records)
@@ -2085,8 +2183,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex};
 
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -2135,12 +2233,31 @@ mod tests {
     /// oldest commit comes back first), and the failure test reverses the
     /// *failures*, so that the one a first-failure-wins reader would report is
     /// deliberately not the one the contract names.
+    ///
+    /// Commit records carry their sequence in the key, so their stagger comes
+    /// from that sequence. Session heads and handoff objects carry none, so
+    /// those reads are staggered by the order they are booked in as they start
+    /// — enough to guarantee every one of them suspends at least once, which is
+    /// what makes overlap observable. Neither stagger depends on how fast
+    /// anything actually ran.
     #[derive(Debug)]
     struct CountingStore {
         inner: InMemory,
         reads: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        /// Reads of objects that carry no sequence in their key, counted as
+        /// they arrive.
+        bookings: AtomicUsize,
+        /// Keys of the reads that finished, in the order they finished, since
+        /// the last [`Self::reset`]. A test that cares *which* object a batch
+        /// put where asserts this first, so that "the reads came back in the
+        /// awkward order" is observed rather than assumed.
+        completed: Mutex<Vec<String>>,
+        /// Keys the bucket "loses" between the listing and the read: the read
+        /// deletes the object first, so it fails with the backend's own
+        /// `NotFound` rather than with a hand-built error.
+        vanished: Mutex<BTreeSet<String>>,
         order: CompletionOrder,
     }
 
@@ -2157,6 +2274,9 @@ mod tests {
     ///
     /// It only has to exceed the sequences of the logs the tests here build, so
     /// that subtracting the sequence is a strict reversal inside that range.
+    /// The one test that asks for that order builds a log far shorter than
+    /// this; a longer batch in reverse order would run out of stagger and stop
+    /// suspending, which is why nothing else uses it.
     const REVERSED_STAGGER_SPAN: usize = 64;
 
     impl CountingStore {
@@ -2175,6 +2295,9 @@ mod tests {
                 reads: AtomicUsize::new(0),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
+                bookings: AtomicUsize::new(0),
+                completed: Mutex::new(Vec::new()),
+                vanished: Mutex::new(BTreeSet::new()),
                 order,
             })
         }
@@ -2189,25 +2312,37 @@ mod tests {
             self.max_in_flight.load(AtomicOrdering::SeqCst)
         }
 
+        /// The keys the reads finished in, since the last [`Self::reset`].
+        fn completed(&self) -> Vec<String> {
+            self.completed.lock().unwrap().clone()
+        }
+
+        /// Have the next read of `key` find the object gone: the race between
+        /// a listing and the reads that follow it, made deterministic.
+        fn vanish(&self, key: &str) {
+            self.vanished.lock().unwrap().insert(key.to_string());
+        }
+
         /// Forget what has been observed, so a test can time one call.
         fn reset(&self) {
             self.reads.store(0, AtomicOrdering::SeqCst);
             self.max_in_flight.store(0, AtomicOrdering::SeqCst);
+            self.completed.lock().unwrap().clear();
         }
     }
 
     /// The commit sequence encoded in a key like
     /// `…/commits/00000000000000000123.json`.
     ///
-    /// Anything that is not a commit record answers zero, so only the log reads
-    /// below get the stagger.
-    fn commit_seq_in(location: &str) -> usize {
+    /// `None` for anything that is not a commit record: session heads end in
+    /// `head.json` and handoff objects carry a hash, so neither parses as a
+    /// sequence. Those reads fall back to the booking counter instead.
+    fn commit_seq_in(location: &str) -> Option<usize> {
         location
             .rsplit('/')
             .next()
             .and_then(|last| last.strip_suffix(".json"))
             .and_then(|seq| seq.parse::<usize>().ok())
-            .unwrap_or(0)
     }
 
     /// Every commit key of the test scope, in the order `list` hands them back
@@ -2290,15 +2425,33 @@ mod tests {
                 // this makes that disorder deterministic, which is what keeps
                 // the assertions below load-bearing rather than satisfied by
                 // luck.
-                let seq = commit_seq_in(location.as_ref());
+                //
+                // A read always suspends at least once, which is what makes
+                // overlap observable at all: without a suspension each future
+                // runs to completion inside the poll that starts it, and even a
+                // genuinely concurrent reader would never show two in flight.
+                let booking = self.bookings.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                let position = commit_seq_in(location.as_ref()).unwrap_or(booking);
                 let stagger = match self.order {
-                    CompletionOrder::OldestFirst => seq,
-                    CompletionOrder::NewestFirst => REVERSED_STAGGER_SPAN.saturating_sub(seq),
+                    CompletionOrder::OldestFirst => position,
+                    CompletionOrder::NewestFirst => REVERSED_STAGGER_SPAN.saturating_sub(position),
                 };
                 for _ in 0..stagger {
                     tokio::task::yield_now().await;
                 }
+                if self.vanished.lock().unwrap().remove(location.as_ref()) {
+                    // The listing named this object a moment ago; it is gone by
+                    // the time the read arrives, which is a plain `NotFound`.
+                    self.inner
+                        .delete(location)
+                        .await
+                        .expect("the fixture only vanishes an object it stored");
+                }
                 let out = self.inner.get_opts(location, options).await;
+                self.completed
+                    .lock()
+                    .unwrap()
+                    .push(location.as_ref().to_string());
                 self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
                 out
             })
@@ -3811,7 +3964,357 @@ mod tests {
         );
     }
 
-    /// A failing read fails the whole call — never a partial log — and the
+    /// The sessions section of a digest is one head per session. Two hundred of
+    /// them must not cost two hundred serial round trips — but overlapping the
+    /// reads may not change the window, the ordering or the cap. Same fixture
+    /// and same shape of assertion as the commit log above: the sessions really
+    /// exist first, then how many objects were read, then how many were ever in
+    /// flight, and only then the answer those reads produced.
+    #[tokio::test]
+    async fn digest_reads_session_heads_with_bounded_overlap() {
+        const SESSIONS: i64 = 200;
+
+        let counter = CountingStore::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=SESSIONS {
+            store
+                .ingest_observations(ingest(
+                    &format!("sess-{index:03}"),
+                    &["one observation"],
+                    index * 1_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Premise before conclusion: every session really is listed, so a read
+        // count below cannot be explained away by an empty listing.
+        let listed = store.list_sessions(&ws(), &proj()).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            SESSIONS as usize,
+            "the premise: every head exists"
+        );
+
+        // One `digest`, nothing else, so every read it issues is its own.
+        counter.reset();
+        let digest = store.digest(&ws(), &proj(), 0, 5).await.unwrap();
+
+        assert_eq!(
+            counter.reads(),
+            SESSIONS as usize,
+            "one head per session is read, and nothing else is: a digest reads \
+             whole, the bound is on overlap"
+        );
+        let max = counter.max_in_flight();
+        assert!(
+            max <= CONCURRENT_READ_LIMIT,
+            "at most {CONCURRENT_READ_LIMIT} reads may be in flight, saw {max}"
+        );
+        assert_eq!(
+            max, 16,
+            "session heads are read concurrently, not one at a time; changing \
+             the bound is a deliberate edit to this line, not a silent one"
+        );
+
+        // Reading out of order is invisible in the answer: newest first by
+        // `last_seen_ms`, capped, and the cap keeps the newest end.
+        let seen: Vec<(&str, i64)> = digest
+            .sessions
+            .iter()
+            .map(|summary| (summary.session_id.as_str(), summary.last_seen_ms))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("sess-200", 200_000),
+                ("sess-199", 199_000),
+                ("sess-198", 198_000),
+                ("sess-197", 197_000),
+                ("sess-196", 196_000),
+            ]
+        );
+
+        // The window is still the window, even though the reads that find the
+        // heads outside it are now the ones issued in parallel.
+        let windowed = store.digest(&ws(), &proj(), 197_500, 5).await.unwrap();
+        let windowed_ids: Vec<&str> = windowed
+            .sessions
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(windowed_ids, vec!["sess-200", "sess-199", "sess-198"]);
+    }
+
+    /// Overlapping the session reads must not scramble them.
+    ///
+    /// A summary's id comes from the listing while its count and its clock come
+    /// from the head, so `digest` pairs the two **by position**. The fixture
+    /// hands the heads back in the reverse of the listing — the premise below
+    /// shows it really did — and where each object lands is then the whole
+    /// difference between `sess-001` carrying its own clock and carrying
+    /// `sess-006`'s. The test above cannot see that: it reads the heads back in
+    /// listing order, where pairing by arrival order happens to agree with
+    /// pairing by position.
+    #[tokio::test]
+    async fn a_digest_pairs_each_session_with_its_own_head_when_reads_finish_out_of_order() {
+        const SESSIONS: i64 = 6;
+
+        let counter = CountingStore::newest_first();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=SESSIONS {
+            // A distinct count *and* a distinct clock per session, so a swapped
+            // pair has two ways to show itself.
+            let texts: Vec<String> = (0..index).map(|n| format!("observation {n}")).collect();
+            let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+            store
+                .ingest_observations(ingest(
+                    &format!("sess-{index:03}"),
+                    &borrowed,
+                    index * 1_000,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let ids = store.list_sessions(&ws(), &proj()).await.unwrap();
+        assert_eq!(
+            ids.len(),
+            SESSIONS as usize,
+            "the premise: every head exists"
+        );
+        let keys: Vec<String> = ids
+            .iter()
+            .map(|id| store.layout().session_head(&ws(), &proj(), id))
+            .collect();
+
+        counter.reset();
+        let digest = store.digest(&ws(), &proj(), 0, usize::MAX).await.unwrap();
+
+        // Premise before conclusion: the heads really came back in the reverse
+        // of the listing, so a batch that paired them up by arrival order could
+        // not pass the assertions below by luck.
+        let mut reversed = keys.clone();
+        reversed.reverse();
+        assert_eq!(
+            counter.completed(),
+            reversed,
+            "the fixture must hand the heads back in the reverse of the listing"
+        );
+
+        // Each summary carries *its own* session's numbers.
+        for summary in &digest.sessions {
+            let index: i64 = summary
+                .session_id
+                .as_str()
+                .trim_start_matches("sess-")
+                .parse()
+                .unwrap();
+            assert_eq!(
+                summary.observations, index as u64,
+                "{} carries another session's observation count",
+                summary.session_id
+            );
+            assert_eq!(
+                summary.last_seen_ms,
+                index * 1_000,
+                "{} carries another session's clock",
+                summary.session_id
+            );
+        }
+
+        // And the answer is still ordered by the heads' clocks, newest first.
+        let ordered: Vec<&str> = digest
+            .sessions
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "sess-006", "sess-005", "sess-004", "sess-003", "sess-002", "sess-001",
+            ]
+        );
+    }
+
+    /// The handoffs section of a digest is every handoff object of the scope,
+    /// hit on the same bound and asserted the same way as the other two.
+    #[tokio::test]
+    async fn digest_reads_handoffs_with_bounded_overlap() {
+        const HANDOFFS: i64 = 200;
+
+        let counter = CountingStore::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        let writer = WriterId::new("mbp-1").unwrap();
+        for index in 1..=HANDOFFS {
+            store
+                .open_handoff(
+                    &ws(),
+                    &proj(),
+                    &format!("batons/{index:03}"),
+                    "carry on",
+                    &writer,
+                    index * 1_000,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Premise before conclusion: two hundred handoff objects, all open.
+        let listed = store.list_handoffs(&ws(), &proj()).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            HANDOFFS as usize,
+            "the premise: every handoff object exists"
+        );
+
+        counter.reset();
+        let digest = store.digest(&ws(), &proj(), 0, 5).await.unwrap();
+
+        assert_eq!(
+            counter.reads(),
+            HANDOFFS as usize,
+            "one object per handoff is read, and nothing else is"
+        );
+        let max = counter.max_in_flight();
+        assert!(
+            max <= CONCURRENT_READ_LIMIT,
+            "at most {CONCURRENT_READ_LIMIT} reads may be in flight, saw {max}"
+        );
+        assert_eq!(
+            max, 16,
+            "handoffs are read concurrently, not one at a time; changing the \
+             bound is a deliberate edit to this line, not a silent one"
+        );
+
+        // Newest activity first, then the id, and the cap keeps the newest end.
+        let opened: Vec<i64> = digest
+            .handoffs
+            .iter()
+            .map(|handoff| handoff.created_at_ms)
+            .collect();
+        assert_eq!(opened, vec![200_000, 199_000, 198_000, 197_000, 196_000]);
+
+        // The window still decides what is read *into* the answer.
+        let windowed = store.digest(&ws(), &proj(), 197_500, 5).await.unwrap();
+        let windowed_ms: Vec<i64> = windowed
+            .handoffs
+            .iter()
+            .map(|handoff| handoff.created_at_ms)
+            .collect();
+        assert_eq!(windowed_ms, vec![200_000, 199_000, 198_000]);
+    }
+
+    /// A session head can be deleted between the listing and the read — a
+    /// retention pass racing a digest. That race is tolerated, and it has to
+    /// stay tolerated once the reads overlap. A handoff is the opposite: a
+    /// listed handoff that is gone when its object is read has always failed
+    /// the read, and overlapping must not quietly turn that into a skip.
+    #[tokio::test]
+    async fn a_vanished_session_is_skipped_and_a_vanished_handoff_is_not() {
+        // Sessions: three listed, the middle one gone by the time it is read.
+        // The reads come back in the reverse of the listing, so the ordering
+        // asserted below is not merely "which sessions are still there": a
+        // digest that paired heads with ids by arrival order would report the
+        // survivors in the wrong order.
+        let counter = CountingStore::newest_first();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        for index in 1..=3 {
+            store
+                .ingest_observations(ingest(&format!("sess-{index}"), &["x"], index * 1_000))
+                .await
+                .unwrap();
+        }
+        let gone = store
+            .layout()
+            .session_head(&ws(), &proj(), &SessionId::new("sess-2").unwrap());
+        // Premise: it is listed and it really is there before the read.
+        assert_eq!(
+            store.list_sessions(&ws(), &proj()).await.unwrap().len(),
+            3,
+            "the premise: all three sessions are listed"
+        );
+        assert!(
+            store.cas.read(&gone).await.is_ok(),
+            "the premise: the head exists until the read arrives"
+        );
+        counter.vanish(&gone);
+        let mut listed_keys: Vec<String> = (1..=3)
+            .map(|index| {
+                store.layout().session_head(
+                    &ws(),
+                    &proj(),
+                    &SessionId::new(format!("sess-{index}")).unwrap(),
+                )
+            })
+            .collect();
+        listed_keys.reverse();
+
+        // Only the digest's own reads from here on: building the fixture read
+        // every head once already.
+        counter.reset();
+        let digest = store.digest(&ws(), &proj(), 0, 10).await.unwrap();
+        let ids: Vec<&str> = digest
+            .sessions
+            .iter()
+            .map(|summary| summary.session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sess-3", "sess-1"],
+            "a session deleted after the listing is skipped, not fatal"
+        );
+        assert_eq!(
+            counter.reads(),
+            3,
+            "the vanished head was still read: it was listed before it was deleted"
+        );
+        assert_eq!(
+            counter.completed(),
+            listed_keys,
+            "the premise: the heads came back in the reverse of the listing"
+        );
+
+        // Handoffs: two listed, the second one gone by the time it is read.
+        let counter = CountingStore::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&counter) as Arc<dyn ObjectStore>;
+        let store = machine(&bucket);
+        let writer = WriterId::new("mbp-1").unwrap();
+        for index in 1..=2 {
+            store
+                .open_handoff(
+                    &ws(),
+                    &proj(),
+                    &format!("batons/{index}"),
+                    "carry on",
+                    &writer,
+                    index * 1_000,
+                )
+                .await
+                .unwrap();
+        }
+        let keys = json_keys(
+            store
+                .cas
+                .list(&store.layout().handoff_prefix(&ws(), &proj()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(keys.len(), 2, "the premise: both handoffs are listed");
+        counter.vanish(&keys[1]);
+
+        let error = store
+            .digest(&ws(), &proj(), 0, 10)
+            .await
+            .expect_err("a handoff that vanished is a failed read, not a skip");
+        assert!(matches!(error, StoreError::NotFound), "{error:?}");
+    }
+
+    /// A failing read fails the whole call, never a partial log — and the
     /// failure it reports is the one belonging to the smallest failing key.
     ///
     /// With overlapping reads, "which failure" is a choice this function makes
