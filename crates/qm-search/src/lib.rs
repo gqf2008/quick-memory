@@ -1609,6 +1609,158 @@ mod tests {
         lease.release(&second, 1_200).await.unwrap();
     }
 
+    /// Recall evaluation over a synthetic corpus with known ground truth.
+    ///
+    /// The corpus is built so that the answer is *declared* by exactly one page
+    /// while the same token also appears in prose in several distractors. That
+    /// makes the evaluation able to distinguish retrieval configurations: the
+    /// same queries are run twice, once with entity/link streams active and once
+    /// against a corpus with the declared fields stripped. If the numbers do not
+    /// move, the harness is measuring nothing.
+    #[tokio::test]
+    async fn recall_eval_separates_declared_matches_from_prose() {
+        use std::collections::BTreeMap;
+
+        const PAGES: usize = 20;
+        const DISTRACTORS: usize = 3;
+        const TOP_K: usize = 5;
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let writer = WriterId::new("eval").unwrap();
+        let build_root = TempDir::new().unwrap();
+
+        // Two projects: one keeps the declared fields, one has them stripped.
+        // Every competing page is committed, because the authority check drops
+        // anything the manifest does not name — an evaluation whose distractors
+        // are filtered away measures nothing.
+        let mut expected: BTreeMap<usize, (String, String)> = BTreeMap::new();
+        for (project_name, keep_declared) in [("declared", true), ("stripped", false)] {
+            let project_id = ProjectId::new(project_name).unwrap();
+            let mut docs = Vec::new();
+            let mut now_ms = 0i64;
+            for index in 0..PAGES {
+                let token = format!("qm-eval-{index:03}");
+                let answer = format!("notes/answer-{index:03}.md");
+                expected.insert(index, (token.clone(), answer.clone()));
+
+                // The answer mentions the token once, but declares it.
+                let answer_body = format!("the canonical note for `{token}`");
+                // Distractors repeat it in prose, which plain BM25 rewards.
+                let distractor_body = format!(
+                    "{token} {token} {token} {token} appears while discussing unrelated caching work"
+                );
+                let mut pages = vec![(answer.clone(), answer_body.clone())];
+                for d in 0..DISTRACTORS {
+                    pages.push((
+                        format!("notes/distract-{index:03}-{d}.md"),
+                        distractor_body.clone(),
+                    ));
+                }
+
+                for (path, body) in pages {
+                    now_ms += 1;
+                    let page_path = PagePath::new(&path).unwrap();
+                    let outcome = project
+                        .commit_page(CommitPageRequest {
+                            workspace_id: workspace.clone(),
+                            project_id: project_id.clone(),
+                            path: page_path,
+                            title: path.clone(),
+                            body: body.clone(),
+                            writer_id: writer.clone(),
+                            now_ms,
+                        })
+                        .await
+                        .unwrap();
+                    let mut doc = PageDoc {
+                        workspace_id: workspace.to_string(),
+                        project_id: project_id.to_string(),
+                        path: path.clone(),
+                        page_id: outcome.page_id.as_str().to_string(),
+                        title: path.clone(),
+                        body,
+                        updated_at_ms: now_ms,
+                        entities: Vec::new(),
+                        links: Vec::new(),
+                    };
+                    if keep_declared {
+                        doc.entities = entities::extract(&doc.body).entities;
+                    }
+                    docs.push(doc);
+                }
+            }
+            publish_split_index(
+                bucket.as_ref(),
+                &project,
+                &workspace,
+                &project_id,
+                &writer,
+                1,
+                &docs,
+                &build_root.path().join(project_name),
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Measure recall@k and MRR for each configuration.
+        let mut metrics: BTreeMap<&str, (f32, f32)> = BTreeMap::new();
+        for project_name in ["declared", "stripped"] {
+            let project_id = ProjectId::new(project_name).unwrap();
+            let cache = TempDir::new().unwrap();
+            let mut hits_at_k = 0usize;
+            let mut reciprocal_rank = 0.0f32;
+            for index in 0..PAGES {
+                let (token, answer) = &expected[&index];
+                let outcome = search_project(
+                    bucket.as_ref(),
+                    &project,
+                    &workspace,
+                    &project_id,
+                    cache.path(),
+                    token,
+                    TOP_K,
+                )
+                .await
+                .unwrap();
+                let rank = outcome
+                    .hits
+                    .iter()
+                    .position(|hit| &hit.path == answer)
+                    .map(|position| position + 1);
+                match rank {
+                    Some(rank) if rank <= TOP_K => {
+                        hits_at_k += 1;
+                        reciprocal_rank += 1.0 / rank as f32;
+                    }
+                    _ => {}
+                }
+            }
+            let recall = hits_at_k as f32 / PAGES as f32;
+            let mrr = reciprocal_rank / PAGES as f32;
+            println!("{project_name}: recall@{TOP_K}={recall:.3} mrr={mrr:.3}");
+            metrics.insert(project_name, (recall, mrr));
+        }
+
+        let (declared_recall, declared_mrr) = metrics["declared"];
+        let (stripped_recall, stripped_mrr) = metrics["stripped"];
+        // The declared corpus must answer almost every query in the top few…
+        assert!(
+            declared_recall >= 0.95,
+            "recall@{TOP_K} with declared entities was {declared_recall}"
+        );
+        assert!(declared_mrr >= 0.80, "mrr was {declared_mrr}");
+        // …and stripping the declared fields must actually hurt, or the metric
+        // is not measuring the streams it claims to.
+        assert!(
+            declared_mrr > stripped_mrr || stripped_recall < declared_recall,
+            "the evaluation cannot tell the configurations apart: declared={metrics:?}"
+        );
+    }
+
     #[tokio::test]
     async fn materialize_refuses_empty_prefix_and_empty_result() {
         let store = InMemory::new();
