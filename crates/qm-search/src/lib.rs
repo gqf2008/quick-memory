@@ -1415,7 +1415,10 @@ pub mod vector;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::consolidate::consolidate_session;
@@ -3834,6 +3837,620 @@ mod tests {
         assert!(
             after.hits.iter().any(|hit| hit.path == KEYWORD.0),
             "the rebuilt index must still answer: {after:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The end-to-end chain: a configured process against a real HTTP endpoint.
+    // ------------------------------------------------------------------
+
+    /// The model the chain starts with — the one `QM_EMBEDDING_MODEL` names
+    /// when the child publishes — and the one it switches to afterwards. Equal
+    /// width on purpose: that is the change [`ensure_split_model_matches`]
+    /// exists for.
+    const FIRST_MODEL: &str = "model-a";
+    const SECOND_MODEL: &str = "model-b";
+
+    /// What `QM_EMBEDDING_API_KEY` holds. Not a credential: the endpoint is the
+    /// stub below, in this process.
+    const STUB_KEY: &str = "stub-key";
+
+    /// What `QM_EMBEDDING_DIM` holds, and the width the stub answers with.
+    const DIM: usize = 4;
+
+    /// Prefixed to the child's report line so the parent can find it among the
+    /// test harness's own output.
+    const CHILD_MARKER: &str = "VECTOR_E2E_REPORT:";
+
+    /// One request, as it arrived.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        /// The request line, e.g. `POST /v1/embeddings HTTP/1.1`.
+        line: String,
+        /// The raw `authorization` header.
+        authorization: String,
+        /// The model the client asked for.
+        model: String,
+        /// The body it sent.
+        body: String,
+    }
+
+    /// A stub OpenAI-compatible embeddings endpoint, in this process.
+    ///
+    /// It answers from a hand-written "model" rather than a learned one: the
+    /// paraphrase page points the same way as the query, the keyword page is
+    /// orthogonal to it, and the query is itself. **Both model names get the
+    /// same numbers**, deliberately — that is the failure mode this area is
+    /// about. With equal widths and predictable coordinates, a removed identity
+    /// guard does not fail loudly: it returns the ranking that means nothing.
+    /// Whatever the guard contributes has to be visible against an endpoint
+    /// that would happily answer.
+    ///
+    /// One request per connection (the response says `connection: close`), so
+    /// the accept loop is one iteration per request and never has to multiplex
+    /// or time anything out.
+    struct StubModel {
+        address: SocketAddr,
+        seen: Arc<Mutex<Vec<SeenRequest>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StubModel {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binding the stub endpoint");
+            let address = listener.local_addr().expect("the stub's address");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let handle = std::thread::spawn({
+                let seen = Arc::clone(&seen);
+                let shutdown = Arc::clone(&shutdown);
+                move || {
+                    for stream in listener.incoming() {
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut stream) = stream else { break };
+                        let (record, response) = answer(&read_request(&mut stream));
+                        seen.lock().expect("the stub's request log").push(record);
+                        // Answer before anything else can go wrong here: a
+                        // client left waiting would hang the child instead of
+                        // failing it.
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                }
+            });
+            Self {
+                address,
+                seen,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}/v1", self.address)
+        }
+
+        /// Stop the accept loop and hand back everything it saw.
+        ///
+        /// The wake-up connection is what makes the blocking `accept` return —
+        /// no polling, and no timeout to tune.
+        fn finish(mut self) -> Vec<SeenRequest> {
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            let handle = self.handle.take().expect("the stub's thread");
+            handle.join().expect("the stub endpoint must not panic");
+            self.seen.lock().expect("the stub's request log").clone()
+        }
+    }
+
+    impl Drop for StubModel {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Read one HTTP request: its head, then exactly the `content-length` bytes
+    /// of body.
+    ///
+    /// A connection that ends early yields a short string rather than a panic,
+    /// so an unparseable request becomes a 400 the client sees — a failure, not
+    /// a hang in this thread.
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break buffer.len(),
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(head) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break head + 4;
+                    }
+                }
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..header_end]).to_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < header_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+        String::from_utf8_lossy(&buffer).to_string()
+    }
+
+    /// What one request was, and what to answer it.
+    ///
+    /// A request the stub cannot serve gets a 400 naming the problem, so a
+    /// client that sent the wrong thing fails through the provider's own error
+    /// path instead of panicking here.
+    fn answer(request: &str) -> (SeenRequest, String) {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap_or((request, ""));
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+        let model = parsed
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let inputs: Vec<&str> = parsed
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let record = SeenRequest {
+            line: head.lines().next().unwrap_or_default().to_string(),
+            authorization: head
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                .unwrap_or_default()
+                .to_string(),
+            model: model.clone(),
+            body: body.to_string(),
+        };
+        if model.is_empty() || inputs.is_empty() {
+            return (
+                record,
+                response(
+                    400,
+                    "Bad Request",
+                    r#"{"error":"the stub needs a model and inputs"}"#,
+                ),
+            );
+        }
+        let mut data = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let Some(vector) = vector_for(input) else {
+                let complaint = serde_json::json!({
+                    "error": format!("the stub was sent an input it does not know: {input:?}"),
+                })
+                .to_string();
+                return (record, response(400, "Bad Request", &complaint));
+            };
+            data.push(serde_json::json!({ "embedding": vector }));
+        }
+        let payload = serde_json::json!({ "model": model, "data": data }).to_string();
+        (record, response(200, "OK", &payload))
+    }
+
+    fn response(status: u16, reason: &str, payload: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+    }
+
+    /// The stub's "model": three texts it recognises and no others.
+    ///
+    /// Anything else is a 400, so a client that embedded the wrong text fails
+    /// loudly instead of scoring something plausible. `None` is what makes that
+    /// possible — there is no fallback vector that would quietly stand in.
+    fn vector_for(text: &str) -> Option<Vec<f32>> {
+        if text == text_for(PARAPHRASE.1, PARAPHRASE.2) {
+            Some(near_query())
+        } else if text == text_for(KEYWORD.1, KEYWORD.2) {
+            Some(orthogonal())
+        } else if text == QUERY {
+            Some(query_vector())
+        } else {
+            None
+        }
+    }
+
+    /// How `text` appears inside a JSON body: quoted, with newlines and anything
+    /// else serde escapes already escaped. Matching this against the raw request
+    /// pins the *exact* text that was embedded, where a bare substring would
+    /// also match a different one.
+    fn json_fragment(text: &str) -> String {
+        let quoted = serde_json::to_string(text).expect("a string always serialises");
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    /// What the only split in the catalog says about the embedder that built
+    /// its vectors: the machine's own record of its provenance.
+    async fn recorded_identity(
+        bucket: &Arc<dyn ObjectStore>,
+        workspace: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> EmbeddingIdentity {
+        let catalog = reader(bucket)
+            .load_catalog(workspace, project_id)
+            .await
+            .unwrap()
+            .catalog;
+        assert_eq!(
+            catalog.splits.len(),
+            1,
+            "premise: exactly one split to read the record from"
+        );
+        let materialised = TempDir::new().unwrap();
+        materialize(bucket, &catalog.splits[0].prefix, materialised.path())
+            .await
+            .unwrap();
+        read_split_identity(materialised.path())
+            .unwrap()
+            .expect("the split must record the embedder that built its vectors")
+    }
+
+    /// The whole chain over real HTTP: a *configured* process publishes,
+    /// searches, switches models, is refused, compacts, and recovers.
+    ///
+    /// Every other vector test here stands in for the provider with an
+    /// in-process `FakeEmbedder`, which pins the pieces but not the seams
+    /// between them: `QM_EMBEDDING_*` into [`vector::embedder_from_env`], a
+    /// provider that speaks actual HTTP, the identity it leaves on the split,
+    /// the guard that reads it back, and a rebuild that rewrites it. This test
+    /// runs that chain against a stub endpoint and asserts from both ends —
+    /// what the stub received, and what the child recorded.
+    ///
+    /// The chain runs in a child process because the configuration *is* the
+    /// environment, and `unsafe_code = "forbid"` makes `std::env::set_var` a
+    /// compile error: spawning a process with `QM_EMBEDDING_*` set is the only
+    /// way to hand them to `embedder_from_env`. The stub stays here, so this
+    /// test compares the model it put in the environment, the model the stub
+    /// saw on the wire, and the model the child wrote onto the split — three
+    /// independent ends of one value.
+    ///
+    /// The stub is not a model and says nothing about embedding quality. What
+    /// it proves is that a configured process, a real HTTP provider and the
+    /// split record fit together.
+    ///
+    /// Nothing here is timed: the wait for the child is a plain `output()`,
+    /// because every step the child takes is either local or answered by a stub
+    /// that always responds — including when it refuses a request. A stub that
+    /// died mid-request closes the connection and the child fails on it, so a
+    /// missing answer is an error rather than a wait.
+    #[test]
+    fn a_configured_process_runs_the_whole_vector_chain_over_real_http() {
+        let stub = StubModel::start();
+        let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--ignored",
+                "child_runs_the_configured_vector_chain",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("QM_E2E_CHILD", "1")
+            .env("QM_EMBEDDING_BASE_URL", stub.base_url())
+            .env("QM_EMBEDDING_API_KEY", STUB_KEY)
+            .env("QM_EMBEDDING_MODEL", FIRST_MODEL)
+            .env("QM_EMBEDDING_DIM", DIM.to_string())
+            .output()
+            .expect("running the child chain");
+        let stdout = String::from_utf8_lossy(&child.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&child.stderr).to_string();
+        let seen = stub.finish();
+
+        // Premises: the child really ran, and it ran exactly the one test it was
+        // asked for and reached the end of the chain.
+        assert!(child.status.success(), "the child chain failed:\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must run exactly `child_runs_the_configured_vector_chain`:\n{stdout}"
+        );
+        // The harness prints the test's name and then, under `--nocapture`, the
+        // captured output on the same line, so the marker is found rather than
+        // anchored — and the report ends where that line does.
+        let report: serde_json::Value = {
+            let start = stdout.find(CHILD_MARKER).expect("the child's report") + CHILD_MARKER.len();
+            let rest = &stdout[start..];
+            let line = rest.split('\n').next().unwrap_or(rest);
+            serde_json::from_str(line).expect("the child's report must be JSON")
+        };
+
+        // What crossed the wire. Four calls in one deterministic order: publish
+        // with the configured model, search with it, the rebuild with the second
+        // model, the search that follows. The refused search in between is
+        // *absent* from this list — the identity guard runs before the query is
+        // embedded, so a mismatch costs no request at all.
+        let models: Vec<&str> = seen.iter().map(|request| request.model.as_str()).collect();
+        assert_eq!(
+            models,
+            vec![FIRST_MODEL, FIRST_MODEL, SECOND_MODEL, SECOND_MODEL],
+            "the configured model must be what the provider was asked for, in order: {seen:#?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|request| request.line == "POST /v1/embeddings HTTP/1.1"),
+            "the provider must call the endpoint the base url names: {seen:#?}"
+        );
+        assert!(
+            seen.iter().all(|request| request
+                .authorization
+                .to_ascii_lowercase()
+                .contains(&format!("bearer {STUB_KEY}"))),
+            "every call must present the key from QM_EMBEDDING_API_KEY: {seen:#?}"
+        );
+
+        // What the calls carried. Both publish calls embed the whole corpus,
+        // as title, blank line, body; both searches embed the query.
+        let corpus_batch = vec![
+            json_fragment(&text_for(KEYWORD.1, KEYWORD.2)),
+            json_fragment(&text_for(PARAPHRASE.1, PARAPHRASE.2)),
+        ];
+        let expected: Vec<Vec<String>> = vec![
+            corpus_batch.clone(),
+            vec![json_fragment(QUERY)],
+            corpus_batch,
+            vec![json_fragment(QUERY)],
+        ];
+        for (request, fragments) in seen.iter().zip(&expected) {
+            for fragment in fragments {
+                assert!(
+                    request.body.contains(fragment),
+                    "the request must carry exactly {fragment:?}: {request:#?}"
+                );
+            }
+        }
+
+        // The child's record names the model that was really sent. This is the
+        // comparison the two-process shape exists for: the child wrote down what
+        // its embedder claimed, and the stub saw what that embedder sent.
+        assert_eq!(
+            report["published_identity"]["provider"].as_str(),
+            Some("openai-compatible"),
+            "{report}"
+        );
+        assert_eq!(report["published_identity"]["dim"], serde_json::json!(DIM));
+        assert_eq!(
+            report["published_identity"]["model"].as_str(),
+            Some(seen[0].model.as_str()),
+            "the split's record must name the model that went over the wire: {report}"
+        );
+        assert_eq!(
+            report["rebuilt_identity"]["model"].as_str(),
+            Some(seen[2].model.as_str()),
+            "the rebuilt split's record must name the model that went over the wire: {report}"
+        );
+
+        // The receipt: every step of the chain completed, in order. The child
+        // pushes a step only after that step's assertions passed, so this is
+        // what says the chain was walked rather than skipped.
+        assert_eq!(
+            report["steps"],
+            serde_json::json!([
+                "published",
+                "unconfigured-search",
+                "configured-search",
+                "refused",
+                "compacted",
+                "recovered"
+            ]),
+            "{report}"
+        );
+    }
+
+    /// The child half of
+    /// [`a_configured_process_runs_the_whole_vector_chain_over_real_http`],
+    /// for the reason that test's comment gives: the configuration has to be in
+    /// the environment at spawn time.
+    ///
+    /// Not runnable on its own — it needs `QM_EMBEDDING_*` pointing at a stub
+    /// that only the parent process runs. `#[ignore]` keeps it out of the
+    /// ordinary suite, and `QM_E2E_CHILD`, which only the parent sets, is the
+    /// first thing checked, so `cargo test -- --ignored` fails loudly here
+    /// rather than reaching out to whatever endpoint a developer's shell
+    /// happens to export.
+    #[tokio::test]
+    #[ignore = "driven by a_configured_process_runs_the_whole_vector_chain_over_real_http, which supplies QM_EMBEDDING_* and its stub endpoint"]
+    async fn child_runs_the_configured_vector_chain() {
+        assert_eq!(
+            std::env::var("QM_E2E_CHILD").as_deref(),
+            Ok("1"),
+            "this test is driven by \
+             a_configured_process_runs_the_whole_vector_chain_over_real_http, which supplies \
+             QM_EMBEDDING_* and a stub endpoint; it cannot run on its own"
+        );
+        let configured_model =
+            std::env::var("QM_EMBEDDING_MODEL").expect("the parent sets QM_EMBEDDING_MODEL");
+        let configured_key =
+            std::env::var("QM_EMBEDDING_API_KEY").expect("the parent sets QM_EMBEDDING_API_KEY");
+        let base_url =
+            std::env::var("QM_EMBEDDING_BASE_URL").expect("the parent sets QM_EMBEDDING_BASE_URL");
+
+        // The provider the *operator* configured: this is the value the whole
+        // chain runs through, so it is only as real as the environment it was
+        // handed.
+        let configured = vector::embedder_from_env()
+            .expect("a fully configured endpoint must build")
+            .expect("QM_EMBEDDING_BASE_URL is set, so there is a provider");
+        // Premise: the environment reached the provider intact. A test that
+        // constructs the provider by hand cannot see this link.
+        assert_eq!(configured.identity().model, configured_model);
+        assert_eq!(configured.identity().dim, DIM);
+        assert_eq!(configured.identity().provider, "openai-compatible");
+
+        let mut steps = Vec::new();
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+
+        // 1. Publish: the corpus goes out as one batch, comes back as vectors,
+        //    and lands on the split with the identity that produced them.
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            Some(&*configured),
+        )
+        .await;
+        assert_eq!(
+            splits_in_catalog(&bucket, &workspace, &project_id).await,
+            1,
+            "premise: exactly one published split"
+        );
+        let published = recorded_identity(&bucket, &workspace, &project_id).await;
+        assert_eq!(published.provider, "openai-compatible");
+        assert_eq!(
+            published.model, configured_model,
+            "the split must record the model QM_EMBEDDING_MODEL named"
+        );
+        assert_eq!(published.dim, DIM);
+        steps.push("published");
+
+        // 2. Without a provider the same query has no vector stream at all.
+        //    Premise first: the vector stream is the only thing that could
+        //    reach the paraphrase, so its absence really is its absence.
+        assert!(
+            !text_for(PARAPHRASE.1, PARAPHRASE.2).contains(QUERY),
+            "the paraphrase must not share the query's words"
+        );
+        let unconfigured =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, None).await;
+        assert_eq!(
+            unconfigured.stream_candidates.get("vector"),
+            None,
+            "an unconfigured machine must not run the vector stream: {unconfigured:?}"
+        );
+        assert!(
+            !unconfigured.hits.iter().any(|hit| hit.path == PARAPHRASE.0),
+            "only the vector stream can reach the paraphrase: {unconfigured:?}"
+        );
+        steps.push("unconfigured-search");
+
+        // 3. With it, the same page is recalled *through the vector stream*.
+        let recalled =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&*configured)).await;
+        assert!(
+            recalled
+                .stream_candidates
+                .get("vector")
+                .is_some_and(|count| *count > 0),
+            "premise: the vector stream ran and proposed candidates: {recalled:?}"
+        );
+        assert!(
+            recalled.hits.iter().any(|hit| hit.path == PARAPHRASE.0
+                && hit.streams.iter().any(|stream| stream == "vector")),
+            "the configured provider must recall the paraphrase through the vector stream: {recalled:?}"
+        );
+        steps.push("configured-search");
+
+        // 4. The same endpoint, the same key, one different word: a second model
+        //    of the same width. The published vectors are not comparable to it,
+        //    and the read path refuses rather than ranking them.
+        let second =
+            qm_llm::OpenAiCompatEmbedder::new(&base_url, &configured_key, SECOND_MODEL, DIM)
+                .expect("the second provider");
+        let error =
+            search_with_embedder_result(&bucket, &workspace, &project_id, QUERY, Some(&second))
+                .await
+                .expect_err("a same-width model change must be refused, not ranked");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("model '{configured_model}'")),
+            "the refusal must name the model the split records: {message}"
+        );
+        assert!(
+            message.contains(&format!("model '{SECOND_MODEL}'")),
+            "the refusal must name the model this machine is configured with: {message}"
+        );
+        steps.push("refused");
+
+        // 5. Compact re-embeds the live pages with the current provider and
+        //    replaces the catalog, which is what `docs/ops.md` tells an operator
+        //    to do after a model change.
+        let outcome = compact_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            &WriterId::new("compactor").unwrap(),
+            &build_root.path().join("compact"),
+            100,
+            60_000,
+            Some(&second),
+        )
+        .await
+        .expect("compaction");
+        assert!(!outcome.skipped, "{outcome:?}");
+        assert_eq!(
+            outcome.splits_after, 1,
+            "compaction replaces the catalog rather than appending to it: {outcome:?}"
+        );
+        let rebuilt = recorded_identity(&bucket, &workspace, &project_id).await;
+        assert_eq!(rebuilt.provider, "openai-compatible");
+        assert_eq!(
+            rebuilt.model, SECOND_MODEL,
+            "the rebuilt split must state the provider that rebuilt it"
+        );
+        assert_eq!(rebuilt.dim, DIM);
+        steps.push("compacted");
+
+        // 6. The same query answers again, through the vector stream, over the
+        //    same set of pages.
+        let recovered =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&second)).await;
+        assert!(
+            recovered
+                .stream_candidates
+                .get("vector")
+                .is_some_and(|count| *count > 0),
+            "premise: the rebuilt split carries vectors: {recovered:?}"
+        );
+        assert!(
+            recovered.hits.iter().any(|hit| hit.path == PARAPHRASE.0
+                && hit.streams.iter().any(|stream| stream == "vector")),
+            "the rebuilt index must recall the paraphrase again: {recovered:?}"
+        );
+        let sorted_paths = |outcome: &SearchOutcome| {
+            let mut paths: Vec<String> = outcome.hits.iter().map(|hit| hit.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(
+            sorted_paths(&recovered),
+            sorted_paths(&recalled),
+            "re-embedding must not change which pages a search returns"
+        );
+        steps.push("recovered");
+
+        // The receipt the parent compares against what its stub received.
+        println!(
+            "{CHILD_MARKER}{}",
+            serde_json::json!({
+                "published_identity": published,
+                "rebuilt_identity": rebuilt,
+                "steps": steps,
+            })
         );
     }
 
