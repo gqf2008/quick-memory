@@ -1431,15 +1431,23 @@ pub mod vector;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::consolidate::consolidate_session;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
-    use qm_core::{PagePath, SessionId, WriterId};
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+    use qm_core::{PagePath, SessionId, WriterId, manifest_shard_index};
     use qm_llm::{EmbedFuture, Embedder};
     use qm_store::{CommitPageRequest, RetryPolicy};
     use tempfile::TempDir;
@@ -4740,5 +4748,726 @@ mod tests {
         assert!(vector::cosine(&[f32::NAN, 0.0], &[1.0, 0.0]).is_err());
         // Positive control: the same call with a defined pair answers 1.0.
         assert!((vector::cosine(&[2.0, 0.0], &[0.5, 0.0]).unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    // ---- The authority check reads only the shards it has to ----------------
+
+    /// The scope every test in this section reads and writes.
+    const SCOPE: &str = "v1/ws/acme/proj/ai-memory";
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId::new("acme").unwrap()
+    }
+
+    fn proj() -> ProjectId {
+        ProjectId::new("ai-memory").unwrap()
+    }
+
+    /// A bucket that records the object keys a call actually read.
+    ///
+    /// The claim under test is *which* objects the authority check fetches, so
+    /// the assertion has to be about the set of keys. A count would be
+    /// satisfied by a reader that fetched one shard twice and never asked for
+    /// another — the exact shape of the mistake this pins.
+    #[derive(Debug)]
+    struct RecordingStore {
+        /// Shared, so a test can seed and inspect the same bucket through a raw
+        /// handle and have the recording not see any of that.
+        inner: Arc<InMemory>,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStore {
+        fn new(inner: Arc<InMemory>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Forget what has been read, so a test can time one call.
+        fn reset(&self) {
+            self.reads.lock().unwrap().clear();
+        }
+
+        /// The manifest objects read since the last [`Self::reset`], sorted.
+        ///
+        /// Sorted, so the comparison is a set comparison: the order reads come
+        /// back in is the bucket's business, not the answer's.
+        fn manifest_reads(&self) -> Vec<String> {
+            let mut out: Vec<String> = self
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| key.starts_with(SCOPE) && key.contains("/manifest"))
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        }
+    }
+
+    impl std::fmt::Display for RecordingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingStore({})", self.inner)
+        }
+    }
+
+    impl ObjectStore for RecordingStore {
+        fn put_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<PutResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.put_opts(location, payload, opts).await })
+        }
+
+        fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = object_store::Result<Box<dyn MultipartUpload>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.put_multipart_opts(location, opts).await })
+        }
+
+        fn get_opts<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 ObjectPath,
+            options: GetOptions,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<GetResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                let out = self.inner.get_opts(location, options).await;
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push(location.as_ref().to_string());
+                out
+            })
+        }
+
+        fn delete<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            location: &'life1 ObjectPath,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.delete(location).await })
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            prefix: Option<&'life1 ObjectPath>,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<ListResult>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.list_with_delimiter(prefix).await })
+        }
+
+        fn copy<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 ObjectPath,
+            to: &'life2 ObjectPath,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.copy(from, to).await })
+        }
+
+        fn copy_if_not_exists<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            from: &'life1 ObjectPath,
+            to: &'life2 ObjectPath,
+        ) -> Pin<Box<dyn Future<Output = object_store::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.copy_if_not_exists(from, to).await })
+        }
+    }
+
+    /// The commit point the bucket holds, read through a raw handle.
+    ///
+    /// Expected values come from here rather than from the store's own reader,
+    /// so an assertion about what a search read is about the persisted layout
+    /// and not about the code under test.
+    async fn persisted_root(bucket: &Arc<InMemory>) -> qm_core::ManifestRoot {
+        let key = ObjectPath::from(format!("{SCOPE}/manifest.json"));
+        let bytes = bucket.get(&key).await.unwrap().bytes().await.unwrap();
+        serde_json::from_slice(&bytes).expect("the premise: the scope is stored sharded")
+    }
+
+    /// The key of the shard the commit point names for `path`.
+    ///
+    /// Not "every shard whose body says `shard: n`": a shard is immutable and
+    /// content-addressed, so the bucket also keeps the shards *earlier* commit
+    /// points named, and more than one object can carry the same index. The one
+    /// that answers for `path` is the one the current root names.
+    async fn shard_key_for(bucket: &Arc<InMemory>, path: &str) -> String {
+        let root = persisted_root(bucket).await;
+        let index = manifest_shard_index(path);
+        root.shard(index)
+            .unwrap_or_else(|| panic!("the root names no shard {index}, for {path}"))
+            .key
+            .clone()
+    }
+
+    /// A reader over the recording bucket, in the storage form `format` names.
+    fn recording_reader(recording: &Arc<RecordingStore>, format: u32) -> ProjectStore {
+        ProjectStore::new(Arc::clone(recording) as Arc<dyn ObjectStore>, "v1")
+            .with_manifest_format(format)
+            .with_retry(RetryPolicy {
+                max_attempts: 64,
+                base_delay: Duration::ZERO,
+            })
+    }
+
+    /// Commit `body` at `path`, then publish a one-document split holding it.
+    ///
+    /// The split is what a search finds; the commit point is what decides
+    /// whether what it found is still current.
+    async fn commit_and_publish(
+        store: &ProjectStore,
+        bucket: &Arc<dyn ObjectStore>,
+        writer: &WriterId,
+        seq: u64,
+        path: &str,
+        body: &str,
+        now_ms: i64,
+    ) {
+        let (workspace, project_id) = (ws(), proj());
+        let page_path = PagePath::new(path).unwrap();
+        store
+            .commit_page(CommitPageRequest {
+                workspace_id: workspace.clone(),
+                project_id: project_id.clone(),
+                path: page_path.clone(),
+                title: path.to_string(),
+                body: body.to_string(),
+                writer_id: writer.clone(),
+                now_ms,
+            })
+            .await
+            .expect("commit");
+        let page = store
+            .read_page(&workspace, &project_id, &page_path)
+            .await
+            .expect("read")
+            .expect("page");
+        let doc = PageDoc::from_version(&workspace, &project_id, &page, now_ms);
+        let build = TempDir::new().unwrap();
+        publish_split_index(
+            bucket.as_ref(),
+            store,
+            &workspace,
+            &project_id,
+            writer,
+            seq,
+            &[doc],
+            build.path(),
+            now_ms,
+        )
+        .await
+        .expect("publish split");
+    }
+
+    /// One page per `(path, body)`, all published in a single split.
+    async fn scope_with_one_split(
+        raw: &Arc<InMemory>,
+        format: u32,
+        pages: &[(String, String)],
+    ) -> ProjectStore {
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(raw) as Arc<dyn ObjectStore>;
+        let store = ProjectStore::new(Arc::clone(&bucket), "v1").with_manifest_format(format);
+        let writer = WriterId::new("mbp-a").unwrap();
+        let mut docs = Vec::new();
+        for (index, (path, body)) in pages.iter().enumerate() {
+            let now_ms = 1_000 + index as i64;
+            let page_path = PagePath::new(path.as_str()).unwrap();
+            store
+                .commit_page(CommitPageRequest {
+                    workspace_id: ws(),
+                    project_id: proj(),
+                    path: page_path.clone(),
+                    title: path.clone(),
+                    body: body.clone(),
+                    writer_id: writer.clone(),
+                    now_ms,
+                })
+                .await
+                .expect("commit");
+            let page = store
+                .read_page(&ws(), &proj(), &page_path)
+                .await
+                .expect("read")
+                .expect("page");
+            docs.push(PageDoc::from_version(&ws(), &proj(), &page, now_ms));
+        }
+        let build = TempDir::new().unwrap();
+        publish_split_index(
+            bucket.as_ref(),
+            &store,
+            &ws(),
+            &proj(),
+            &writer,
+            1,
+            &docs,
+            build.path(),
+            9_000,
+        )
+        .await
+        .expect("publish split");
+        store
+    }
+
+    /// A corpus of 60 paths, with `hit_token` given to three paths that land in
+    /// three different shards.
+    fn spread_corpus(hit_token: &str) -> Vec<(String, String)> {
+        let mut pages: Vec<(String, String)> = (0..60)
+            .map(|index| {
+                (
+                    format!("notes/page-{index:03}.md"),
+                    "ordinary note".to_string(),
+                )
+            })
+            .collect();
+        // Three paths in three *different* shards, so the expected read set is
+        // the root plus three shards rather than an accident of two paths
+        // colliding on one.
+        let mut indices = BTreeSet::new();
+        let chosen: Vec<String> = pages
+            .iter()
+            .filter(|(path, _)| indices.insert(manifest_shard_index(path)))
+            .take(3)
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            chosen.len(),
+            3,
+            "the premise: 60 paths must reach at least 3 distinct shards"
+        );
+        for (path, body) in pages.iter_mut() {
+            if chosen.contains(path) {
+                *body = format!("{hit_token} note");
+            }
+        }
+        pages
+    }
+
+    /// A scope with one live page, one superseded page whose old version is the
+    /// only copy in its split, and one deleted page whose document is still in
+    /// its split.
+    ///
+    /// Those last two are the candidates the authority check exists to refuse.
+    async fn scope_with_stale_and_deleted(format: u32) -> (Arc<InMemory>, Arc<RecordingStore>) {
+        let raw = Arc::new(InMemory::new());
+        let bucket: Arc<dyn ObjectStore> = Arc::clone(&raw) as Arc<dyn ObjectStore>;
+        let store = ProjectStore::new(Arc::clone(&bucket), "v1").with_manifest_format(format);
+
+        // Three splits, one per page, each written by its own machine.
+        for (index, (writer, path, body)) in [
+            ("mbp-a", "notes/live.md", "zephyrquill note"),
+            ("mbp-b", "notes/superseded.md", "quorumstone note"),
+            ("mbp-c", "notes/removed.md", "removalmark note"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            commit_and_publish(
+                &store,
+                &bucket,
+                &WriterId::new(writer).unwrap(),
+                1,
+                path,
+                body,
+                1_000 + index as i64,
+            )
+            .await;
+        }
+        // The superseded path's newer version is committed but never published,
+        // so the split keeps proposing the version the commit point dropped.
+        store
+            .commit_page(CommitPageRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                path: PagePath::new("notes/superseded.md").unwrap(),
+                title: "notes/superseded.md".to_string(),
+                body: "replacement note".to_string(),
+                writer_id: WriterId::new("mbp-d").unwrap(),
+                now_ms: 2_000,
+            })
+            .await
+            .expect("supersede");
+        // The deleted path keeps its document in the split; the commit point
+        // gains a tombstone instead.
+        store
+            .delete_page(
+                &ws(),
+                &proj(),
+                &PagePath::new("notes/removed.md").unwrap(),
+                &WriterId::new("mbp-e").unwrap(),
+                2_100,
+            )
+            .await
+            .expect("delete");
+
+        let recording = RecordingStore::new(Arc::clone(&raw));
+        (raw, recording)
+    }
+
+    /// A search must fetch the root pointer and the shards its candidates land
+    /// in — not every shard in the scope.
+    #[tokio::test]
+    async fn a_sharded_search_reads_only_the_shards_its_candidates_land_in() {
+        const HIT_TOKEN: &str = "zephyrquill";
+        let raw = Arc::new(InMemory::new());
+        let pages = spread_corpus(HIT_TOKEN);
+        scope_with_one_split(&raw, qm_core::MANIFEST_FORMAT_SHARDED, &pages).await;
+
+        let recording = RecordingStore::new(Arc::clone(&raw));
+        let reader = recording_reader(&recording, qm_core::MANIFEST_FORMAT_SHARDED);
+        let cache = TempDir::new().unwrap();
+
+        recording.reset();
+        let outcome = search_project(
+            recording.as_ref(),
+            &reader,
+            &ws(),
+            &proj(),
+            cache.path(),
+            HIT_TOKEN,
+            10,
+        )
+        .await
+        .expect("search");
+
+        // Premises: the token matches exactly the three paths this test gave it
+        // to, and the authority check let all three through. Without them the
+        // read-set assertion below could be about a search that found nothing.
+        let mut hit_paths: Vec<String> = outcome.hits.iter().map(|hit| hit.path.clone()).collect();
+        hit_paths.sort();
+        let mut expected_paths: Vec<String> = pages
+            .iter()
+            .filter(|(_, body)| body.contains(HIT_TOKEN))
+            .map(|(path, _)| path.clone())
+            .collect();
+        expected_paths.sort();
+        assert_eq!(
+            expected_paths.len(),
+            3,
+            "the premise: the corpus gives the token to three paths"
+        );
+        assert_eq!(
+            hit_paths, expected_paths,
+            "the premise: the token matches exactly those three paths"
+        );
+        assert_eq!(
+            outcome.filtered_out, 0,
+            "the premise: nothing in this corpus is stale"
+        );
+
+        // The answer: the root pointer and the three shards those paths hash
+        // to, as a set of keys.
+        let mut expected = vec![format!("{SCOPE}/manifest.json")];
+        for path in &expected_paths {
+            expected.push(shard_key_for(&raw, path).await);
+        }
+        expected.sort();
+        assert_eq!(
+            expected.len(),
+            4,
+            "the premise: three paths in three shards, plus the root: {expected:?}"
+        );
+        assert_eq!(
+            recording.manifest_reads(),
+            expected,
+            "the authority check must read the root and only the shards its \
+             candidates land in"
+        );
+
+        // And the scope really does commit more shards than that, so the
+        // equality above is not "it read everything" in disguise.
+        let root = persisted_root(&raw).await;
+        assert!(
+            root.shards.len() > 3,
+            "the premise: 60 paths must spread over more than three shards, got {}",
+            root.shards.len()
+        );
+    }
+
+    /// The whole form has one commit-point object, and the check reads exactly
+    /// that one — the change is about the sharded form only.
+    #[tokio::test]
+    async fn a_whole_search_reads_exactly_the_one_manifest_object() {
+        const HIT_TOKEN: &str = "zephyrquill";
+        let raw = Arc::new(InMemory::new());
+        let pages = spread_corpus(HIT_TOKEN);
+        scope_with_one_split(&raw, qm_core::MANIFEST_FORMAT_WHOLE, &pages).await;
+
+        let recording = RecordingStore::new(Arc::clone(&raw));
+        let reader = recording_reader(&recording, qm_core::MANIFEST_FORMAT_WHOLE);
+        let cache = TempDir::new().unwrap();
+
+        recording.reset();
+        let outcome = search_project(
+            recording.as_ref(),
+            &reader,
+            &ws(),
+            &proj(),
+            cache.path(),
+            HIT_TOKEN,
+            10,
+        )
+        .await
+        .expect("search");
+
+        // Premise: the search really did check three candidates against the
+        // commit point, so "one object" is not "nothing to check".
+        assert_eq!(outcome.hits.len(), 3, "{:?}", outcome.hits);
+        assert_eq!(outcome.filtered_out, 0);
+        assert_eq!(
+            recording.manifest_reads(),
+            vec![format!("{SCOPE}/manifest.json")],
+            "the whole form is a single object, read once"
+        );
+    }
+
+    /// The storage form must not change the answer: same hits, same
+    /// `filtered_out`, same streams — including the two ways a candidate the
+    /// split still proposes can be stale.
+    #[tokio::test]
+    async fn both_forms_answer_identically_including_stale_and_deleted_candidates() {
+        let (whole_raw, whole_recording) =
+            scope_with_stale_and_deleted(qm_core::MANIFEST_FORMAT_WHOLE).await;
+        let (sharded_raw, sharded_recording) =
+            scope_with_stale_and_deleted(qm_core::MANIFEST_FORMAT_SHARDED).await;
+        let whole = recording_reader(&whole_recording, qm_core::MANIFEST_FORMAT_WHOLE);
+        let sharded = recording_reader(&sharded_recording, qm_core::MANIFEST_FORMAT_SHARDED);
+
+        for (query, expected_hits, expected_candidates, expected_filtered) in [
+            ("zephyrquill", vec!["notes/live.md"], 1usize, 0usize),
+            ("quorumstone", vec![], 1, 1),
+            ("removalmark", vec![], 1, 1),
+            ("note", vec!["notes/live.md"], 3, 2),
+        ] {
+            let from_whole = search_project(
+                whole_recording.as_ref(),
+                &whole,
+                &ws(),
+                &proj(),
+                TempDir::new().unwrap().path(),
+                query,
+                10,
+            )
+            .await
+            .expect("whole search");
+            let from_shards = search_project(
+                sharded_recording.as_ref(),
+                &sharded,
+                &ws(),
+                &proj(),
+                TempDir::new().unwrap().path(),
+                query,
+                10,
+            )
+            .await
+            .expect("sharded search");
+
+            let paths: Vec<&str> = from_whole
+                .hits
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect();
+            assert_eq!(
+                paths, expected_hits,
+                "the premise: what `{query}` should match and keep"
+            );
+            assert_eq!(
+                from_whole.candidates, expected_candidates,
+                "the premise: how many documents the split proposed for `{query}`"
+            );
+            assert_eq!(
+                from_whole.filtered_out, expected_filtered,
+                "the premise: how many of them the commit point refuses for `{query}`"
+            );
+            if expected_filtered > 0 {
+                // The negative case is only real when the split actually
+                // proposed something the commit point then refused.
+                assert!(
+                    from_whole.candidates > from_whole.hits.len(),
+                    "the premise: `{query}` must reach a candidate the authority \
+                     check has to refuse: {:?}",
+                    from_whole
+                );
+            }
+            assert_eq!(
+                from_whole, from_shards,
+                "the storage form must not change the answer to `{query}`"
+            );
+        }
+
+        // The sharded side is not merely equal to a whole side that read
+        // nothing: three pages, three splits, three shards of the commit point.
+        assert_eq!(
+            persisted_root(&sharded_raw).await.shards.len(),
+            3,
+            "the premise: the corpus spreads over three shards"
+        );
+        let shard_prefix = ObjectPath::from(format!("{SCOPE}/manifest/shards"));
+        assert!(
+            futures::StreamExt::next(&mut whole_raw.list(Some(&shard_prefix)))
+                .await
+                .is_none(),
+            "the premise: the whole form stores no shard objects at all"
+        );
+    }
+
+    /// A read that fetches less cannot report damage it never looked at.
+    ///
+    /// The authority check reads the shards its candidates land in, so a corrupt
+    /// shard no candidate lands in does not fail the search — and the layer that
+    /// does read everything, `verify_project`, still says so. Both halves are
+    /// asserted here, because "search still answers" alone would also pass on a
+    /// bucket where nothing was wrong.
+    #[tokio::test]
+    async fn a_corrupt_shard_no_candidate_lands_in_is_verify_s_problem_not_search_s() {
+        const HIT_TOKEN: &str = "zephyrquill";
+        let raw = Arc::new(InMemory::new());
+        let pages = spread_corpus(HIT_TOKEN);
+        scope_with_one_split(&raw, qm_core::MANIFEST_FORMAT_SHARDED, &pages).await;
+
+        let recording = RecordingStore::new(Arc::clone(&raw));
+        let reader = recording_reader(&recording, qm_core::MANIFEST_FORMAT_SHARDED);
+
+        let before = search_project(
+            recording.as_ref(),
+            &reader,
+            &ws(),
+            &proj(),
+            TempDir::new().unwrap().path(),
+            HIT_TOKEN,
+            10,
+        )
+        .await
+        .expect("search");
+        assert_eq!(before.hits.len(), 3, "{:?}", before.hits);
+        let hit_paths: BTreeSet<String> = before.hits.iter().map(|hit| hit.path.clone()).collect();
+        let hit_shards: BTreeSet<u16> = hit_paths
+            .iter()
+            .map(|path| manifest_shard_index(path))
+            .collect();
+
+        // A path whose shard holds no candidate: nothing the check has to
+        // consult, so that shard is one it has no reason to read.
+        let victim = pages
+            .iter()
+            .map(|(path, _)| path.clone())
+            .find(|path| {
+                !hit_paths.contains(path) && !hit_shards.contains(&manifest_shard_index(path))
+            })
+            .expect("the premise: 60 paths over ~53 shards leave a shard with no hit");
+        let victim_key = shard_key_for(&raw, &victim).await;
+
+        // Premise: that shard's own body names none of the paths the search
+        // keeps, so the search has no reason to read it.
+        let body = raw
+            .get(&ObjectPath::from(victim_key.clone()))
+            .await
+            .expect("the victim shard is in the bucket")
+            .bytes()
+            .await
+            .unwrap();
+        let shard: qm_core::ManifestShard = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !shard.pages.keys().any(|path| hit_paths.contains(path)),
+            "the premise: {victim_key} holds no candidate path: {:?}",
+            shard.pages.keys().collect::<Vec<_>>()
+        );
+
+        // Damage it where it lies: the same key, different bytes.
+        raw.put(
+            &ObjectPath::from(victim_key.clone()),
+            PutPayload::from_static(b"not a manifest shard"),
+        )
+        .await
+        .expect("overwrite the shard");
+
+        recording.reset();
+        let after = search_project(
+            recording.as_ref(),
+            &reader,
+            &ws(),
+            &proj(),
+            TempDir::new().unwrap().path(),
+            HIT_TOKEN,
+            10,
+        )
+        .await
+        .expect("a shard the check never reads cannot fail the search");
+        assert_eq!(
+            after, before,
+            "the answer is the same down to the scores: the corrupt shard was not consulted"
+        );
+        assert!(
+            !recording.manifest_reads().contains(&victim_key),
+            "the premise: the search really did not read {victim_key}: {:?}",
+            recording.manifest_reads()
+        );
+
+        // The layer that reads every shard reports it.
+        let report = reader
+            .verify_project(&ws(), &proj())
+            .await
+            .expect("verify reports damage as problems, not as an error");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.detail.contains(&victim_key)),
+            "verify must name the corrupt shard: {:?}",
+            report.problems
+        );
     }
 }
