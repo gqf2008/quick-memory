@@ -374,7 +374,7 @@ manifest.json                        # 唯一提交点；可变对象，CAS；`f
 manifest/shards/<content_hash>.json  # 不可变分片，内容寻址
   schema, format, workspace_id, project_id, shard, pages, tombstones
 
-manifest/archive/<content_hash>.json # 迁移前那一份整份对象，只增不删
+manifest/archive/<content_hash>.json # 迁移前那一份整份对象；迁移只写不删（回收见"迁移与回滚"）
 ```
 
 - **一次提交 = 一次 CAS**：写新分片（不可变、内容寻址），再 CAS 根指针。根指针的 `seq` 仍然
@@ -406,7 +406,7 @@ manifest/archive/<content_hash>.json # 迁移前那一份整份对象，只增�
 | `recent_pages` | 根指针 + **全部分片** | 全局按时间排序需要看全 |
 | `digest` 的页面段 | 只读 commit log，不读 manifest | 与形态无关 |
 | `verify` 的权威层检查 | 根指针 + 全部分片 + 每片的 archive 校验 | 报告 `shards` 与 predecessor 问题 |
-| `gc` 的可达性 | 根指针 + 全部分片（一次读全，然后逐 path 走链时不再重读） | 分片与 archive 都进 live 集合 |
+| `gc` 的可达性 | 根指针 + 全部分片（一次读全，然后逐 path 走链时不再重读） | **根指针还在时**分片与 archive 进 live 集合；回滚成整份之后它们不再被引用 |
 | `search` 的可见性校验 | 根指针 + **全部分片** | **未做**的优化：设计上可以只读候选命中的片 |
 
 ### 上限
@@ -442,7 +442,11 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
    `predecessor` 指向它。回滚是**再写一次**整份 manifest：把当前分片 materialize 成整份形态，
    走一次 CAS（不是"把指针换回旧对象"）。
    这一点是刻意的：从 archive 恢复会静默丢掉迁移之后的所有提交，materialize 不会。
-   archive 与分片都留在桶里（`gc` 也把它们算成 live）。
+   archive 与分片都留在桶里，但**live 的条件是根指针还在**：只要提交点还是分片形态，`gc` 就把每一片
+   与 `predecessor` 指向的 archive 都算作"活"；一旦回滚成整份形态，它们不再被**任何东西**引用，
+   `qm gc` 会在宽限期之后把它们回收——回滚本身**不删除**任何东西，`verify` 在那之前都能读到 archive。
+   所以"回滚之后还能长期从 archive 做字节级考古"并不成立：要保留它，就别在回滚后的 scope 上跑
+   `gc --apply`。
 4. **迁移期间不阻塞读**：读按 `format` 分派，所以整份与分片两种形态同时可读。写竞争由 CAS 重试
    兜住（迁移与写者互不协调，见下）。
 
