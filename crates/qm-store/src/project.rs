@@ -11,6 +11,7 @@
 //! changed) and tries again. No machine has to know another exists.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -198,6 +199,36 @@ enum PathSource {
         root: Box<ManifestRoot>,
         shard: ManifestShard,
     },
+}
+
+/// What the commit point names for a set of paths, read without loading the
+/// paths around them.
+///
+/// The same answer [`Manifest::is_current`] gives, restricted to the paths the
+/// caller asked about: this is a visibility question — "is this exact page
+/// version still the head of this path?" — not a way to read a project. Like
+/// [`PathState`], the point is that the rest of the scope was never fetched,
+/// which is why the answer is a map of page ids rather than a `Manifest`: there
+/// is no page list in here to hand to something that would list pages.
+#[derive(Debug, Clone)]
+pub struct PathHeads {
+    /// Current page id per asked-for path. A path the commit point does not
+    /// name — superseded, deleted, or never committed — is simply absent.
+    page_ids: BTreeMap<String, qm_core::PageId>,
+}
+
+impl PathHeads {
+    /// Whether the commit point still names this exact page version for `path`.
+    ///
+    /// The one visibility rule a reader may use, and the same rule
+    /// [`Manifest::is_current`] applies: a tombstone, a superseded version, and
+    /// a page id the commit point never named all answer `false`.
+    #[must_use]
+    pub fn is_current(&self, path: &str, page_id: &str) -> bool {
+        self.page_ids
+            .get(path)
+            .is_some_and(|current| current.as_str() == page_id)
+    }
 }
 
 /// A commit-point write, encoded and checked before anything is written.
@@ -653,6 +684,24 @@ fn encode_root(
     Ok(bytes)
 }
 
+/// The shard the root names for `index`, if it names one.
+///
+/// The one place in this module that decides which shard answers for a shard
+/// index: the single-path read ([`ProjectStore::load_path`]) and the batched
+/// one ([`ProjectStore::load_path_heads`]) both ask here, so that rule cannot
+/// change on one route alone. It forwards to [`ManifestRoot::shard`] — the
+/// definition itself is qm-core's — and what it pins down is that both readers
+/// arrive at it the same way.
+///
+/// `None` means the root names no shard for this index, i.e. nothing was ever
+/// committed under it. Each caller handles that in the way its own answer
+/// allows: `load_path` materialises an empty shard, because "no entry for this
+/// path" is a normal state; `load_path_heads` reads nothing, because a root
+/// that names no shard cannot name any of its paths either.
+fn shard_ref_for(root: &ManifestRoot, index: u16) -> Option<&ShardRef> {
+    root.shard(index)
+}
+
 /// Check the bytes read for a shard against the layout entry that named them.
 ///
 /// A shard's key is its content hash, so a root that points at the wrong
@@ -827,7 +876,7 @@ impl ProjectStore {
                     // would hold it. That is a normal state, not a missing
                     // object — an empty scope materialises no shards at all.
                     let index = manifest_shard_index(path.as_str());
-                    let shard = match root.shard(index) {
+                    let shard = match shard_ref_for(&root, index) {
                         Some(reference) => self.read_shard(reference).await?,
                         None => {
                             ManifestShard::empty(workspace_id.clone(), project_id.clone(), index)
@@ -840,6 +889,87 @@ impl ProjectStore {
                         version: Some(version),
                         source: PathSource::Sharded { root, shard },
                     })
+                }
+            },
+        }
+    }
+
+    /// The current page id for each of `paths`, read without loading the paths
+    /// around them.
+    ///
+    /// The whole form lives in one object, so this reads that object and looks
+    /// the paths up. The sharded form reads the root pointer and, of the shards
+    /// it names, only the ones an asked-for path hashes to: a search whose
+    /// candidates land in `k` shards fetches those `k`, not all
+    /// [`qm_core::MANIFEST_SHARD_COUNT`] of them. Paths that hash to the same
+    /// shard cost one read between them, and an index the root does not name is
+    /// not read at all — nothing was ever committed under it.
+    ///
+    /// The answers are the ones [`Self::load`] would give for the same paths.
+    /// This is the same state reached by a shorter route, and
+    /// `a_scoped_read_matches_the_full_read_in_every_format` pins the
+    /// single-path form of that.
+    ///
+    /// # Errors
+    /// Propagates backend, decode, and layout failures, including a shard whose
+    /// bytes disagree with the hash the root recorded for it.
+    pub async fn load_path_heads(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        paths: &[String],
+    ) -> Result<PathHeads, StoreError> {
+        let key = self.layout.manifest(workspace_id, project_id);
+        match self.cas.read(&key).await {
+            Err(StoreError::NotFound) => Ok(PathHeads {
+                page_ids: BTreeMap::new(),
+            }),
+            Err(error) => Err(error),
+            Ok((bytes, _version)) => match self.read_commit_point(&bytes, &key)? {
+                AnyManifest::Whole(manifest) => Ok(PathHeads {
+                    page_ids: paths
+                        .iter()
+                        .filter_map(|path| {
+                            manifest
+                                .pages
+                                .get(path)
+                                .map(|entry| (path.clone(), entry.page_id.clone()))
+                        })
+                        .collect(),
+                }),
+                AnyManifest::Sharded(root) => {
+                    // Shard indices, in order, each named once: the reads come
+                    // back in this order, so which shard fails a batch is a
+                    // fact about the data rather than about the network.
+                    let mut wanted: Vec<u16> = paths
+                        .iter()
+                        .map(|path| manifest_shard_index(path))
+                        .collect();
+                    wanted.sort_unstable();
+                    wanted.dedup();
+                    let named: Vec<&ShardRef> = wanted
+                        .iter()
+                        .filter_map(|index| shard_ref_for(&root, *index))
+                        .collect();
+                    let keys: Vec<String> = named
+                        .iter()
+                        .map(|reference| reference.key.clone())
+                        .collect();
+                    let read = self.read_bytes_all(keys).await?;
+                    let mut page_ids = BTreeMap::new();
+                    for (reference, (key, bytes)) in named.into_iter().zip(read) {
+                        check_shard_bytes(reference, &key, &bytes)?;
+                        let shard: ManifestShard = decode(&bytes, &key)?;
+                        for path in paths
+                            .iter()
+                            .filter(|path| manifest_shard_index(path) == reference.shard)
+                        {
+                            if let Some(entry) = shard.pages.get(path) {
+                                page_ids.insert(path.clone(), entry.page_id.clone());
+                            }
+                        }
+                    }
+                    Ok(PathHeads { page_ids })
                 }
             },
         }

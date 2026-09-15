@@ -249,7 +249,7 @@ pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
     LeaseGuard, LoadedCatalog, LoadedManifest, MANIFEST_MAX_BYTES, MANIFEST_ROOT_MAX_BYTES,
-    MigrateOutcome, PathState, ProjectStore, ProposalRequest, PublishOutcome,
+    MigrateOutcome, PathHeads, PathState, ProjectStore, ProposalRequest, PublishOutcome,
     ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
 };
 pub use verify::{Problem, VerifyReport};
