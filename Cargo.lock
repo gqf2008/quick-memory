@@ -1452,6 +1452,7 @@ dependencies = [
  "object_store",
  "qm-cli",
  "qm-core",
+ "qm-probe",
  "rmcp",
  "schemars",
  "serde",

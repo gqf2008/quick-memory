@@ -9,6 +9,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use qm_core::{KeyLayout, ProjectId, SessionId, WorkspaceId};
+use qm_probe::s3_stub::S3Stub;
+
 struct Client {
     child: Child,
     stdin: ChildStdin,
@@ -23,9 +28,20 @@ impl Client {
     /// Same server, with extra environment. Used to configure an embedding
     /// provider; last write wins, so an override may replace the defaults.
     fn start_with(envs: &[(&str, &str)]) -> Self {
+        Self::start_inner(envs, true)
+    }
+
+    /// Start against an S3-compatible socket instead of the synthetic bucket.
+    fn start_s3(envs: &[(&str, &str)]) -> Self {
+        Self::start_inner(envs, false)
+    }
+
+    fn start_inner(envs: &[(&str, &str)], synthetic: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_qm-mcp"));
+        if synthetic {
+            command.arg("--synthetic-bucket");
+        }
         command
-            .arg("--synthetic-bucket")
             .env("QM_WORKSPACE", "acme")
             .env("QM_PROJECT", "ai-memory")
             .env("QM_WRITER", "test-machine")
@@ -648,6 +664,80 @@ fn mcp_maintain_compiles_publishes_and_is_idempotent() {
         "maintain must make the page searchable: {}",
         tool_text(&searched)
     );
+}
+
+/// A partial maintain failure must cross the real JSON-RPC `tools/call`
+/// boundary as a tool-level error, with the complete report still available.
+#[tokio::test]
+async fn mcp_maintain_partial_failure_is_a_tool_error_with_the_full_report() {
+    let stub = S3Stub::start().expect("start S3 stub");
+    let bucket = AmazonS3Builder::new()
+        .with_bucket_name(stub.bucket())
+        .with_region("auto")
+        .with_endpoint(stub.endpoint())
+        .with_allow_http(true)
+        .with_access_key_id("stub-access")
+        .with_secret_access_key("stub-secret")
+        .with_virtual_hosted_style_request(false)
+        .build()
+        .expect("build S3 client");
+
+    let workspace = WorkspaceId::new("partial-ws").expect("workspace");
+    let project = ProjectId::new("partial-project").expect("project");
+    let session = SessionId::new("sess-broken").expect("session");
+    let key = KeyLayout::new("v1").session_head(&workspace, &project, &session);
+    bucket
+        .put(
+            &object_store::path::Path::from(key),
+            b"not-json".to_vec().into(),
+        )
+        .await
+        .expect("seed corrupt session head");
+
+    let cache_dir = std::env::temp_dir().join(format!("qm-mcp-partial-{}", std::process::id()));
+    std::fs::create_dir_all(&cache_dir).expect("create partial-failure cache dir");
+    let endpoint = stub.endpoint();
+    let mut client = Client::start_s3(&[
+        ("QM_S3_ENDPOINT", endpoint.as_str()),
+        ("QM_S3_BUCKET", stub.bucket()),
+        ("QM_S3_ACCESS_KEY_ID", "stub-access"),
+        ("QM_S3_SECRET_ACCESS_KEY", "stub-secret"),
+        ("QM_CACHE_DIR", cache_dir.to_str().expect("cache dir")),
+        ("QM_WORKSPACE", "partial-ws"),
+        ("QM_PROJECT", "partial-project"),
+        ("QM_WRITER", "partial-machine"),
+    ]);
+    client.handshake();
+
+    let response = client.call_tool_raw(
+        1,
+        "memory_maintain",
+        serde_json::json!({"compiler": "rules"}),
+    );
+    assert!(
+        response["error"].is_null(),
+        "partial failure must stay a tool result: {response}"
+    );
+    assert_eq!(
+        response["result"]["isError"], true,
+        "partial failure must set isError: {response}"
+    );
+    let report_text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool error must carry report text: {response}"))
+        .to_string();
+    let report: serde_json::Value = serde_json::from_str(&report_text)
+        .unwrap_or_else(|error| panic!("tool error report must be JSON: {error}: {report_text}"));
+    assert_eq!(report["failed"], 1, "{report}");
+    assert_eq!(report["failures"][0]["session"], "sess-broken", "{report}");
+    assert!(
+        report
+            .as_object()
+            .is_some_and(|report| report.contains_key("publish_error")),
+        "{report}"
+    );
+
+    stub.shutdown();
 }
 
 /// A local embedding endpoint that answers every batch with the same vector.

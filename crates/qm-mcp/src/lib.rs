@@ -234,7 +234,7 @@ pub struct MemoryServer {
     project: String,
     writer: String,
     cache_dir: PathBuf,
-    now_ms: i64,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -264,7 +264,7 @@ impl MemoryServer {
             project,
             writer,
             cache_dir,
-            now_ms: wall_clock_ms(),
+            clock: Arc::new(wall_clock_ms),
             tool_router: Self::tool_router(),
         }
     }
@@ -294,8 +294,24 @@ impl MemoryServer {
         self
     }
 
-    /// Build the shared CLI/context pair for one tool call.
-    fn command_context(&self, command: Command) -> Result<(Cli, CommandContext), McpError> {
+    /// Replace the wall clock with a deterministic one for regression tests.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Resolve the current wall clock for one tool call.
+    fn clock_ms(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// Build the shared CLI/context pair for one tool call at `now_ms`.
+    fn command_context(
+        &self,
+        command: Command,
+        now_ms: i64,
+    ) -> Result<(Cli, CommandContext), McpError> {
         let cli = Cli {
             workspace: self.workspace.clone(),
             project: self.project.clone(),
@@ -310,7 +326,7 @@ impl MemoryServer {
             &cli.project,
             &cli.writer,
             self.cache_dir.clone(),
-            self.now_ms,
+            now_ms,
             true,
         )
         .map_err(|error| McpError::invalid_params(error.to_string(), None))?
@@ -319,13 +335,18 @@ impl MemoryServer {
         Ok((cli, context))
     }
 
-    /// Run one command through the shared dispatch and return its JSON.
-    async fn dispatch(&self, command: Command) -> Result<CallToolResult, McpError> {
-        let (cli, context) = self.command_context(command)?;
+    /// Run one command through the shared dispatch at an explicit clock.
+    async fn dispatch_at(&self, command: Command, now_ms: i64) -> Result<CallToolResult, McpError> {
+        let (cli, context) = self.command_context(command, now_ms)?;
         let output = execute(&cli, context)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Run one command through the shared dispatch and return its JSON.
+    async fn dispatch(&self, command: Command) -> Result<CallToolResult, McpError> {
+        self.dispatch_at(command, self.clock_ms()).await
     }
 
     /// Run `maintain`, preserving its partial-failure report as tool content.
@@ -334,9 +355,14 @@ impl MemoryServer {
     /// some work but one or more sessions or the publish step failed. MCP
     /// callers need the same complete report the CLI prints, so that case is a
     /// tool-level error carrying the report rather than an opaque internal
-    /// error.
-    async fn dispatch_maintain(&self, command: Command) -> Result<CallToolResult, McpError> {
-        let (cli, context) = self.command_context(command)?;
+    /// error. The call-time clock is captured once and threaded into the
+    /// context so leases and commits cannot use a stale server-start time.
+    async fn dispatch_maintain_at(
+        &self,
+        command: Command,
+        now_ms: i64,
+    ) -> Result<CallToolResult, McpError> {
+        let (cli, context) = self.command_context(command, now_ms)?;
         match execute(&cli, context).await {
             Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
             Err(error) => {
@@ -349,6 +375,11 @@ impl MemoryServer {
                 }
             }
         }
+    }
+
+    /// Run `maintain` with the clock sampled at the call site.
+    async fn dispatch_maintain(&self, command: Command) -> Result<CallToolResult, McpError> {
+        self.dispatch_maintain_at(command, self.clock_ms()).await
     }
 }
 
@@ -529,12 +560,19 @@ impl MemoryServer {
             .since_hours
             .unwrap_or(qm_cli::DIGEST_DEFAULT_HOURS)
             .max(0);
-        let since_ms = wall_clock_ms().saturating_sub(hours.saturating_mul(3_600_000));
-        self.dispatch(Command::Digest {
-            since_ms: Some(since_ms),
-            hours: None,
-            limit: args.limit.unwrap_or(qm_cli::DIGEST_DEFAULT_LIMIT),
-        })
+        // Resolve the window and the context clock from the same call-time
+        // sample: a digest assembled from one instant must not rank against a
+        // frozen server-start instant.
+        let now_ms = self.clock_ms();
+        let since_ms = now_ms.saturating_sub(hours.saturating_mul(3_600_000));
+        self.dispatch_at(
+            Command::Digest {
+                since_ms: Some(since_ms),
+                hours: None,
+                limit: args.limit.unwrap_or(qm_cli::DIGEST_DEFAULT_LIMIT),
+            },
+            now_ms,
+        )
         .await
     }
 
@@ -821,7 +859,133 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
-    use qm_core::{KeyLayout, ProjectId, SessionId, WorkspaceId};
+    use qm_core::{KeyLayout, Lease, ProjectId, SessionId, WorkspaceId};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[tokio::test]
+    async fn a_long_lived_server_uses_call_time_for_writes_and_leases() {
+        let start_ms = 1_000_000;
+        let call_ms = start_ms + 180_000;
+        let clock = Arc::new(AtomicI64::new(start_ms));
+        let clock_for_server = Arc::clone(&clock);
+        let bucket = Arc::new(InMemory::new());
+        let server = MemoryServer::new(
+            Arc::clone(&bucket) as Arc<dyn ObjectStore>,
+            "long-ws".to_string(),
+            "long-project".to_string(),
+            "long-writer".to_string(),
+            std::env::temp_dir().join(format!("qm-mcp-long-lived-{}", std::process::id())),
+        )
+        .with_clock(Arc::new(move || clock_for_server.load(Ordering::SeqCst)));
+
+        let captured = server
+            .memory_capture(Parameters(CaptureArgs {
+                session: "sess-long-lived".to_string(),
+                text: "capture at the old time".to_string(),
+                kind: None,
+                actor: None,
+                at: None,
+            }))
+            .await
+            .expect("capture");
+        assert_eq!(captured.is_error, Some(false), "{captured:?}");
+
+        clock.store(call_ms, Ordering::SeqCst);
+        let maintained = server
+            .memory_maintain(Parameters(MaintainArgs {
+                compiler: Some("rules".to_string()),
+                drain_limit: Some(10),
+            }))
+            .await
+            .expect("maintain");
+        assert_eq!(maintained.is_error, Some(false), "{maintained:?}");
+
+        let recent = server
+            .memory_recent(Parameters(RecentArgs { limit: Some(10) }))
+            .await
+            .expect("recent");
+        let recent_text = recent
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|content| content.text.as_str())
+            .expect("recent text");
+        let recent_json: serde_json::Value =
+            serde_json::from_str(recent_text).expect("recent JSON");
+        let page = recent_json
+            .as_array()
+            .expect("recent array")
+            .iter()
+            .find(|page| page["path"] == "sessions/sess-long-lived.md")
+            .expect("the page written by maintain");
+        assert_eq!(page["created_at_ms"], call_ms, "{page}");
+
+        let lease_key =
+            KeyLayout::new("v1").lease("consolidate/long-ws/long-project/sess-long-lived");
+        let lease_bytes = bucket
+            .get(&ObjectPath::from(lease_key))
+            .await
+            .expect("lease object")
+            .bytes()
+            .await
+            .expect("lease bytes");
+        let lease: Lease = serde_json::from_slice(&lease_bytes).expect("lease JSON");
+        assert_eq!(
+            lease.acquired_at_ms, call_ms,
+            "lease acquisition must use call time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_lived_server_resolves_the_digest_window_at_call_time() {
+        let start_ms = 1_000_000;
+        let page_ms = start_ms + 1_000_000;
+        let call_ms = start_ms + 5_000_000;
+        let clock = Arc::new(AtomicI64::new(start_ms));
+        let clock_for_server = Arc::clone(&clock);
+        let server = MemoryServer::new(
+            Arc::new(InMemory::new()),
+            "digest-ws".to_string(),
+            "digest-project".to_string(),
+            "digest-writer".to_string(),
+            std::env::temp_dir().join(format!("qm-mcp-digest-lived-{}", std::process::id())),
+        )
+        .with_clock(Arc::new(move || clock_for_server.load(Ordering::SeqCst)));
+
+        clock.store(page_ms, Ordering::SeqCst);
+        let written = server
+            .memory_write_page(Parameters(WritePageArgs {
+                path: "notes/long-lived.md".to_string(),
+                body: "written between the startup and call windows".to_string(),
+                title: None,
+            }))
+            .await
+            .expect("write page");
+        assert_eq!(written.is_error, Some(false), "{written:?}");
+
+        clock.store(call_ms, Ordering::SeqCst);
+        let digest = server
+            .memory_digest(Parameters(DigestArgs {
+                since_hours: Some(1),
+                limit: Some(20),
+            }))
+            .await
+            .expect("digest");
+        let digest_text = digest
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|content| content.text.as_str())
+            .expect("digest text");
+        let digest_json: serde_json::Value =
+            serde_json::from_str(digest_text).expect("digest JSON");
+        assert!(
+            !digest_json["pages"].as_array().is_some_and(|pages| pages
+                .iter()
+                .any(|page| page["path"] == "notes/long-lived.md")),
+            "the digest window must be resolved against call time: {digest_json}"
+        );
+    }
 
     #[tokio::test]
     async fn memory_maintain_returns_a_complete_report_as_a_tool_error() {
