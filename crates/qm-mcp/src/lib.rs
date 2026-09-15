@@ -192,6 +192,17 @@ pub struct RecentArgs {
     pub limit: Option<usize>,
 }
 
+/// Arguments for `memory_digest`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DigestArgs {
+    /// Look back this many hours (default: 24).
+    #[serde(default)]
+    pub since_hours: Option<i64>,
+    /// Maximum entries per section (default: 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Arguments for page-addressed tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PageArgs {
@@ -419,6 +430,36 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Recent {
             limit: args.limit.unwrap_or(qm_cli::RECENT_DEFAULT_LIMIT),
+        })
+        .await
+    }
+
+    /// Summarise what changed recently.
+    #[tool(
+        description = "Summarise what changed recently in three sections: pages \
+                       (commits, including deletions), sessions (whose heads \
+                       moved) and handoffs (created, claimed or finished). \
+                       Assembled from authoritative objects, not from the search \
+                       index. Call this FIRST at the start of a session to find \
+                       out what happened while you were away."
+    )]
+    async fn memory_digest(
+        &self,
+        Parameters(args): Parameters<DigestArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // A digest is always relative to *now*, and this server is long-lived:
+        // resolving the window against its startup clock would freeze the
+        // look-back. So resolve against the wall clock at call time and hand
+        // the dispatch an absolute instant.
+        let hours = args
+            .since_hours
+            .unwrap_or(qm_cli::DIGEST_DEFAULT_HOURS)
+            .max(0);
+        let since_ms = wall_clock_ms().saturating_sub(hours.saturating_mul(3_600_000));
+        self.dispatch(Command::Digest {
+            since_ms: Some(since_ms),
+            hours: None,
+            limit: args.limit.unwrap_or(qm_cli::DIGEST_DEFAULT_LIMIT),
         })
         .await
     }

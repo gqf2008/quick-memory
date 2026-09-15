@@ -152,6 +152,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_restore",
         "memory_log",
         "memory_recent",
+        "memory_digest",
         "memory_compact_session",
         "memory_verify",
         "memory_propose",
@@ -223,6 +224,24 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
     assert!(
         recent_text.contains("created_at_ms"),
         "recent output should carry its own fields: {recent_text}"
+    );
+
+    // `memory_digest` is the "what did I miss?" open. It must carry all three
+    // sections, and it must see the activity this round trip just produced:
+    // a page commit and a session head.
+    let digest = client.call_tool(30, "memory_digest", serde_json::json!({"limit": 5}));
+    let digest_text = tool_text(&digest);
+    let digest_json: serde_json::Value = serde_json::from_str(&digest_text).unwrap();
+    // A tool mis-wired to `memory_log` would have no `sessions` key at all.
+    assert!(digest_json["sessions"].is_array(), "{digest_text}");
+    assert!(digest_json["handoffs"].is_array(), "{digest_text}");
+    assert!(
+        digest_text.contains("sessions/sess-mcp.md"),
+        "the digest must see the page this session just committed: {digest_text}"
+    );
+    assert!(
+        digest_text.contains("sess-mcp"),
+        "the digest must see the session head: {digest_text}"
     );
 
     // Handoffs: open, list, claim, and refuse a second claim — over the wire.

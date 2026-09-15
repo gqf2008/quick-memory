@@ -22,6 +22,7 @@ use qm_core::{
     derive_segment_id,
 };
 
+use crate::digest::{Digest, SessionSummary, handoff_activity_ms};
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
 
 /// Upper bound on how far back `page_history` will walk a supersession chain.
@@ -623,6 +624,84 @@ impl ProjectStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(handoffs)
+    }
+
+    /// Everything that changed in this scope since `since_ms`, newest first.
+    ///
+    /// This is the "what happened while I was away" read. It is assembled from
+    /// authoritative objects only — the commit log, session heads and handoff
+    /// objects — so it needs no index and no cache, and a machine that has just
+    /// started sees the same answer as one that has been running all along.
+    ///
+    /// `pages` keeps deletions, as [`CommitKind::PageDeleted`]: "this page was
+    /// removed" is exactly the kind of thing a new session needs to know, and
+    /// dropping it would make a digest launder a deletion into silence.
+    ///
+    /// Each part is sorted by its own clock, newest first, and any part may be
+    /// empty — an empty window is an answer, never an error.
+    ///
+    /// # Errors
+    /// Propagates backend and decode failures.
+    pub async fn digest(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        since_ms: i64,
+        limit: usize,
+    ) -> Result<Digest, StoreError> {
+        // The log is already newest-first by sequence, so filtering to the
+        // window and keeping its head is "the latest `limit` records in range"
+        // — no second sort, and no chance of the two orders disagreeing.
+        let log = self
+            .read_commit_log(workspace_id, project_id, usize::MAX)
+            .await?;
+        let pages: Vec<CommitRecord> = log
+            .into_iter()
+            .filter(|record| record.at_ms >= since_ms)
+            .take(limit)
+            .collect();
+
+        let mut sessions = Vec::new();
+        for session_id in self.list_sessions(workspace_id, project_id).await? {
+            // Listed a moment ago and gone now is a normal race for a
+            // snapshot read; skip it rather than failing the whole digest.
+            let Some((head, _)) = self
+                .load_session_head(workspace_id, project_id, &session_id)
+                .await?
+            else {
+                continue;
+            };
+            if head.updated_at_ms >= since_ms {
+                sessions.push(SessionSummary {
+                    session_id,
+                    observations: head.count,
+                    last_seen_ms: head.updated_at_ms,
+                });
+            }
+        }
+        sessions.sort_by(|a, b| {
+            b.last_seen_ms
+                .cmp(&a.last_seen_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+
+        let mut handoffs: Vec<Handoff> = self
+            .list_handoffs(workspace_id, project_id)
+            .await?
+            .into_iter()
+            .filter(|handoff| handoff_activity_ms(handoff) >= since_ms)
+            .collect();
+        handoffs.sort_by(|a, b| {
+            handoff_activity_ms(b)
+                .cmp(&handoff_activity_ms(a))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        Ok(Digest {
+            pages,
+            sessions,
+            handoffs,
+        })
     }
 
     /// Claim a handoff. Exactly one machine can win.
@@ -3216,5 +3295,171 @@ mod tests {
             .await
             .expect_err("content addressing must fail closed");
         assert!(matches!(error, StoreError::Corrupt(_)), "{error:?}");
+    }
+
+    /// A digest answers "what changed recently", so the window and the cap are
+    /// its whole contract: everything older than `since_ms` is out, and at most
+    /// `limit` of the survivors come back, newest first.
+    #[tokio::test]
+    async fn digest_windows_and_limits_the_commit_log() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        for (index, at) in [1_000_i64, 2_000, 3_000, 4_000].into_iter().enumerate() {
+            store
+                .commit_page(request("mbp-1", &format!("notes/n{index}.md"), "body", at))
+                .await
+                .unwrap();
+        }
+
+        // The window keeps only what happened at or after `since_ms`; the two
+        // older commits are not merely truncated, they are absent.
+        let windowed = store.digest(&ws(), &proj(), 3_000, 20).await.unwrap();
+        let paths: Vec<&str> = windowed
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["notes/n3.md", "notes/n2.md"]);
+        assert!(
+            windowed.pages.iter().all(|record| record.at_ms >= 3_000),
+            "a commit from outside the window leaked in: {:?}",
+            windowed.pages
+        );
+
+        // The limit caps the window and keeps the *newest* end of it: a cap
+        // that returned the oldest commits would be useless for a digest.
+        let capped = store.digest(&ws(), &proj(), 0, 2).await.unwrap();
+        let capped_paths: Vec<&str> = capped
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(capped_paths, vec!["notes/n3.md", "notes/n2.md"]);
+
+        // A cap of zero is a legal request, not an error.
+        let none = store.digest(&ws(), &proj(), 0, 0).await.unwrap();
+        assert!(none.pages.is_empty());
+    }
+
+    /// A deleted page must show up as a deletion. Dropping it would let a
+    /// digest quietly launder "this was removed" into "nothing happened".
+    #[tokio::test]
+    async fn digest_keeps_a_deletion_instead_of_dropping_it() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        store
+            .commit_page(request("mbp-1", "notes/keep.md", "kept", 1_000))
+            .await
+            .unwrap();
+        store
+            .commit_page(request("mbp-1", "notes/gone.md", "doomed", 2_000))
+            .await
+            .unwrap();
+        let doomed = PagePath::new("notes/gone.md").unwrap();
+        let deleted = store
+            .delete_page(
+                &ws(),
+                &proj(),
+                &doomed,
+                &WriterId::new("mbp-1").unwrap(),
+                3_000,
+            )
+            .await
+            .unwrap();
+        assert!(!deleted.already_deleted);
+
+        let digest = store.digest(&ws(), &proj(), 0, 20).await.unwrap();
+        let kinds: Vec<(&str, &CommitKind)> = digest
+            .pages
+            .iter()
+            .map(|record| (record.path.as_str(), &record.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("notes/gone.md", &CommitKind::PageDeleted),
+                ("notes/gone.md", &CommitKind::PageWritten),
+                ("notes/keep.md", &CommitKind::PageWritten),
+            ],
+            "the deletion must be present, and the newest commit first"
+        );
+        // The manifest no longer knows the path; the digest still does.
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(loaded.manifest.is_tombstoned(&doomed));
+    }
+
+    /// Sessions and handoffs are windows too, and a handoff counts as recent
+    /// when *any* of its stages lands inside the window -- a baton opened
+    /// before it was claimed is exactly the one a new session must see.
+    #[tokio::test]
+    async fn digest_reports_sessions_and_handoffs_in_the_window() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        store
+            .ingest_observations(ingest("sess-old", &["a", "b"], 1_000))
+            .await
+            .unwrap();
+        store
+            .ingest_observations(ingest("sess-new", &["c"], 5_000))
+            .await
+            .unwrap();
+
+        let writer = WriterId::new("mbp-1").unwrap();
+        let (handoff, _) = store
+            .open_handoff(
+                &ws(),
+                &proj(),
+                "finish the rebuild",
+                "pending",
+                &writer,
+                2_000,
+            )
+            .await
+            .unwrap();
+        store
+            .claim_handoff(&ws(), &proj(), &handoff.id, &writer, 6_000)
+            .await
+            .unwrap();
+
+        let digest = store.digest(&ws(), &proj(), 4_000, 20).await.unwrap();
+
+        let sessions: Vec<(&str, u64)> = digest
+            .sessions
+            .iter()
+            .map(|summary| (summary.session_id.as_str(), summary.observations))
+            .collect();
+        assert_eq!(sessions, vec![("sess-new", 1)]);
+
+        assert_eq!(digest.handoffs.len(), 1, "claimed inside the window");
+        assert_eq!(digest.handoffs[0].id, handoff.id);
+
+        // The claim was the only in-window activity; before it the handoff was
+        // not open yet, and after the window opens both sessions are gone.
+        let earlier = store.digest(&ws(), &proj(), 7000, 20).await.unwrap();
+        assert!(earlier.is_empty(), "{earlier:?}");
+    }
+
+    /// A window with nothing in it is an empty answer, never an error.
+    #[tokio::test]
+    async fn digest_of_a_quiet_window_is_empty() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        store
+            .commit_page(request("mbp-1", "notes/old.md", "body", 1_000))
+            .await
+            .unwrap();
+
+        let digest = store.digest(&ws(), &proj(), 10_000, 20).await.unwrap();
+        assert!(digest.pages.is_empty());
+        assert!(digest.sessions.is_empty());
+        assert!(digest.handoffs.is_empty());
+        assert!(digest.is_empty());
+
+        // A scope that has never been touched behaves the same way: a fresh
+        // bucket, so there is genuinely nothing to find.
+        let untouched: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let virgin = machine(&untouched);
+        let digest = virgin.digest(&ws(), &proj(), 0, 20).await.unwrap();
+        assert!(digest.is_empty(), "{digest:?}");
     }
 }

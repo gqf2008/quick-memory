@@ -353,6 +353,35 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
+## 6.20 最近变化摘要（digest）：三张权威清单
+
+`qm recent` 回答"哪些页面最近改过"，但一个刚接手的 agent 还要知道三件不同的事：哪些提交发生了
+（**包括删除**）、哪些会话还在动、有没有留给自己的接力棒。`digest` 把这三件事一次问完：
+
+```bash
+qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 / 每段 20 条
+```
+
+- `ProjectStore::digest(ws, proj, since_ms, limit) -> Digest { pages, sessions, handoffs }`，
+  三部分都从**权威对象**读，不碰索引、不碰缓存：pages 来自 commit log（`commits/<seq>.json`）、
+  sessions 来自各会话 head（`SessionSummary { session_id, observations, last_seen_ms }`，
+  `observations` 就是 head 里的 `count`）、handoffs 来自 `handoffs/<id>.json`。
+- **删除是提交，不是缺席**：`pages` 同时保留 `PageWritten` 与 `PageDeleted`。
+  只留"还存在的页面"会把"这个被删掉了"洗成"什么都没发生"，而恰恰是前者更需要下一个会话知道——
+  manifest 已不再知道那条路径，digest 仍然知道。
+- **提交日志是建议性元数据**：提交与日志之间崩溃会少一条记录，digest 因此少报一条，
+  但它**不会报错、也不会报出不存在的东西**——它只回答"什么时候"，从不回答"现在什么是真的"。
+- **窗口按各自的时钟**：pages 按提交时间、sessions 按 head 的 `updated_at_ms`、
+  handoffs 按 created/claimed/finished 三者中**最新**的那个——所以"窗口之前开、窗口之内被认领"的接力棒会出现，
+  这正是它存在的意义。三部分各自降序，任何一部分为空都是正常答案（`Digest::is_empty()`），
+  没有变化是**空 vec**，不是错误。
+- **`limit` 保留窗口内最新的那端**：commit log 本就是以 `seq` 降序读出的，过滤窗口后取前 `limit` 条即可，
+  无需二次排序，也就没有"两种顺序打架"的机会。
+- `--since-ms` 与 `--hours` **互斥**而不是按优先级静默取一个；人类输出分 `pages` / `sessions` / `handoffs`
+  三段，整窗无活动时输出一句话而不是三个空标题。
+- MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
+  而不是按 server 启动时钟——否则长驻 server 的回看窗口会冻在启动那一刻。
+
 ## 6.19 最近变化：会话开始时先看这里
 
 agent 开场最常问的问题不是"搜点什么"，而是"上一个会话在做什么"。这不需要检索，
@@ -390,7 +419,7 @@ qm reject  --id <id> --note "not this time"
   中途崩溃只会留下"已批准、id 未知"，**决定不会丢**。
 - 应用走的是普通 `commit_page`：因此仍然 supersede 而非覆盖，历史与回滚照旧可用。
 - 拒绝同样是一次 CAS，只写决定，不碰页面。
-- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 24 个工具）。
+- MCP 对应 `memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`（共 25 个工具）。
 
 ## 6.17 新近度先验：它承诺什么、不承诺什么
 
@@ -599,7 +628,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。
 
 - `qm` CLI 26 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器已实现并通过协议级回环测试（24 个工具，与 CLI 同一分发）。
+- MCP stdio 服务器已实现并通过协议级回环测试（25 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 

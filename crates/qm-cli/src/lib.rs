@@ -17,21 +17,30 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use object_store::ObjectStore;
 use qm_core::{
-    HandoffState, MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId, WorkspaceId,
-    WriterId,
+    CommitKind, HandoffState, MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId,
+    WorkspaceId, WriterId,
 };
 use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
 use qm_search::{
     PageDoc, attach_embeddings, compact_project, publish_split_index, search_project_tuned,
     search_workspace_tuned,
 };
-use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
+use qm_store::{CommitPageRequest, Digest, IngestObservationsRequest, ProjectStore};
 
 /// Default page count for `recent` / `memory_recent`.
 ///
 /// One constant rather than a literal per surface: the CLI default and the MCP
 /// default are the same promise, so they must not be able to drift apart.
 pub const RECENT_DEFAULT_LIMIT: usize = 10;
+
+/// Default look-back window for `digest` / `memory_digest`, in hours.
+///
+/// One constant rather than a literal per surface: the CLI default and the MCP
+/// default are the same promise, so they must not be able to drift apart.
+pub const DIGEST_DEFAULT_HOURS: i64 = 24;
+
+/// Default per-section entry cap for `digest` / `memory_digest`.
+pub const DIGEST_DEFAULT_LIMIT: usize = 20;
 
 /// Command line interface.
 #[derive(Debug, Parser)]
@@ -302,6 +311,18 @@ pub enum Command {
         #[arg(long, default_value_t = RECENT_DEFAULT_LIMIT)]
         limit: usize,
     },
+    /// Summarise everything that changed recently.
+    Digest {
+        /// Look back this many milliseconds.
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Look back this many hours (default: 24).
+        #[arg(long, conflicts_with = "since_ms")]
+        hours: Option<i64>,
+        /// Maximum entries per section.
+        #[arg(long, default_value_t = DIGEST_DEFAULT_LIMIT)]
+        limit: usize,
+    },
     /// Tombstone a page.
     DeletePage {
         /// Path inside the project.
@@ -363,6 +384,71 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
         builder = builder.with_allow_http(true);
     }
     Ok(Arc::new(builder.build().context("building S3 client")?))
+}
+
+/// Flatten every control character to a space.
+///
+/// A single record is a single line in this CLI's output, and titles, paths and
+/// handoff text are not validated: a bare newline, a CRLF, a tab or an escape
+/// sequence would each break some half of that contract.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Render a digest as three labelled sections: pages, sessions, handoffs.
+///
+/// The sections are always all present when there is anything at all to show,
+/// because "no handoffs" and "the handoff section never rendered" are different
+/// facts and a reader should not have to guess which one they are looking at.
+fn render_digest(digest: &Digest) -> String {
+    if digest.is_empty() {
+        return "no recent activity".to_string();
+    }
+    let mut out = String::new();
+
+    out.push_str(&format!("pages ({})\n", digest.pages.len()));
+    for record in &digest.pages {
+        let kind = match record.kind {
+            CommitKind::PageWritten => "written",
+            CommitKind::PageDeleted => "deleted",
+        };
+        out.push_str(&format!(
+            "  {}\t{}\t{}\n",
+            record.at_ms,
+            kind,
+            one_line(record.path.as_str())
+        ));
+    }
+
+    out.push_str(&format!("sessions ({})\n", digest.sessions.len()));
+    for session in &digest.sessions {
+        out.push_str(&format!(
+            "  {}\t{}\t{} observations\n",
+            session.last_seen_ms,
+            one_line(session.session_id.as_str()),
+            session.observations
+        ));
+    }
+
+    out.push_str(&format!("handoffs ({})\n", digest.handoffs.len()));
+    for handoff in &digest.handoffs {
+        let state = match handoff.state() {
+            HandoffState::Open => "open",
+            HandoffState::Claimed => "claimed",
+            HandoffState::Done => "done",
+        };
+        out.push_str(&format!(
+            "  {}\t{}\t{}\t{}\n",
+            qm_store::handoff_activity_ms(handoff),
+            state,
+            handoff.id,
+            one_line(&handoff.title)
+        ));
+    }
+
+    out
 }
 
 /// Everything a command needs, already resolved.
@@ -1677,6 +1763,32 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
+            })
+        }
+        Command::Digest {
+            since_ms,
+            hours,
+            limit,
+        } => {
+            // `--since-ms` wins outright; otherwise the window is relative to
+            // this command's clock, so a digest and the writes it reports on
+            // agree about what "now" means.
+            let since = match *since_ms {
+                Some(ms) => ms,
+                None => {
+                    let hours = hours.unwrap_or(DIGEST_DEFAULT_HOURS);
+                    ctx.now_ms.saturating_sub(hours.saturating_mul(3_600_000))
+                }
+            };
+            let digest = ctx
+                .project
+                .digest(&ctx.workspace, &ctx.project_id, since, *limit)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&digest)?
+            } else {
+                render_digest(&digest)
             })
         }
         Command::DeletePage { path } => {
@@ -3260,5 +3372,185 @@ mod tests {
             read_watermark(&dir.path().join("absent.json")).manifest_seq,
             0
         );
+    }
+
+    /// End to end: two pages written, one deleted, and the digest reports all
+    /// three commits -- including the deletion, which the manifest can no
+    /// longer answer for.
+    #[tokio::test]
+    async fn digest_reports_writes_and_deletions_end_to_end() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for (path, at) in [("notes/a.md", 1_000_i64), ("notes/b.md", 2_000)] {
+            execute(
+                &cli(&[
+                    "write-page",
+                    "--path",
+                    path,
+                    "--title",
+                    path,
+                    "--body",
+                    "body of the page",
+                ]),
+                Context {
+                    now_ms: at,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let deleted = execute(
+            &cli(&["delete-page", "--path", "notes/b.md"]),
+            Context {
+                now_ms: 3_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(deleted.contains("deleted"), "{deleted}");
+
+        let out = execute(
+            &cli(&["digest", "--json"]),
+            Context {
+                now_ms: 4_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        let digest: qm_store::Digest = serde_json::from_str(&out).unwrap();
+
+        let written = digest
+            .pages
+            .iter()
+            .filter(|record| record.kind == qm_core::CommitKind::PageWritten)
+            .count();
+        let removed = digest
+            .pages
+            .iter()
+            .filter(|record| record.kind == qm_core::CommitKind::PageDeleted)
+            .count();
+        assert_eq!((written, removed), (2, 1), "{out}");
+        // Newest first, and the deletion is the newest commit of all.
+        assert_eq!(digest.pages[0].kind, qm_core::CommitKind::PageDeleted);
+        assert_eq!(digest.pages[0].path.as_str(), "notes/b.md");
+    }
+
+    /// The human output is three labelled sections, and a window with nothing
+    /// in it says so instead of printing three bare headers.
+    #[tokio::test]
+    async fn digest_renders_three_sections_or_says_there_is_nothing() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&["capture", "--session", "sess-1", "--text", "did a thing"]),
+            Context {
+                now_ms: 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        execute(
+            &cli(&["write-page", "--path", "notes/a.md", "--body", "body"]),
+            Context {
+                now_ms: 2_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        let out = execute(
+            &cli(&["digest"]),
+            Context {
+                now_ms: 3_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("pages (1)"), "{out}");
+        assert!(out.contains("sessions (1)"), "{out}");
+        assert!(out.contains("handoffs (0)"), "{out}");
+
+        // A window with nothing in it gets one plain sentence rather than
+        // three headers that all say nothing.
+        let empty = execute(
+            &cli(&["digest", "--since-ms", "9999999"]),
+            Context {
+                now_ms: 3_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty, "no recent activity");
+    }
+
+    /// `--since-ms` and `--hours` both narrow the window, and the default is a
+    /// day, not "everything ever".
+    #[tokio::test]
+    async fn digest_window_flags_exclude_older_commits() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        let day_ms = 86_400_000_i64;
+        execute(
+            &cli(&["write-page", "--path", "notes/old.md", "--body", "old"]),
+            Context {
+                now_ms: 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        execute(
+            &cli(&["write-page", "--path", "notes/new.md", "--body", "new"]),
+            Context {
+                now_ms: 1_000 + day_ms * 2,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        // Default window: a day, so the older commit is out.
+        let out = execute(
+            &cli(&["digest", "--json"]),
+            Context {
+                now_ms: 1_000 + day_ms * 2 + 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        let digest: qm_store::Digest = serde_json::from_str(&out).unwrap();
+        let paths: Vec<&str> = digest
+            .pages
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["notes/new.md"], "{out}");
+
+        // `--hours` widens it enough to reach both.
+        let out = execute(
+            &cli(&["digest", "--hours", "72", "--json"]),
+            Context {
+                now_ms: 1_000 + day_ms * 2 + 1_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        let digest: qm_store::Digest = serde_json::from_str(&out).unwrap();
+        assert_eq!(digest.pages.len(), 2, "{out}");
+
+        // The two flags are mutually exclusive rather than silently ranked.
+        assert!(Cli::try_parse_from(["qm", "digest", "--hours", "1", "--since-ms", "0"]).is_err());
     }
 }

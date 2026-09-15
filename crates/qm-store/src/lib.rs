@@ -153,10 +153,12 @@ impl From<OsError> for StoreError {
     }
 }
 
+mod digest;
 mod gc;
 mod project;
 mod verify;
 
+pub use digest::{Digest, SessionSummary, handoff_activity_ms};
 pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
