@@ -99,6 +99,66 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
 **仍然没有做的**：在真 R2 上跑一次 `cas-conformance`。上面是"按构造 + 回归"级别的证据，
 不是"在 R2 上观测到的证据"，两者不应混为一谈。
 
+#### 协议层验证（stub）
+
+上面两条回归跑在 `object_store` 的 InMemory 后端上——它没有 HTTP 层，所以 ETag 头、条件请求头、
+404/412 错误体、ListObjectsV2 XML 从未被端到端走过。`qm_probe::s3_stub::S3Stub` 补上了这一层：
+一个进程内的最小 S3 兼容服务（`std::net::TcpListener` + 手写 HTTP/1.1，无新依赖，仅在测试与探针辅助代码里），
+探针通过**真 socket** 驱动 `object_store` 的 S3 客户端。
+
+这层现在**测到了**：
+
+- **条件头真的上了线**：`If-None-Match: *`（create-if-absent）与 `If-Match: <etag>`（update-if-match）
+  由测试断言 stub **收到**的值，而不是断言客户端"打算"发什么；陈旧 ETag 与已消费 ETag 各被拒一次，
+  两次都是 stub 回 `412`。
+- **S3 的名字语义**：重复 create 由 bucket（412）而不是客户端拒绝；`If-Match` 打在不存在的对象上回 `404 NoSuchKey`，
+  再由客户端按契约翻译成 precondition failure（`cas-conformance` 与 `qm-store` 的错误映射都覆盖）；
+  `DELETE` 幂等（删不存在的 key 也是成功）。
+- **错误体是 S3 错误 XML**：`404 NoSuchKey` / `404 NoSuchBucket` / `412 PreconditionFailed` 都以
+  `<Error><Code>…` 文档返回，不是空体。
+- **list 与分页**：`ListObjectsV2` XML、`prefix`、`continuation-token` 走通——5 个对象按每页 2 个
+  返回时客户端恰好发 3 次请求、每次带同一个 prefix，且 ETag/size 逐条对上（stub 分页是刻意开的，
+  否则这层只会被单页覆盖）。
+- **HEAD 元数据**：`Content-Length`、RFC2822 `Last-Modified`（解析回的时间就是写入时刻）、ETag 都能被客户端解出。
+- **签名代码路径**：请求确实带 `AWS4-HMAC-SHA256` 的 `Authorization` 头（`SignedHeaders` 里能看见
+  `if-match`/`if-none-match`），因此走的不是 `skip_signature` 捷径。
+- **R2 的 PUT-only version 形状**：stub 打开该形状后，测试同时断言 PUT **有** `x-amz-version-id`、
+  随后的 GET **没有**，探针仍全绿——§5.1 的"按构造免疫"于是在真实 HTTP 形状下被观测到，
+  而不再只是类型层面构造出来的。
+- **并发条件写**：两条针对同一 ETag 的并发 `update` 恰好一条成功、另一条拿到 412，落盘内容等于胜者的字节。
+- **两个故障注入的对照**：stub 忽略 `If-Match` → `cas-conformance` 必须在 `stale-etag-rejected` /
+  `consumed-etag-rejected` 上报 FAIL 并退出非零（测试同时跑一遍正常 stub 确认这不是环境问题）；
+  stub 回一个从未写过的读 ETag → 探针也必须失败。
+
+**这层仍然没有测到什么**（不要把它读成真 R2 验证）：
+
+- **真 R2/S3 账号**：没有凭据，仍然没有在真桶上跑过 `cas-conformance`；stub 是我们写的服务，
+  它证明的是"客户端在真实 HTTP 往返下的行为"，不是"R2 真的这样回答"。
+- **服务端签名校验**：stub 记录并忽略 `Authorization`；签名是否正确，只有真后端才能拒。
+- **R2 的延迟、配额、区域行为、一致性、错误 XML 变体**：stub 一律立刻回答、无错误变体。
+- **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
+  所以"大对象"这条路径没有被覆盖。
+- **真实网络故障**：重试/退避只被单元测试覆盖，stub 不制造超时、5xx 或连接断裂。
+
+复现（stub 只在测试与探针辅助里，产品路径不可达）：
+
+```bash
+# 进程内：真实 S3 客户端 + 真 socket（约 1.5s）
+cargo test -p qm-probe --test s3_protocol
+
+# 跨进程：起一个独立 stub，再用现有探针二进制打它
+cargo build -p qm-probe --bins
+./target/debug/s3-stub --port 0 --port-file /tmp/s3-stub-port &
+QM_S3_ENDPOINT="http://127.0.0.1:$(cat /tmp/s3-stub-port)" QM_S3_BUCKET=stub-bucket \
+QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_PATH_STYLE=true \
+./target/debug/cas-conformance
+# 对照：同一个探针必须失败
+./target/debug/s3-stub --fault ignore-if-match --port-file /tmp/s3-stub-fault-port &
+QM_S3_ENDPOINT="http://127.0.0.1:$(cat /tmp/s3-stub-fault-port)" QM_S3_BUCKET=stub-bucket \
+QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_PATH_STYLE=true \
+./target/debug/cas-conformance
+```
+
 ## 6. 索引与检索
 
 **分片发布（每个写入方独立）**
