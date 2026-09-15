@@ -140,11 +140,12 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 细节与原始数字见 `design.md` §10.5。
 
 仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**Quickwit 二进制产出的真实分片**，
-以及**向量检索链在真 R2 上的行为**。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，
-它专门盯前两类后端差异；向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点。
+以及**向量检索链在真 R2 上的行为**，还有**在真 R2 上跑一遍跨进程 digest**（`digest-probe seed` 然后 `read`）。
+有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯前两类后端差异；
+向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点，digest 另有 `digest-probe` 的跨进程闭环。
 
 没有凭据时能走多远：`qm-probe` 里有一个进程内的最小 S3 stub（`s3-stub` 二进制 / `qm_probe::s3_stub`），
-探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页、跨进程检索，以及“独立进程 A 经真实 HTTP
+探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页、跨进程检索、跨进程 digest，以及“独立进程 A 经真实 HTTP
 embedding stub 发布向量、独立进程 B 只靠 `vector` 流召回”的闭环（见 `design.md` §5.1 / §6.20）。
 但它只是「协议层」，不是真桶，有两条读法要记住：
 
@@ -154,6 +155,12 @@ embedding stub 发布向量、独立进程 B 只靠 `vector` 流召回”的闭�
 - 它**不校验签名**：请求里的 `AWS4-HMAC-SHA256` 只被记录、不被验算，签名对不对只有真后端能拒。
 - 向量闭环的“真 HTTP”指 embedding stub 与 S3 stub 都走本地 socket；它仍没有证明 R2 的
   latency/quota/一致性，也没有把真 provider 的网络故障形态纳入。
+
+跨进程 digest 这条链的具体形状：`digest-probe` 的 `seed` 与 `read` 是两个独立进程，第二个只有桶坐标，
+必须自己把 pages（含删除）/ sessions / handoffs 三段从对象里重组出来；`read` 同时报告 manifest 仍认账的
+live pages，所以「manifest 已不再返回那条 path、digest 仍然报这条删除」是被断言的事实，而不是对代码的转述
+（见 `design.md` §6.20、`crates/qm-probe/tests/digest_probe_stub.rs`）。它与其他 stub 证据一样，
+**只在协议层验证过，真 R2 仍未验证**。
 
 ## 完整性自检
 

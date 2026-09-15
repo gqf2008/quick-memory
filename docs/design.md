@@ -147,6 +147,12 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   与分片，并把一个**与页面无词法重合**的查询召回为目标页。测试断言命中的 `streams` 和
   `streams_active` 都只有 `vector`，且无 provider 时命令硬失败、同宽换模型在查询向量生成前被身份守卫拒绝；
   它不是产品 CLI，而是探针的协议层证据。见 `crates/qm-probe/tests/search_probe_stub.rs`。
+- **digest 也有一条跨进程证据**：`digest-probe seed` 与 `digest-probe read` 是**两个独立进程**打同一个
+  stub——第一个提交两页、删掉其中一页、提交两个会话 head、开并认领一个 handoff，第二个只有桶坐标，
+  必须自己把 pages（含删除）/ sessions / handoffs 重组出来，并报告 manifest 仍认账的 live pages
+  （所以「manifest 已不再返回那条 path、digest 仍报这条删除」是被断言的）。故障对照：stub 把 listing
+  第一页当成整份答案 → 同一个正向谓词（三段内容、`at_ms` 时钟序、per-section 窗口与 `limit`）变红。
+  见 §6.20 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
 - **两个检索侧的故障注入对照**：stub 把 listing 的第一页当成完整答案（`--fault truncate-listing`）→
   读者只被告知 1 个对象、材料化出来的目录缺 `meta.json`，`query` 必须退出非零且不打印命中；
   stub 把每个 `GET` 的 body 截成 1 字节、`content-length` 仍然诚实（`--fault truncate-read-body`）→
@@ -180,6 +186,10 @@ HTTP `409 Conflict` 被 `object_store` 映射成 `Error::AlreadyExists`，`qm-st
 - **检索与向量路径同样只有 stub 级证据**：`search-probe` 的 build/query、project 以及
   vector-publish/vector-query 已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、5 项）；`project`
   里的“多台机器”是同一进程内的并发任务，只有桶访问是跨进程的，向量闭环则另有独立进程的 A/B 证据。
+- **检索与 digest 路径同样只有 stub 级证据**：`search-probe` 的 build/query 与 project、以及
+  `digest-probe` 的 seed/read 都已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、6 项）；
+  `project` 里的"多台机器"是同一进程内的并发任务，只有桶访问是跨进程的（`digest-probe` 的两个命令
+  才各是一个进程）。
 - **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
   所以"大对象"这条路径没有被覆盖。
 - **真实网络故障**：重试/退避只被单元测试覆盖，stub 不制造超时、5xx 或连接断裂。
@@ -698,6 +708,14 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
   三段，整窗无活动时输出一句话而不是三个空标题。
 - MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
   而不是按 server 启动时钟——否则长驻 server 的回看窗口会冻在启动那一刻。
+- **S3 协议层的跨进程证据**：`digest-probe` 的 `seed` / `read` 是两个独立进程。`seed` 通过真实
+  `object_store` S3 客户端提交两页、删掉其中一页、提交两个会话 head、开并认领一个 handoff（外加一个
+  只开不认领的），`read` 只有桶坐标，必须把三段重新组装出来，并同时报告 manifest 仍认账的 live pages——
+  所以「删除还在 digest 里、而 manifest 已经不返回那条 path」是被断言的事实，不是对代码的转述。
+  `crates/qm-probe/tests/digest_probe_stub.rs` 还钉住：`at_ms` 时钟序与 commit log 的 `seq` 序
+  **故意不一致**（只按日志顺序返回就会红）、per-section 窗口与 `limit`，以及一条
+  「第一条 listing 当成整份 listing」的故障对照——同一个谓词在健康腿为空、在故障腿非空。
+  这是协议层（`S3Stub`）证据，**真 R2 仍未验证**（§11）。
 
 ## 6.19 最近变化：会话开始时先看这里
 
@@ -1135,6 +1153,10 @@ mTLS 之外的完整读写链路、多机协作语义。
 
 - 自动采集：`qm hook` + `qm hook-drain`，fire-and-forget 契约（超时即 spool，永不阻塞 agent）。
 
+- 最近变化摘要（digest）：三张**权威**清单（commit log / session head / handoff）各按自己的时钟取窗口、
+  各自降序、各自截断；删除是提交而非缺席，manifest 已不再返回的 path 仍以 `PageDeleted` 出现。
+  跨进程 S3 协议层证据见 §6.20。
+
 - 回收：可达性分析 + 宽限期 + dry-run 默认；live 页面、历史链、会话链在回收后仍可读。
 - 鉴权/凭据方案仍未定（每机全桶 token vs Worker 网关 vs 混合），是**决策项**而非实现项：
   决策就绪的选项、对照与建议见 §9（**待用户拍板**，本文不构成批准）。
@@ -1211,3 +1233,8 @@ mTLS 之外的完整读写链路、多机协作语义。
 5. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
    `search-probe vector-query`，并把无 provider / 同宽换模型两条 fail-closed 对照一起跑一遍——
    **协议层（stub）已验证，真 R2 待验证**（无凭据）。见 §5.1 与 §6.20。
+6. 真 R2 上跑 `qm-probe digest-probe seed` 然后 `read`（跨进程恢复最近变化摘要）—— **协议层已验证（stub），真 R2 待验证**
+   （无凭据）：两个独立 `digest-probe` 进程在本地 S3 stub 上跑通 seed → read，
+   删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，
+   并有一条 listing 截断的故障对照使同一个正向谓词变红。见 §6.20 与
+   `crates/qm-probe/tests/digest_probe_stub.rs`。
