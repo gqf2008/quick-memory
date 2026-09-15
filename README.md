@@ -14,6 +14,7 @@ S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**�
 - 多机分片发布 + 跨分片 RRF 检索 + 权威可见性过滤：过期副本永不答出、离线机器的内容仍可搜（`qm-store`/`qm-search`）
 - 删除（tombstone）+ 压缩（租约保护、结果不变、分片下降）+ 租约抢占语义（`qm-store`/`qm-search`）
 - Quickwit `.split` 容器解包：读方无需 Quickwit 集群即可检索该格式的分片（`qm-search::quickwit_split`）
+- 采集与编译：观测按会话链捕获（入口强制脱敏 + 限长），编译成页面并可被检索；重放与重编译幂等（`qm-store`/`qm-search`）
 
 真 R2 与 Quickwit 的验证需要凭据与二进制，见下。
 
@@ -53,7 +54,10 @@ cargo run -p qm-probe --bin manifest-probe -- --machines 3 --writes 5
 # 3) 多机发布 + 检索（含过期副本过滤与离线机器）
 cargo run -p qm-probe --bin search-probe -- project
 
-# 4) 跨机器检索（单分片）：A 构建并上传分片
+# 4) 采集 → 编译 → 检索一条会话
+cargo run -p qm-probe --bin session-probe
+
+# 5) 跨机器检索（单分片）：A 构建并上传分片
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 build docs.jsonl
 #    B（另一台机器/另一次运行）只靠桶材料化并查询
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 query "consensus"

@@ -9,11 +9,14 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 mod model;
+mod scrub;
 
 pub use model::{
-    CatalogHead, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion,
-    SplitEntry, Tombstone, WalEntry, content_hash, derive_page_id,
+    CatalogHead, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment,
+    PageEntry, PageVersion, SessionHead, SplitEntry, Tombstone, WalEntry, content_hash,
+    derive_observation_id, derive_page_id, derive_segment_id,
 };
+pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 
 /// Version prefix of the object layout. Bumping it is a breaking change.
 pub const KEY_ROOT: &str = "v1";
@@ -98,6 +101,7 @@ id_type!(ProjectId, "project");
 id_type!(WriterId, "writer");
 id_type!(PageId, "page");
 id_type!(ObservationId, "observation");
+id_type!(SessionId, "session");
 
 impl PageId {
     /// Construct from a value this crate derived, bypassing validation.
@@ -267,6 +271,33 @@ impl KeyLayout {
             "{}/index/splits/{}/{seq:010}",
             self.scope_prefix(ws, proj),
             writer
+        )
+    }
+
+    /// Prefix holding every session of a project.
+    #[must_use]
+    pub fn session_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/sessions", self.scope_prefix(ws, proj))
+    }
+
+    /// Per-session commit point: the CAS head of an observation chain.
+    #[must_use]
+    pub fn session_head(&self, ws: &WorkspaceId, proj: &ProjectId, session: &SessionId) -> String {
+        format!("{}/{session}/head.json", self.session_prefix(ws, proj))
+    }
+
+    /// Immutable observation segment, addressed by its content hash.
+    #[must_use]
+    pub fn session_segment(
+        &self,
+        ws: &WorkspaceId,
+        proj: &ProjectId,
+        session: &SessionId,
+        segment_id: &str,
+    ) -> String {
+        format!(
+            "{}/{session}/segments/{segment_id}.json",
+            self.session_prefix(ws, proj)
         )
     }
 

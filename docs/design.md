@@ -49,8 +49,11 @@ quick-memory 跑在多机上，这三条全部不可用，因此**索引发布�
 ```
 v1/
 └── ws/<ws>/proj/<proj>/
-    ├── manifest.json                              # 唯一提交点（CAS）
+    ├── manifest.json                              # 页面提交点（CAS）
     ├── wal/<page_id>.json                         # 不可变提交记录
+    ├── sessions/<session_id>/
+    │   ├── head.json                              # 会话提交点（CAS，每会话独立）
+    │   └── segments/<sha256>.json                 # 不可变观测段（prev 链）
     ├── pages/<path>/versions/<page_id>.md         # 不可变页面版本
     ├── observations/<obs_id>.json                 # 不可变原始观测
     ├── index/
@@ -151,6 +154,29 @@ FileMetadata = 8 字节版本头（magic = 403881646，version = 1）+ JSON {"fi
 - **本机文件系统不是可用后端**：`object_store` 的 local 后端不支持条件写，探针会在预检阶段直接拒绝
   （这正是"本地文件不能当对象存储语义模型"的可执行证据）。
 
+## 6.6 采集与编译（S4 已实现）
+
+**采集**（`ingest_observations`）：
+
+- `Observation` 只含内容（`session_id / actor / kind / text / created_at_ms`）＋由内容派生的 `observation_id`。
+  捕获路径**不分配序号**，因此 hook 重试写的是同一个对象。
+- **脱敏在唯一的入口做**：`Observation::sanitized()` 在 `ingest_observations` 内被强制调用，scrub 掉常见凭据形状
+  （Bearer、`password=`、`sk-…`、`AKIA…`、URL 内嵌密码），把 `text` 限到 16 KiB、`actor`/`kind` 限长，
+  并**重算 id** 使之与落库字节一致。调用方忘了脱敏也不会写进秘密。
+- **会话是独立提交域**：`sessions/<sid>/head.json` 是 CAS 提交点，段是内容寻址的不可变对象并带 `prev` 链。
+  两台机器捕获**不同**会话零竞争；捕获**同一**会话只在该会话 head 上竞争。可见性 = 从 head 沿 `prev` 可达，
+  因此输掉 CAS 的段是孤儿，不会变成幽灵事件。
+- 重放同一批（head 末尾就是这批）是 no-op；读侧再按 `observation_id` 去重，所以"重复段"只是浪费，不会出错。
+- 会话发现靠 LIST `sessions/` 下的 `head.json`：没有 head 的会话不可见。
+
+**编译**（`consolidate_session`）：
+
+- 渲染是**确定性函数**：同样的链永远渲染出同样的页面。这让任何机器都能重跑，也让"没变化就不写"可判定。
+- 链没变时**不追加版本**（`already_up_to_date`）。
+- 用租约保护（`consolidate/<ws>/<proj>/<sid>`），拿不到就 `skipped`——和压缩一样是可放弃作业。
+- 输出走的是普通页面提交路径（`commit_page`），因此自动获得 supersession 链、索引发布与权威过滤；
+  将来接 LLM 重写时，也走同一条路径，不需要新机制。
+
 ## 7. 删除与压缩（S3 已实现）
 
 - **不用 Quickwit delete-tasks**。那是集群形态的产物（只对 mature split 生效、需要协调者与可见性探针）。
@@ -202,6 +228,15 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - ETag CAS 契约与探针（含阳性对照：接受一切的后端会被探针报错）。
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
+
+**S4（采集与编译）**
+
+- 捕获：3 批观测 → head `generation=3`、`count=6`；重复提交最后一批被识别为 no-op（不新增段）。
+- 两台机器并发捕获同一会话：两批都落地（`count=2`/`generation=2`），读侧按 id 去重后正好两条。
+- **脱敏在入口生效**：调用方直接塞 `api_key=abcd1234` 也存不进秘密，且落库的 `observation_id` 与落库字节一致。
+- 会话互相独立：三会话并存可按 LIST 发现；只有段没有 head 的会话**不可见**。
+- 编译：3 条观测 → 一页 `sessions/<sid>.md`（正文含全部文本）→ 发布分片后**可被检索**；
+  链没变时重编译 `already_up_to_date` 且不消耗 manifest `seq`；另一台从未见过该状态的机器可编译；租约被占则 `skipped`。
 
 **S3（删除与压缩）**
 

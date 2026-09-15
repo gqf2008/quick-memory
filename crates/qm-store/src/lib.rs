@@ -110,6 +110,14 @@ pub enum StoreError {
     Backend(String),
 }
 
+impl From<qm_core::CoreError> for StoreError {
+    fn from(error: qm_core::CoreError) -> Self {
+        // A key in the bucket that does not yield a valid identifier means the
+        // stored data is not what this code believes it to be.
+        Self::Corrupt(error.to_string())
+    }
+}
+
 impl From<OsError> for StoreError {
     fn from(error: OsError) -> Self {
         match error {
@@ -124,7 +132,8 @@ impl From<OsError> for StoreError {
 mod project;
 
 pub use project::{
-    CommitOutcome, CommitPageRequest, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome,
+    CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
+    LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome, ReplaceCatalogOutcome,
     RetryPolicy,
 };
 

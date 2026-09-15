@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use qm_core::{
-    CatalogHead, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest, PageEntry, PagePath,
-    PageVersion, ProjectId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash,
-    derive_page_id,
+    CatalogHead, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest, Observation,
+    ObservationSegment, PageEntry, PagePath, PageVersion, ProjectId, SessionHead, SessionId,
+    SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash, derive_page_id,
+    derive_segment_id,
 };
 
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -49,6 +50,40 @@ pub struct LoadedManifest {
     pub manifest: Manifest,
     /// Version to pass to a CAS, or `None` when the manifest does not exist yet.
     pub version: Option<ObjectVersion>,
+}
+
+/// One batch of observations to ingest.
+#[derive(Debug, Clone)]
+pub struct IngestObservationsRequest {
+    /// Workspace the session belongs to.
+    pub workspace_id: WorkspaceId,
+    /// Project the session belongs to.
+    pub project_id: ProjectId,
+    /// Session being captured.
+    pub session_id: SessionId,
+    /// Machine performing the capture.
+    pub writer_id: WriterId,
+    /// Already-scrubbed observations, in arrival order.
+    pub observations: Vec<Observation>,
+    /// Commit timestamp in milliseconds.
+    pub now_ms: i64,
+}
+
+/// What an ingest did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// Id of the committed segment (empty when the batch was already present).
+    pub segment_id: String,
+    /// Segments committed after this ingest.
+    pub generation: u64,
+    /// Observations committed across the chain.
+    pub count: u64,
+    /// Observations accepted from this batch.
+    pub accepted: usize,
+    /// True when this exact batch was already committed.
+    pub already_present: bool,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
 }
 
 /// A catalog plus the head version it was read at.
@@ -345,6 +380,267 @@ impl ProjectStore {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Load a session's head, if the session has ever committed.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the stored head cannot be decoded.
+    pub async fn load_session_head(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Option<(SessionHead, ObjectVersion)>, StoreError> {
+        let key = self
+            .layout
+            .session_head(workspace_id, project_id, session_id);
+        match self.cas.read(&key).await {
+            Ok((bytes, version)) => Ok(Some((decode(&bytes, &key)?, version))),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Append a batch of observations to a session's chain.
+    ///
+    /// Sessions are their own commit domains: two machines capturing two
+    /// sessions never contend, and two machines capturing the *same* session
+    /// contend only on that session's head. Re-ingesting the batch the head
+    /// already ends with is a no-op, which is what makes a hook that retries
+    /// safe.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race.
+    pub async fn ingest_observations(
+        &self,
+        request: IngestObservationsRequest,
+    ) -> Result<IngestOutcome, StoreError> {
+        let head_key = self.layout.session_head(
+            &request.workspace_id,
+            &request.project_id,
+            &request.session_id,
+        );
+        // Scrubbing happens here, at the only path into storage, so no caller
+        // can persist an unscubbed observation by forgetting to scrub first.
+        let observations: Vec<Observation> = request
+            .observations
+            .iter()
+            .cloned()
+            .map(Observation::sanitized)
+            .collect();
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let current = self
+                .load_session_head(
+                    &request.workspace_id,
+                    &request.project_id,
+                    &request.session_id,
+                )
+                .await?;
+
+            // Replay guard: if the chain already ends with exactly this batch,
+            // there is nothing to commit.
+            if let Some((head, _)) = &current {
+                let last = self
+                    .read_segment(
+                        &request.workspace_id,
+                        &request.project_id,
+                        &request.session_id,
+                        &head.segment_id,
+                    )
+                    .await?;
+                if last.observations == observations {
+                    return Ok(IngestOutcome {
+                        segment_id: String::new(),
+                        generation: head.generation,
+                        count: head.count,
+                        accepted: 0,
+                        already_present: true,
+                        attempts: attempt,
+                    });
+                }
+            }
+
+            let segment = ObservationSegment {
+                schema: MANIFEST_SCHEMA,
+                session_id: request.session_id.clone(),
+                prev: current.as_ref().map(|(head, _)| head.segment_id.clone()),
+                observations: observations.clone(),
+            };
+            let segment_id = derive_segment_id(&segment);
+            let segment_key = self.layout.session_segment(
+                &request.workspace_id,
+                &request.project_id,
+                &request.session_id,
+                &segment_id,
+            );
+            self.create_or_verify(&segment_key, &segment).await?;
+
+            let head = SessionHead {
+                schema: MANIFEST_SCHEMA,
+                session_id: request.session_id.clone(),
+                generation: current.as_ref().map_or(1, |(head, _)| head.generation + 1),
+                segment_id: segment_id.clone(),
+                count: current.as_ref().map_or(0, |(head, _)| head.count)
+                    + observations.len() as u64,
+                updated_at_ms: request.now_ms,
+            };
+            let bytes = encode(&head)?;
+            let committed = match &current {
+                Some((_, version)) => self.cas.update(&head_key, bytes, version).await,
+                None => self.cas.create(&head_key, bytes).await,
+            };
+
+            match committed {
+                Ok(_) => {
+                    return Ok(IngestOutcome {
+                        segment_id,
+                        generation: head.generation,
+                        count: head.count,
+                        accepted: observations.len(),
+                        already_present: false,
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Read one segment by id.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the segment does not belong to the session.
+    pub async fn read_segment(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        segment_id: &str,
+    ) -> Result<ObservationSegment, StoreError> {
+        let key = self
+            .layout
+            .session_segment(workspace_id, project_id, session_id, segment_id);
+        let (bytes, _) = self.cas.read(&key).await?;
+        let segment: ObservationSegment = decode(&bytes, &key)?;
+        if segment.session_id != *session_id {
+            return Err(StoreError::Corrupt(format!(
+                "{key} holds a segment for {}",
+                segment.session_id
+            )));
+        }
+        if derive_segment_id(&segment) != segment_id {
+            return Err(StoreError::Corrupt(format!(
+                "{key} does not hash to its key"
+            )));
+        }
+        Ok(segment)
+    }
+
+    /// Walk a session's chain, oldest segment first.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] on a broken or cyclic chain.
+    pub async fn read_session_chain(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<ObservationSegment>, StoreError> {
+        let Some((head, _)) = self
+            .load_session_head(workspace_id, project_id, session_id)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut newest_first = Vec::new();
+        let mut cursor = Some(head.segment_id);
+        while let Some(segment_id) = cursor {
+            if newest_first.len() >= MAX_HISTORY_DEPTH {
+                return Err(StoreError::Corrupt(format!(
+                    "session {session_id} chain exceeds {MAX_HISTORY_DEPTH} segments"
+                )));
+            }
+            let segment = self
+                .read_segment(workspace_id, project_id, session_id, &segment_id)
+                .await?;
+            cursor = segment.prev.clone();
+            newest_first.push(segment);
+        }
+        newest_first.reverse();
+        Ok(newest_first)
+    }
+
+    /// Every observation of a session, oldest first, deduplicated by id.
+    ///
+    /// Deduplication is why a duplicated batch is merely wasteful rather than
+    /// wrong: two segments can carry the same event, and consumers see it once.
+    ///
+    /// # Errors
+    /// Propagates chain read failures.
+    pub async fn read_session_observations(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<Observation>, StoreError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut observations = Vec::new();
+        for segment in self
+            .read_session_chain(workspace_id, project_id, session_id)
+            .await?
+        {
+            for observation in segment.observations {
+                if seen.insert(observation.observation_id.clone()) {
+                    observations.push(observation);
+                }
+            }
+        }
+        Ok(observations)
+    }
+
+    /// Discover the sessions of a project.
+    ///
+    /// Sessions are found by listing their heads: a session whose head never
+    /// committed has no head object, so its orphaned segments stay invisible.
+    ///
+    /// # Errors
+    /// Propagates listing failures.
+    pub async fn list_sessions(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<Vec<SessionId>, StoreError> {
+        let prefix = self.layout.session_prefix(workspace_id, project_id);
+        let listed = self.cas.list(&prefix).await?;
+        let mut sessions = Vec::new();
+        for (key, _) in listed {
+            let Some(rest) = key.strip_prefix(&format!("{prefix}/")) else {
+                continue;
+            };
+            let Some(session) = rest.strip_suffix("/head.json") else {
+                continue;
+            };
+            if session.contains('/') {
+                continue;
+            }
+            sessions.push(SessionId::new(session)?);
+        }
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
     }
 
     /// Delete a page by tombstoning it.
@@ -1013,6 +1309,205 @@ mod tests {
         assert!(
             attempts > 8,
             "expected at least one head CAS conflict, saw {attempts} attempts"
+        );
+    }
+
+    fn observation(session: &str, text: &str, at: i64) -> Observation {
+        let session_id = SessionId::new(session).unwrap();
+        Observation {
+            schema: MANIFEST_SCHEMA,
+            observation_id: qm_core::derive_observation_id(
+                &session_id,
+                "codex",
+                "tool_use",
+                text,
+                at,
+            ),
+            session_id,
+            actor: "codex".into(),
+            kind: "tool_use".into(),
+            text: text.into(),
+            created_at_ms: at,
+        }
+    }
+
+    fn ingest(session: &str, texts: &[&str], now_ms: i64) -> IngestObservationsRequest {
+        IngestObservationsRequest {
+            workspace_id: ws(),
+            project_id: proj(),
+            session_id: SessionId::new(session).unwrap(),
+            writer_id: WriterId::new("mbp-1").unwrap(),
+            observations: texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| observation(session, text, now_ms + index as i64))
+                .collect(),
+            now_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_capture_builds_a_visible_chain_and_tolerates_replays() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let session = SessionId::new("sess-1").unwrap();
+
+        for (index, texts) in [["first", "second"], ["third", "fourth"], ["fifth", "sixth"]]
+            .iter()
+            .enumerate()
+        {
+            let outcome = store
+                .ingest_observations(ingest("sess-1", texts, 10 + index as i64))
+                .await
+                .unwrap();
+            assert!(!outcome.already_present);
+            assert_eq!(outcome.generation, index as u64 + 1);
+            assert_eq!(outcome.count, (index as u64 + 1) * 2);
+            assert_eq!(outcome.accepted, 2);
+        }
+
+        let (head, _) = store
+            .load_session_head(&ws(), &proj(), &session)
+            .await
+            .unwrap()
+            .expect("head");
+        assert_eq!(head.generation, 3);
+        assert_eq!(head.count, 6);
+
+        let observations = store
+            .read_session_observations(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        let texts: Vec<&str> = observations.iter().map(|o| o.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["first", "second", "third", "fourth", "fifth", "sixth"]
+        );
+
+        // Replaying the last batch must not append anything.
+        let replay = store
+            .ingest_observations(ingest("sess-1", &["fifth", "sixth"], 12))
+            .await
+            .unwrap();
+        assert!(replay.already_present, "a retried batch must be a no-op");
+        assert_eq!(replay.count, 6);
+        let (head, _) = store
+            .load_session_head(&ws(), &proj(), &session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.generation, 3, "a replay must not add a segment");
+    }
+
+    #[tokio::test]
+    async fn two_machines_capturing_one_session_keep_both_batches() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = machine(&bucket);
+        let second = machine(&bucket);
+        let session = SessionId::new("sess-shared").unwrap();
+
+        let a = {
+            let store = machine(&bucket);
+            tokio::spawn(async move {
+                store
+                    .ingest_observations(ingest("sess-shared", &["from-a"], 100))
+                    .await
+                    .unwrap()
+            })
+        };
+        let b = {
+            let store = machine(&bucket);
+            tokio::spawn(async move {
+                store
+                    .ingest_observations(ingest("sess-shared", &["from-b"], 101))
+                    .await
+                    .unwrap()
+            })
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+
+        let (head, _) = second
+            .load_session_head(&ws(), &proj(), &session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.count, 2, "both batches must land");
+        assert_eq!(head.generation, 2, "one segment per batch");
+        let observations = first
+            .read_session_observations(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let texts: BTreeSet<&str> = observations.iter().map(|o| o.text.as_str()).collect();
+        assert_eq!(texts, BTreeSet::from(["from-a", "from-b"]));
+    }
+
+    #[tokio::test]
+    async fn scrubbing_happens_inside_the_ingest_boundary() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let session = SessionId::new("sess-secret").unwrap();
+        let mut request = ingest(
+            "sess-secret",
+            &["export api_key=abcd1234 before the run"],
+            5,
+        );
+        // Even a caller that hands over raw text cannot persist a secret.
+        request.observations[0].text = "export api_key=abcd1234 before the run".into();
+        store.ingest_observations(request).await.unwrap();
+
+        let observations = store
+            .read_session_observations(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(
+            !observations[0].text.contains("abcd1234"),
+            "{}",
+            observations[0].text
+        );
+        assert!(observations[0].text.contains("[REDACTED]"));
+        // The stored id must match the stored bytes.
+        assert_eq!(
+            observations[0].observation_id,
+            qm_core::derive_observation_id(
+                &session,
+                &observations[0].actor,
+                &observations[0].kind,
+                &observations[0].text,
+                observations[0].created_at_ms,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_are_independent_commit_domains() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        for session in ["sess-a", "sess-b", "sess-c"] {
+            store
+                .ingest_observations(ingest(session, &["one"], 1))
+                .await
+                .unwrap();
+        }
+        let sessions = store.list_sessions(&ws(), &proj()).await.unwrap();
+        let names: Vec<&str> = sessions.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names, vec!["sess-a", "sess-b", "sess-c"]);
+
+        // A session that never committed a head has no visible segment.
+        let orphan = store
+            .cas
+            .create(
+                "v1/ws/acme/proj/ai-memory/sessions/sess-orphan/segments/deadbeef.json",
+                bytes::Bytes::from_static(b"{}"),
+            )
+            .await;
+        assert!(orphan.is_ok());
+        let sessions = store.list_sessions(&ws(), &proj()).await.unwrap();
+        assert!(
+            !sessions.iter().any(|s| s.as_str() == "sess-orphan"),
+            "a session without a committed head must stay invisible"
         );
     }
 

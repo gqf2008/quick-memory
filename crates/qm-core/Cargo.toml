@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
+regex = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -325,6 +325,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_scenario_captures_compiles_and_finds_a_session() {
+        let bucket: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let report = run_session_scenario(&bucket, Some("unit-session".to_string()))
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.observations, 3);
+        assert_eq!(report.segments, 2);
+        assert_eq!(report.hits, 1);
+    }
+
+    #[tokio::test]
     async fn scenario_verifies_a_backend_with_working_cas() {
         let bucket: std::sync::Arc<dyn ObjectStore> =
             std::sync::Arc::new(object_store::memory::InMemory::new());
@@ -639,5 +652,174 @@ pub async fn run_search_scenario(
         failures,
         splits_before,
         splits_after: compact.splits_after,
+    })
+}
+
+/// What the session scenario observed, after verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionScenarioReport {
+    /// Workspace id the run used.
+    pub workspace: String,
+    /// Project id the run used.
+    pub project: String,
+    /// Observations captured into the session chain.
+    pub observations: usize,
+    /// Segments the chain was made of.
+    pub segments: usize,
+    /// Splits published for the compiled page.
+    pub splits: usize,
+    /// Hits for a term that only appears in a captured observation.
+    pub hits: usize,
+    /// Verification failures; empty means the run proved the invariants.
+    pub failures: Vec<String>,
+}
+
+/// Run the S4 acceptance scenario against `bucket` and verify it.
+///
+/// Capture a session, compile it into a page, publish that page as a split, and
+/// search for it from a fresh reader — then compile again and require that
+/// nothing new was written.
+///
+/// # Errors
+/// Fails on backend, ingest, compile, publish, or search errors; verification
+/// results are reported in [`SessionScenarioReport::failures`].
+pub async fn run_session_scenario(
+    bucket: &std::sync::Arc<dyn ObjectStore>,
+    scope_suffix: Option<String>,
+) -> Result<SessionScenarioReport> {
+    use qm_core::{MANIFEST_SCHEMA, Observation, ProjectId, SessionId, WorkspaceId, WriterId};
+    use qm_search::{PageDoc, consolidate::consolidate_session, publish_split_index};
+    use qm_store::{IngestObservationsRequest, ProjectStore, RetryPolicy};
+
+    let run = scope_suffix.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    });
+    let workspace = WorkspaceId::new(format!("probe-ws-{run}"))?;
+    let project = ProjectId::new(format!("probe-proj-{run}"))?;
+    let session = SessionId::new(format!("probe-sess-{run}"))?;
+    let writer = WriterId::new("probe-session")?;
+    let store = ProjectStore::new(std::sync::Arc::clone(bucket), "v1").with_retry(RetryPolicy {
+        max_attempts: 32,
+        base_delay: std::time::Duration::from_millis(10),
+    });
+
+    let mut failures = Vec::new();
+    for (batch, texts) in [
+        vec!["switched the index to tantivy splits", "ran the full suite"],
+        vec!["published the catalog"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let observations: Vec<Observation> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let created_at_ms = (batch * 100 + index) as i64;
+                Observation {
+                    schema: MANIFEST_SCHEMA,
+                    observation_id: qm_core::derive_observation_id(
+                        &session,
+                        "probe",
+                        "tool_use",
+                        text,
+                        created_at_ms,
+                    ),
+                    session_id: session.clone(),
+                    actor: "probe".into(),
+                    kind: "tool_use".into(),
+                    text: (*text).to_string(),
+                    created_at_ms,
+                }
+            })
+            .collect();
+        store
+            .ingest_observations(IngestObservationsRequest {
+                workspace_id: workspace.clone(),
+                project_id: project.clone(),
+                session_id: session.clone(),
+                writer_id: writer.clone(),
+                observations,
+                now_ms: batch as i64,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+
+    let compiled =
+        consolidate_session(&store, &workspace, &project, &session, &writer, 10, 60_000).await?;
+    if compiled.skipped || compiled.already_up_to_date {
+        failures.push("consolidation did not compile a fresh page".to_string());
+    }
+    let page_path = qm_core::PagePath::new(format!("sessions/{session}.md"))?;
+    let page = store
+        .read_page(&workspace, &project, &page_path)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .context("compiled page missing")?;
+    if !page.body.contains("tantivy splits") {
+        failures.push("compiled page is missing captured text".to_string());
+    }
+
+    let build_root = tempfile::TempDir::new().context("build dir")?;
+    let doc = PageDoc::from_version(&workspace, &project, &page, 10);
+    let published = publish_split_index(
+        bucket.as_ref(),
+        &store,
+        &workspace,
+        &project,
+        &writer,
+        1,
+        &[doc],
+        &build_root.path().join("session"),
+        10,
+    )
+    .await?;
+
+    let reader = ProjectStore::new(std::sync::Arc::clone(bucket), "v1");
+    let cache = tempfile::TempDir::new().context("cache dir")?;
+    let found = qm_search::search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        cache.path(),
+        "tantivy",
+        10,
+    )
+    .await?;
+    if found.hits.len() != 1 || found.hits[0].path != format!("sessions/{session}.md") {
+        failures.push(format!("compiled page is not searchable: {:?}", found.hits));
+    }
+
+    let again = consolidate_session(
+        &reader,
+        &workspace,
+        &project,
+        &session,
+        &WriterId::new("probe-other")?,
+        20,
+        60_000,
+    )
+    .await?;
+    if !again.already_up_to_date {
+        failures.push("recompiling an unchanged chain wrote a new version".to_string());
+    }
+
+    let chain = reader
+        .read_session_chain(&workspace, &project, &session)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(SessionScenarioReport {
+        workspace: workspace.to_string(),
+        project: project.to_string(),
+        observations: compiled.observations,
+        segments: chain.len(),
+        splits: published.generation as usize,
+        hits: found.hits.len(),
+        failures,
     })
 }

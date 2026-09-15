@@ -15,7 +15,21 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{PageId, PagePath, ProjectId, WorkspaceId, WriterId};
+use crate::scrub::scrub;
+use crate::{PageId, PagePath, ProjectId, SessionId, WorkspaceId, WriterId};
+
+/// Bound a short field such as an actor or event kind.
+fn bound(value: &str, max: usize) -> String {
+    let mut out = value.trim().to_string();
+    if out.len() > max {
+        let mut cut = max;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    out
+}
 
 /// Lower-case hex SHA-256 of an object body, used for content-addressed keys.
 #[must_use]
@@ -292,6 +306,120 @@ impl IndexCatalog {
     }
 }
 
+/// One captured event from an agent session.
+///
+/// Content-only, like every other immutable object here: the id is derived from
+/// the bytes, so a hook that retries the same event produces the same object
+/// instead of a duplicate. Capture never assigns a sequence — the session head
+/// does that when the CAS wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Content-derived id, also the deduplication key.
+    pub observation_id: String,
+    /// Session this event belongs to.
+    pub session_id: SessionId,
+    /// Harness or agent that emitted it.
+    pub actor: String,
+    /// Event kind, e.g. `tool_use` or `session_end`.
+    pub kind: String,
+    /// Scrubbed event text.
+    pub text: String,
+    /// Client-supplied timestamp in milliseconds; ordering only.
+    pub created_at_ms: i64,
+}
+
+impl Observation {
+    /// Scrub, bound, and re-id an observation.
+    ///
+    /// This is the intake boundary in type form: the id is recomputed after
+    /// scrubbing so it always matches the bytes that get stored, and callers
+    /// cannot accidentally persist a secret the scrubber removed.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.text = scrub(&self.text);
+        self.actor = bound(&self.actor, 128);
+        self.kind = bound(&self.kind, 64);
+        self.observation_id = derive_observation_id(
+            &self.session_id,
+            &self.actor,
+            &self.kind,
+            &self.text,
+            self.created_at_ms,
+        );
+        self
+    }
+}
+
+/// Derive an observation id from everything that makes the event unique.
+#[must_use]
+pub fn derive_observation_id(
+    session_id: &SessionId,
+    actor: &str,
+    kind: &str,
+    text: &str,
+    created_at_ms: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"quick-memory/observation/v1\0");
+    hasher.update(session_id.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(actor.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(text.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(created_at_ms.to_le_bytes());
+    hex(&hasher.finalize())
+}
+
+/// An immutable batch of observations, chained to its predecessor.
+///
+/// The chain is what makes capture visible: a segment is readable only when it
+/// is reachable from the session head, so a batch that lost its CAS race is an
+/// orphan rather than a phantom event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationSegment {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Session the segment belongs to.
+    pub session_id: SessionId,
+    /// Id of the segment this one extends, if any.
+    pub prev: Option<String>,
+    /// Events captured in this batch, in the order they arrived.
+    pub observations: Vec<Observation>,
+}
+
+/// Content hash of a segment, used as its object key.
+#[must_use]
+pub fn derive_segment_id(segment: &ObservationSegment) -> String {
+    match serde_json::to_vec(segment) {
+        Ok(bytes) => content_hash(&bytes),
+        // Serialization of these types cannot fail; fall back to a value that
+        // is obviously not a real id rather than panicking in a capture path.
+        Err(_) => "unserializable-segment".to_string(),
+    }
+}
+
+/// CAS head of a session's observation chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHead {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Session this head belongs to.
+    pub session_id: SessionId,
+    /// Number of committed segments.
+    pub generation: u64,
+    /// Newest committed segment id.
+    pub segment_id: String,
+    /// Total observations committed across the chain.
+    pub count: u64,
+    /// When the head was last committed, in milliseconds.
+    pub updated_at_ms: i64,
+}
+
 /// A lease on an optional, abandonable job (compaction, garbage collection).
 ///
 /// Leases exist so that "only one machine at a time" is expressible without a
@@ -380,6 +508,51 @@ mod tests {
         assert_eq!(catalog.generation, 1);
         assert!(catalog.contains_hash("h1"));
         assert_eq!(catalog.covered_until_ms, 10);
+    }
+
+    #[test]
+    fn observation_ids_are_content_addressed_and_dedupe_replays() {
+        let session = SessionId::new("sess-1").unwrap();
+        let first = derive_observation_id(&session, "codex", "tool_use", "ran cargo t", 10);
+        assert_eq!(
+            first,
+            derive_observation_id(&session, "codex", "tool_use", "ran cargo t", 10),
+            "a retry must produce the same id"
+        );
+        assert_ne!(
+            first,
+            derive_observation_id(&session, "codex", "tool_use", "ran cargo t", 11)
+        );
+        assert_ne!(
+            first,
+            derive_observation_id(&session, "codex", "tool_use", "ran cargo t2", 10)
+        );
+
+        let segment = ObservationSegment {
+            schema: MANIFEST_SCHEMA,
+            session_id: session.clone(),
+            prev: None,
+            observations: vec![Observation {
+                schema: MANIFEST_SCHEMA,
+                observation_id: first,
+                session_id: session,
+                actor: "codex".into(),
+                kind: "tool_use".into(),
+                text: "ran cargo t".into(),
+                created_at_ms: 10,
+            }],
+        };
+        assert_eq!(
+            derive_segment_id(&segment),
+            derive_segment_id(&segment.clone())
+        );
+        let mut other = segment.clone();
+        other.prev = Some("abc".into());
+        assert_ne!(
+            derive_segment_id(&segment),
+            derive_segment_id(&other),
+            "changing the chain position changes the segment identity"
+        );
     }
 
     #[test]

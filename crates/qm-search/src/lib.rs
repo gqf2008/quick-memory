@@ -574,6 +574,7 @@ pub async fn search_project(
     })
 }
 
+pub mod consolidate;
 pub mod quickwit_split;
 
 #[cfg(test)]
@@ -581,8 +582,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::consolidate::consolidate_session;
     use object_store::memory::InMemory;
-    use qm_core::{PagePath, WriterId};
+    use qm_core::{PagePath, SessionId, WriterId};
     use qm_store::{CommitPageRequest, RetryPolicy};
     use tempfile::TempDir;
 
@@ -1024,6 +1026,174 @@ mod tests {
         let hits = search(cache.path(), "tantivy", 5).unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "notes/quickwit.md");
+    }
+
+    fn observation(session: &SessionId, text: &str, at: i64) -> qm_core::Observation {
+        qm_core::Observation {
+            schema: qm_core::MANIFEST_SCHEMA,
+            observation_id: qm_core::derive_observation_id(session, "codex", "tool_use", text, at),
+            session_id: session.clone(),
+            actor: "codex".into(),
+            kind: "tool_use".into(),
+            text: text.into(),
+            created_at_ms: at,
+        }
+    }
+
+    async fn ingest(store: &ProjectStore, session: &SessionId, texts: &[&str], now_ms: i64) {
+        store
+            .ingest_observations(qm_store::IngestObservationsRequest {
+                workspace_id: WorkspaceId::new("acme").unwrap(),
+                project_id: ProjectId::new("ai-memory").unwrap(),
+                session_id: session.clone(),
+                writer_id: WriterId::new("mbp-a").unwrap(),
+                observations: texts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| observation(session, text, now_ms + index as i64))
+                    .collect(),
+                now_ms,
+            })
+            .await
+            .expect("ingest");
+    }
+
+    /// S4 acceptance: raw capture becomes a durable, searchable page, and
+    /// re-running the compiler over an unchanged chain writes nothing.
+    #[tokio::test]
+    async fn a_session_is_compiled_into_a_searchable_page() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let consolidator = WriterId::new("mbp-a").unwrap();
+
+        ingest(
+            &project,
+            &session,
+            &[
+                "switched the index to tantivy splits",
+                "ran the full test suite",
+            ],
+            100,
+        )
+        .await;
+        ingest(&project, &session, &["published the catalog"], 200).await;
+
+        let outcome = consolidate_session(
+            &project,
+            &workspace,
+            &project_id,
+            &session,
+            &consolidator,
+            300,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.skipped && !outcome.already_up_to_date);
+        assert_eq!(outcome.observations, 3);
+        assert_eq!(outcome.segments, 2);
+        assert_eq!(outcome.manifest_seq, 1);
+
+        let page_path = PagePath::new("sessions/sess-1.md").unwrap();
+        let page = project
+            .read_page(&workspace, &project_id, &page_path)
+            .await
+            .unwrap()
+            .expect("compiled page");
+        assert!(page.body.contains("tantivy splits"), "{}", page.body);
+        assert!(page.body.contains("published the catalog"), "{}", page.body);
+        assert!(
+            page.body.contains("Compiled from 3 observations"),
+            "{}",
+            page.body
+        );
+
+        // The compiled page is searchable like any other page.
+        let build_root = TempDir::new().unwrap();
+        let doc = PageDoc::from_version(&workspace, &project_id, &page, 300);
+        publish_split_index(
+            bucket.as_ref(),
+            &project,
+            &workspace,
+            &project_id,
+            &WriterId::new("mbp-a").unwrap(),
+            1,
+            &[doc],
+            &build_root.path().join("sess"),
+            300,
+        )
+        .await
+        .unwrap();
+        let found = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "tantivy",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.hits.len(), 1, "{:?}", found.hits);
+        assert_eq!(found.hits[0].path, "sessions/sess-1.md");
+
+        // Recompiling an unchanged chain must not append a version.
+        let again = consolidate_session(
+            &project,
+            &workspace,
+            &project_id,
+            &session,
+            &consolidator,
+            400,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(again.already_up_to_date);
+        assert_eq!(again.manifest_seq, 1, "no new commit for an unchanged page");
+
+        // A different machine can compile a session it has never seen, and a
+        // held lease makes consolidation defer.
+        let other_session = SessionId::new("sess-2").unwrap();
+        ingest(&project, &other_session, &["only observation"], 500).await;
+        let second = reader(&bucket);
+        let compiled = consolidate_session(
+            &second,
+            &workspace,
+            &project_id,
+            &other_session,
+            &WriterId::new("mbp-b").unwrap(),
+            600,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(!compiled.skipped && !compiled.already_up_to_date);
+
+        let holder = WriterId::new("holder").unwrap();
+        let scope = format!("consolidate/{workspace}/{project_id}/{other_session}");
+        let lease = second
+            .acquire_lease(&scope, &holder, 1_000, 60_000)
+            .await
+            .unwrap()
+            .expect("lease");
+        let deferred = consolidate_session(
+            &second,
+            &workspace,
+            &project_id,
+            &other_session,
+            &WriterId::new("mbp-c").unwrap(),
+            1_100,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(deferred.skipped, "a held lease must defer consolidation");
+        lease.release(&second, 1_200).await.unwrap();
     }
 
     #[tokio::test]
