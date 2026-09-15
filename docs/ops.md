@@ -171,7 +171,11 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 HTTP stub，不是真 provider；MinIO 也不是 R2，不能把这组结果扩展成 R2 验证。
 
 Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `design.md` §6.4），这不是真 R2 证据。
-仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**ACL/签名/区域/一致性/配额/延迟/错误 XML 变体**，
+另有 Linux 1.95 源码/测试套件验证（2026-09-16，`main @ b817f42`）：`rust:1.95-bookworm` 容器
+（`linux/arm64`）接收排除 `target/` 与 `.git/` 的源码，`cargo test --workspace` exit 0，
+`233 passed / 0 failed / 0 ignored`，宿主工作树测试前后保持干净；这次没有在容器内跑 MinIO/S3/真桶
+端到端链路，Windows 仍未验证。仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、
+**ACL/签名/区域/一致性/配额/延迟/错误 XML 变体**，
 以及**在真 R2 上跑一遍向量闭环与跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project`
 必填，两者必须传同一组唯一值）；此外，**向量链的真 provider 仍未验证**（当前 vector 证据使用本地
 deterministic HTTP stub，不是真 provider）。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，

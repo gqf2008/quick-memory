@@ -549,7 +549,11 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
    要写新形态的人显式设置开关。
 5. **该压测没有在真桶上验证**：本工作项的持续竞争断言全部跑在 `InMemory` 上，MinIO 的 current-head
    复验也没有覆盖这套持续竞争；桶的 listing/写入与真实 RTT 仍未端到端。
-6. **跨平台未验证**：只在 macOS 本机跑过。
+6. **Linux 1.95 源码/测试套件已验证，Windows 仍未验证**：2026-09-16 在 `b817f42` 上用
+   `rust:1.95-bookworm`（`linux/arm64`）容器，对排除 `target/` 与 `.git/` 的源码运行
+   `cargo test --workspace`，exit 0（`233 passed / 0 failed / 0 ignored`）；测试前后宿主工作树
+   `git status --porcelain` 均为空。Windows 仍未验证。该容器没有跑 MinIO/S3/真桶端到端链路，
+   所以这不证明 Linux 上的对象存储链路；真 R2 与真 provider 也仍未验证。
 
 ## 6.6 采集与编译（S4 已实现）
 
@@ -1188,10 +1192,21 @@ GET 不返回 version、ACL/凭据边界、服务端签名拒绝、区域/一致
 在该 MinIO scope 上的收口与幂等，不是多机 R2 竞争。既有 Quickwit 真分片读取验证（2026-09-15，
 6893 字节、解包 8 个文件、命中 1 条）独立于本次 MinIO 复验，见 §6.4。
 
+## 10.6 Linux 1.95 源码/测试套件验证（2026-09-16 @ b817f42）
+
+2026-09-16 在 `b817f42` 上用 `rust:1.95-bookworm` Linux 容器（`linux/arm64`）跑了
+`cargo test --workspace`。源码通过 tar 流式送入容器，排除 `target/` 与 `.git/`；容器内是
+`rustc 1.95.0` / `cargo 1.95.0`，测试 exit 0，`233 passed / 0 failed / 0 ignored`。测试前后宿主
+工作树的 `git status --porcelain` 均为空。
+
+边界：这只证明 Linux 1.95 上源码/测试套件可编译并通过；本次没有在容器内跑 MinIO/S3/真桶
+端到端链路。Windows 仍未验证；真 R2、真 provider 仍未验证。
+
 ## 11. 实证结论（截至本次提交）
 
 已在本仓库验证（离线，`cargo test`）；另有 2026-09-16 在 `c9006a0` 上完成的 MinIO current-head 复验，
-原始数字见 §10.5。MinIO 是真实 S3-compatible HTTP 后端，不是 R2。
+以及 2026-09-16 在 `b817f42` 上完成的 Linux 1.95 源码/测试套件复验（§10.6）。MinIO 是真实
+S3-compatible HTTP 后端，不是 R2；Linux 复验没有跑真桶端到端。
 
 **S0**
 
