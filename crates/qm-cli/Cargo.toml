@@ -27,3 +27,4 @@ object_store = { workspace = true }
 
 [dev-dependencies]
 object_store = { workspace = true }
+qm-probe = { path = "../qm-probe" }

@@ -7,12 +7,36 @@ quick-memory 没有常驻服务：运维对象是**一个桶**和**每台机器�
 
 | 频率 | 动作 | 命令 |
 |---|---|---|
-| 每次会话结束 | 编译并发布 | `qm consolidate --session <id>` 然后 `qm publish` |
+| 每次会话结束 / 定时 | 编译并发布 | `qm maintain --json`；也可手动 `qm consolidate --session <id>` 后 `qm publish` |
 | 每天/每周 | 压缩索引（可选） | `qm compact` |
 | 每周 | 回收不可达对象（先 dry-run） | `qm gc` → 确认后 `qm gc --apply` |
 | 随时 | 查看状态 | `qm status --json` |
 
 这些都是**可放弃作业**：拿不到租约就跳过，没有它们系统照常工作，只是分片或孤儿对象变多。
+
+## 一次性维护闭环
+
+`qm maintain` 把本地 spool drain、当前 scope 全部会话的 consolidate、以及需要时的
+publish 收成一次可定时的幂等命令。它适合 cron、launchd 或 CI 调用，**不是常驻服务**；
+hook 仍保持原有的 fire-and-forget 契约，绝不在 agent 生命周期钩子里等待维护完成。
+
+```bash
+qm maintain --json
+qm maintain --compiler rules --drain-limit 100   # 默认 auto；spool 每次最多处理 100 条
+```
+
+- 先 drain 当前 scope 的 spool；本机其他 scope 的条目保留。
+- 再逐个编译当前 scope 的会话。单个会话失败会记录错误后继续处理其余会话，最后非零退出。
+- consolidate 后调用同一条 typed publish 路径；没有新页面时 publish 是 no-op。
+- 会话租约被其他机器占用时计入 `skipped_locked`，不算失败。
+- 第二次运行不会新增 manifest `seq`、重复页面版本或重复分片；未变化会话计入
+  `already_up_to_date`。
+
+`--json` 的稳定字段包括 `drained / spool_kept / sessions / consolidated /
+already_up_to_date / skipped_locked / failed / failures / published /
+published_pages / publish_already_present / publish_error / manifest_seq /
+generation / splits`。即使存在会话失败或 publish 失败，完整报告仍写入 stdout，
+进程以非零状态退出，便于调度器报警。
 
 ## 回收（GC）
 
@@ -179,6 +203,8 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 | 失败 | 影响 | 处理 |
 |---|---|---|
 | 桶不可达 | 写入失败 / hook 落 spool | 恢复后 `qm hook-drain` |
+| `qm maintain` 中单个会话链损坏 | 其他会话仍继续；维护报告 `failed` 并非零退出 | 从 `failures[].session` 定位并修复该会话；其他会话通常已发布 |
+| `qm maintain` 的 publish 失败 | 会话页可能已提交但未进入 catalog；报告 `publish_error` 并非零退出 | 修复桶/CAS 后重跑；已提交页面不会被重复版本覆盖 |
 | catalog head CAS 冲突 | 发布重试，最坏留下孤儿分片 | 由 GC 回收 |
 | 压缩者中途消失 | 租约到期后由别的机器接管 | 无需人工干预；过期租约可被抢 |
 | commit log 少一条（提交与日志之间崩溃） | 历史少一个时间戳 | 权威状态不受影响；无需修复 |
@@ -189,6 +215,9 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 
 - R2 出口免费，读分片不产生出口费；写入按 Class A 操作计费。
 - 一次 `qm capture` = 1 段 + 1 个 head CAS；一次 `qm publish` = 分片文件数 + 1 个 catalog + 1 次 CAS。
+- 一次 `qm maintain` 的对象访问随会话数线性增长：每个会话至少读 head/链（变化时再加一次
+  page commit），最后做一次 publish 扫描；没有未发布页面时不写分片或 catalog。它是单次
+  CLI 过程，不会为定时执行保留后台任务或连接池。
 - 分片随发布次数增长，压缩把 N 个分片并回 1 个；检索成本 ≈ 分片数 × 流数（3）。
 - 一次 `qm digest` 的**三段都读整份对象**，读的对象数各自随对象数**线性**增长，并发上限统一是
   **16**，所以每段延迟约 `⌈N/16⌉ × RTT`，而不是 `N × RTT`：

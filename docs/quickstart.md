@@ -48,6 +48,30 @@ QM_WRITER=mbp-1 qm search "tantivy"                    # 换一台机器也能�
 
 `qm search` 需要桶里已有分片；`qm publish` 之前检索不到任何东西是正常的。
 
+### 一键收口（可定时）
+
+把上面的三步收成一次可重复执行的维护：
+
+```bash
+QM_WRITER=mbp-1 qm maintain --json
+```
+
+它先 drain 本地 hook spool，再编译当前 scope 的所有会话，最后复用普通
+`publish` 路径发布变化。命令只跑一次，不是 daemon；连续跑第二次时，
+未变化的会话计入 `already_up_to_date`，不会新增 manifest `seq`，不会生成重复页面版本，
+也不会重复发布分片。`--json` 会给出 `drained / sessions / consolidated /
+already_up_to_date / skipped_locked / failed / published / manifest_seq / splits`；
+某个会话坏掉时会继续处理其他会话，但仍以非零状态结束。
+
+定时执行示例（把环境文件保存为 `~/.config/quick-memory/env`）：
+
+```cron
+*/15 * * * * . "$HOME/.config/quick-memory/env"; /usr/local/bin/qm maintain --json >> "$HOME/.local/state/qm-maintain.log" 2>&1
+```
+
+不要把 `qm maintain` 放进 agent 的 fire-and-forget hook 路径：`qm hook` 只负责
+200ms 内接收或落 spool，维护命令交给 cron/launchd/CI 在会话外运行。
+
 检索默认融合**正文 / 实体 / 链接**三路词法信号，再按"最近改过的排前面"做一次有界微调。
 三个开关各关掉一路或那个先验：
 

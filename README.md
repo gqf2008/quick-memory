@@ -35,11 +35,12 @@ crates/qm-mcp     `qm-mcp` MCP stdio 服务器（25 个 memory_* 工具）
 
 ## 命令行
 
-共 **27** 个子命令（`qm --help`；下表按用途分组）：
+共 **29** 个子命令（`qm --help`；下表按用途分组）：
 
 | 子命令 | 作用 |
 |---|---|
 | `capture` / `consolidate` / `sessions` | 记观测 / 编译会话页 / 列会话 |
+| `maintain` | 一次性收口：drain spool → 编译当前 scope 的所有会话 → 需要时 publish；适合 cron/launchd/CI |
 | `compact-session` | 收敛会话链里的旧观测（默认 dry run，`--apply` 才写） |
 | `search` | 检索：`--global` 跨项目；`--no-recency` / `--no-neighbors` / `--no-vector` 各关一路信号 |
 | `publish` / `compact` | 发布本机增量分片 / 从权威页面整体重建索引（租约保护） |
@@ -62,6 +63,7 @@ qm capture --session sess-1 --text "ran the suite"
 qm consolidate --session sess-1          # --compiler auto|rules|llm
 # LLM 编译（可选）：设置 QM_LLM_BASE_URL / QM_LLM_API_KEY / QM_LLM_MODEL；失败自动回落 rules
 qm publish                               # 增量：只发布本机上次发布后变化的页面
+qm maintain --json                       # 定时收口：drain spool + 编译所有会话 + 按需 publish
 qm search "suite"
 qm recent --limit 10                     # 开场先看：上次都在改什么
 qm digest --hours 24                     # 最近变化摘要：提交（含删除）/ 会话 / 交接棒

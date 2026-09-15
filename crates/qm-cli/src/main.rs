@@ -7,10 +7,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use qm_cli::{
-    Cli, Context as CommandContext, bucket_identity_from_env, build_bucket_from_env, execute,
+    Cli, Context as CommandContext, MaintainFailure, bucket_identity_from_env,
+    build_bucket_from_env, execute,
 };
 
 #[tokio::main]
@@ -39,7 +40,19 @@ async fn main() -> Result<()> {
         cli.json,
     )?
     .with_bucket_identity(bucket_identity_from_env());
-    let output = execute(&cli, ctx).await?;
+    let output = match execute(&cli, ctx).await {
+        Ok(output) => output,
+        Err(error) => {
+            // `maintain` returns a complete rendered summary with its failure.
+            // Keep that summary on stdout (so `--json` remains machine-readable)
+            // and still give schedulers a non-zero process status.
+            if let Some(failure) = error.downcast_ref::<MaintainFailure>() {
+                println!("{}", failure.report());
+                return Err(anyhow!("maintain completed with failures"));
+            }
+            return Err(error);
+        }
+    };
     println!("{output}");
     Ok(())
 }

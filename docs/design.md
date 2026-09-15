@@ -576,6 +576,7 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
 qm capture --session sess-1 --kind tool_use --text "switched to tantivy splits"
 qm consolidate --session sess-1        # 编译成 sessions/sess-1.md
 qm publish                             # 把当前页面发布成一个分片
+qm maintain                            # 一次性 drain + 编译所有会话 + 按需 publish
 qm search "tantivy" --json
 qm write-page --path notes/raft.md --body "leader election"
 qm read-page  --path notes/raft.md
@@ -590,6 +591,9 @@ qm sessions
 - 凭据：`QM_S3_*`（或 `R2_*`）必须在环境里；拿不到就**报错**，不猜、不降级成本地存储。
 - 每条命令都重新读取权威状态：命令之间不缓存，这是多机共享的前提。
 - `--json` 输出机器可读结果，便于被 agent 或脚本直接消费。
+- `maintain` 是 CLI 运维面的一次性闭环：drain spool → 当前 scope 的所有会话
+  consolidate → publish。它不是 daemon，也不进入 hook 的 200ms 快速路径；单个会话失败会继续、
+  汇总后非零退出，租约冲突按 `skipped_locked` 计数。连续运行是幂等的，不重复版本或分片。
 - 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
   页面的写/读/删、status/sessions、作用域解析。
 
@@ -1156,6 +1160,8 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 交接棒：`handoff open/list/claim/done`，CAS 保证恰好一次认领、只有认领者能收尾。
 
 - 自动采集：`qm hook` + `qm hook-drain`，fire-and-forget 契约（超时即 spool，永不阻塞 agent）。
+- 定时收口：`qm maintain` 复用同一 spool drain、consolidate 与 publish 路径；没有常驻进程，
+  hook 的 200ms / 202 / 429 语义不变。
 
 - 最近变化摘要（digest）：三张**权威**清单（commit log / session head / handoff）各按自己的时钟取窗口、
   各自降序、各自截断；交接棒的时间取 created/claimed/finished 三者中**最新**的那个（所以窗口之前开、
@@ -1166,7 +1172,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 鉴权/凭据方案仍未定（每机全桶 token vs Worker 网关 vs 混合），是**决策项**而非实现项：
   决策就绪的选项、对照与建议见 §9（**待用户拍板**，本文不构成批准）。
 
-- `qm` CLI 28 个顶层子命令可用（含 `handoff` 的 4 个子动作）；命令逻辑在内存桶上做了端到端测试（无需凭据）。
+- `qm` CLI 29 个顶层子命令可用（含 `handoff` 的 4 个子动作）；命令逻辑在内存桶上做了端到端测试（无需凭据）。
 - MCP stdio 服务器已实现并通过协议级回环测试（25 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**

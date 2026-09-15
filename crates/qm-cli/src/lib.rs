@@ -44,6 +44,13 @@ pub const DIGEST_DEFAULT_HOURS: i64 = 24;
 /// Default per-section entry cap for `digest` / `memory_digest`.
 pub const DIGEST_DEFAULT_LIMIT: usize = 20;
 
+/// Default number of spooled hook events one drain attempt processes.
+///
+/// `hook-drain` and `maintain` share this value so the one-shot maintenance
+/// path cannot quietly drain a different queue than the explicit repair
+/// command.
+pub const HOOK_DRAIN_DEFAULT_LIMIT: usize = 100;
+
 /// Command line interface.
 #[derive(Debug, Parser)]
 #[command(name = "qm", about = "Shared agent memory on object storage")]
@@ -130,6 +137,16 @@ pub enum Command {
         #[arg(long, default_value = "auto")]
         compiler: String,
     },
+    /// Drain hook spool, consolidate every session, and publish if needed.
+    Maintain {
+        /// Compiler: `auto` (LLM when QM_LLM_BASE_URL is set, else rules),
+        /// `rules`, or `llm` (which falls back to rules on failure).
+        #[arg(long, default_value = "auto")]
+        compiler: String,
+        /// Maximum number of spooled events to attempt before consolidating.
+        #[arg(long, default_value_t = HOOK_DRAIN_DEFAULT_LIMIT)]
+        drain_limit: usize,
+    },
     /// List the sessions of the project.
     Sessions,
     /// Retire old observations from a session's chain (dry run unless `--apply`).
@@ -191,7 +208,7 @@ pub enum Command {
     /// Replay events that were spooled because the bucket was unreachable.
     HookDrain {
         /// Maximum number of spooled events to attempt.
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = HOOK_DRAIN_DEFAULT_LIMIT)]
         limit: usize,
     },
     /// Stage a proposed edit for approval.
@@ -687,6 +704,404 @@ impl Context {
     }
 }
 
+/// Resolve the compiler spelling shared by `consolidate` and `maintain`.
+fn compiler_choice_from_name(name: &str) -> Result<CompilerChoice> {
+    match name {
+        "auto" => {
+            if std::env::var("QM_LLM_BASE_URL")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                Ok(CompilerChoice::Llm)
+            } else {
+                Ok(CompilerChoice::Rules)
+            }
+        }
+        "rules" => Ok(CompilerChoice::Rules),
+        "llm" => Ok(CompilerChoice::Llm),
+        other => bail!("unknown compiler {other:?}: use auto, rules or llm"),
+    }
+}
+
+/// What one publish attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishReport {
+    reason: Option<String>,
+    already_present: bool,
+    pages: usize,
+    manifest_seq: u64,
+    splits: usize,
+    generation: u64,
+    embedded: bool,
+    full_publish: bool,
+}
+
+impl PublishReport {
+    fn published(&self) -> bool {
+        self.reason.is_none() && !self.already_present
+    }
+
+    fn render(&self, json: bool) -> String {
+        if let Some(reason) = &self.reason {
+            return reason.clone();
+        }
+        let because = if self.full_publish {
+            "; the bucket held no splits, so this was a full publish"
+        } else {
+            ""
+        };
+        if json {
+            serde_json::json!({
+                "generation": self.generation,
+                "already_present": self.already_present,
+                "pages": self.pages,
+                "manifest_seq": self.manifest_seq,
+                "embedded": self.embedded,
+                "full_publish": self.full_publish,
+            })
+            .to_string()
+        } else if self.already_present {
+            format!("split already published ({} pages){because}", self.pages)
+        } else {
+            format!(
+                "published {} page(s) as one split (generation {}){because}",
+                self.pages, self.generation
+            )
+        }
+    }
+}
+
+/// Publish the pages this machine has not indexed yet.
+async fn publish_project(ctx: &Context) -> Result<PublishReport> {
+    let loaded = ctx
+        .project
+        .load(&ctx.workspace, &ctx.project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let watermark_path = publish_watermark_path(ctx);
+    let embedder = qm_search::vector::embedder_from_env()?;
+    let embedded = embedder.is_some();
+    let watermark = read_watermark(&watermark_path);
+    // Enabling a provider has to re-embed pages that were published without
+    // one, and their sequence numbers have not moved. Without this the vector
+    // stream would stay empty forever on a machine that had already caught up.
+    let watermark = if embedded && !watermark.embedded {
+        0
+    } else {
+        watermark.manifest_seq
+    };
+    // A watermark is only meaningful for a bucket that actually holds what
+    // this machine published. Point the same cache at a bucket nobody has
+    // built here and the sequence numbers claim "done" for an index that does
+    // not exist; an empty catalog therefore wins over the watermark, and the
+    // publish is full.
+    let catalog = ctx
+        .project
+        .load_catalog(&ctx.workspace, &ctx.project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let bucket_has_no_splits = catalog.catalog.splits.is_empty();
+    let since = if bucket_has_no_splits { 0 } else { watermark };
+    let mut docs = Vec::new();
+    for (path, entry) in &loaded.manifest.pages {
+        // Only what changed since this machine last published. Without the
+        // watermark (a fresh cache) everything is republished, which is
+        // wasteful but never wrong.
+        if entry.seq <= since {
+            continue;
+        }
+        let page_path = PagePath::new(path)?;
+        let page = ctx
+            .project
+            .read_page_version(&ctx.workspace, &ctx.project_id, &page_path, &entry.page_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        docs.push(PageDoc::from_version(
+            &ctx.workspace,
+            &ctx.project_id,
+            &page,
+            entry.created_at_ms,
+        ));
+    }
+    if docs.is_empty() {
+        let reason = if loaded.manifest.pages.is_empty() {
+            "nothing to publish: the project has no live pages".to_string()
+        } else {
+            format!(
+                "nothing to publish: this machine is up to date through seq {}",
+                watermark
+            )
+        };
+        return Ok(PublishReport {
+            reason: Some(reason),
+            already_present: false,
+            pages: 0,
+            manifest_seq: loaded.manifest.seq,
+            splits: catalog.catalog.splits.len(),
+            generation: catalog.catalog.generation,
+            embedded,
+            full_publish: bucket_has_no_splits,
+        });
+    }
+    let docs = attach_embeddings(docs, embedder.as_deref()).await?;
+    let seq = loaded.manifest.seq + 1;
+    // One directory per invocation: building an index into a directory that
+    // already holds one fails, and seq+timestamp is not unique enough (two
+    // projects can publish in the same millisecond).
+    let build_dir = unique_build_dir(ctx, "build");
+    let outcome = publish_split_index(
+        ctx.bucket.as_ref(),
+        &ctx.project,
+        &ctx.workspace,
+        &ctx.project_id,
+        &ctx.writer,
+        seq,
+        &docs,
+        &build_dir,
+        ctx.now_ms,
+    )
+    .await?;
+    write_watermark(&watermark_path, loaded.manifest.seq, embedded)?;
+    let current_manifest = ctx
+        .project
+        .load(&ctx.workspace, &ctx.project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let current_catalog = ctx
+        .project
+        .load_catalog(&ctx.workspace, &ctx.project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(PublishReport {
+        reason: None,
+        already_present: outcome.already_present,
+        pages: docs.len(),
+        manifest_seq: current_manifest.manifest.seq,
+        splits: current_catalog.catalog.splits.len(),
+        generation: outcome.generation,
+        embedded,
+        full_publish: bucket_has_no_splits,
+    })
+}
+
+/// One session that could not be consolidated during a maintenance pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MaintainSessionFailure {
+    /// Session whose consolidation failed.
+    pub session: String,
+    /// Error reported by the consolidation path.
+    pub error: String,
+}
+
+/// Result of one `qm maintain` pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MaintainReport {
+    /// Spool entries successfully ingested.
+    pub drained: usize,
+    /// Spool entries left for a later pass.
+    pub spool_kept: usize,
+    /// Sessions listed after the drain.
+    pub sessions: usize,
+    /// Sessions whose consolidation wrote a new page version.
+    pub consolidated: usize,
+    /// Sessions whose page already matched the current chain.
+    pub already_up_to_date: usize,
+    /// Sessions skipped because another machine held the consolidation lease.
+    pub skipped_locked: usize,
+    /// Sessions whose consolidation failed.
+    pub failed: usize,
+    /// Details for each failed session.
+    pub failures: Vec<MaintainSessionFailure>,
+    /// Whether this pass created a new split.
+    pub published: bool,
+    /// Number of pages in the split considered by the publish step.
+    pub published_pages: usize,
+    /// Whether the split content was already present in the catalog.
+    pub publish_already_present: bool,
+    /// A failure from the publish step, if any.
+    pub publish_error: Option<String>,
+    /// Manifest sequence after the pass, when readable.
+    pub manifest_seq: u64,
+    /// Catalog generation after the pass, when readable.
+    pub generation: u64,
+    /// Number of splits in the catalog after the pass, when readable.
+    pub splits: usize,
+}
+
+impl MaintainReport {
+    /// Whether this pass must make the CLI exit non-zero.
+    #[must_use]
+    pub fn needs_nonzero_exit(&self) -> bool {
+        self.failed > 0 || self.publish_error.is_some()
+    }
+
+    fn render(&self) -> String {
+        let mut out = format!(
+            "drained {} spooled event(s), kept {}\n\
+             sessions {}: consolidated {}, already up to date {}, skipped locked {}, failed {}\n\
+             published: {} ({} page(s), generation {}, already present {})\n\
+             manifest: seq {}, {} split(s)",
+            self.drained,
+            self.spool_kept,
+            self.sessions,
+            self.consolidated,
+            self.already_up_to_date,
+            self.skipped_locked,
+            self.failed,
+            if self.published { "yes" } else { "no" },
+            self.published_pages,
+            self.generation,
+            self.publish_already_present,
+            self.manifest_seq,
+            self.splits
+        );
+        for failure in &self.failures {
+            out.push_str(&format!("\nsession {}: {}", failure.session, failure.error));
+        }
+        if let Some(error) = &self.publish_error {
+            out.push_str(&format!("\npublish failed: {error}"));
+        }
+        out
+    }
+}
+
+/// A maintain pass that completed some work but must exit non-zero.
+///
+/// Keeping the rendered report inside the error lets `main` print the complete
+/// summary to stdout (including valid JSON in `--json` mode) before returning a
+/// failure status.
+#[derive(Debug)]
+pub struct MaintainFailure {
+    report: String,
+}
+
+impl MaintainFailure {
+    /// The already-rendered report to print before exiting non-zero.
+    #[must_use]
+    pub fn report(&self) -> &str {
+        &self.report
+    }
+}
+
+impl std::fmt::Display for MaintainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.report)
+    }
+}
+
+impl std::error::Error for MaintainFailure {}
+
+/// Drain, consolidate every session, and publish the resulting pages.
+///
+/// A failure in one session is recorded and the pass continues with the rest,
+/// because later sessions are independent and one corrupt chain must not make
+/// every other session unmaintainable. The caller turns a report with failures
+/// into [`MaintainFailure`] after rendering it, so automation still gets a
+/// non-zero status and the complete summary.
+async fn maintain(
+    ctx: &Context,
+    compiler: CompilerChoice,
+    drain_limit: usize,
+) -> Result<MaintainReport> {
+    let (drained, spool_kept) = drain_spool(ctx, drain_limit).await?;
+    let session_ids = ctx
+        .project
+        .list_sessions(&ctx.workspace, &ctx.project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let mut consolidated = 0usize;
+    let mut already_up_to_date = 0usize;
+    let mut skipped_locked = 0usize;
+    let mut failures = Vec::new();
+    for session_id in &session_ids {
+        let result = consolidate_session_with(
+            compiler,
+            &ctx.project,
+            qm_search::consolidate::ConsolidationRequest {
+                workspace_id: &ctx.workspace,
+                project_id: &ctx.project_id,
+                session_id,
+                consolidator: &ctx.writer,
+                now_ms: ctx.now_ms,
+                lease_ttl_ms: 60_000,
+            },
+        )
+        .await;
+        match result {
+            Ok(outcome) if outcome.skipped => skipped_locked += 1,
+            Ok(outcome) if outcome.already_up_to_date => already_up_to_date += 1,
+            Ok(_) => consolidated += 1,
+            Err(error) => failures.push(MaintainSessionFailure {
+                session: session_id.to_string(),
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    // Publish unconditionally: the explicit publish path is a no-op when this
+    // machine has no new pages, and calling it here also repairs a previous
+    // run that committed a page but crashed before its publish step.
+    let (publish, publish_error) = match publish_project(ctx).await {
+        Ok(report) => (report, None),
+        Err(error) => {
+            let state = current_publish_state(ctx).await;
+            (
+                PublishReport {
+                    reason: None,
+                    already_present: false,
+                    pages: 0,
+                    manifest_seq: state.0,
+                    splits: state.2,
+                    generation: state.1,
+                    embedded: false,
+                    full_publish: false,
+                },
+                Some(error.to_string()),
+            )
+        }
+    };
+
+    Ok(MaintainReport {
+        drained,
+        spool_kept,
+        sessions: session_ids.len(),
+        consolidated,
+        already_up_to_date,
+        skipped_locked,
+        failed: failures.len(),
+        failures,
+        published: publish.published(),
+        published_pages: publish.pages,
+        publish_already_present: publish.already_present,
+        publish_error,
+        manifest_seq: publish.manifest_seq,
+        generation: publish.generation,
+        splits: publish.splits,
+    })
+}
+
+/// Best-effort state for the report when publishing itself failed.
+async fn current_publish_state(ctx: &Context) -> (u64, u64, usize) {
+    let manifest_seq = ctx
+        .project
+        .load(&ctx.workspace, &ctx.project_id)
+        .await
+        .map(|loaded| loaded.manifest.seq)
+        .unwrap_or(0);
+    ctx.project
+        .load_catalog(&ctx.workspace, &ctx.project_id)
+        .await
+        .map(|loaded| {
+            (
+                manifest_seq,
+                loaded.catalog.generation,
+                loaded.catalog.splits.len(),
+            )
+        })
+        .unwrap_or((manifest_seq, 0, 0))
+}
+
 /// Run one command, returning the text to print.
 ///
 /// # Errors
@@ -753,21 +1168,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
         }
         Command::Consolidate { session, compiler } => {
             let session_id = SessionId::new(session)?;
-            let choice = match compiler.as_str() {
-                "auto" => {
-                    if std::env::var("QM_LLM_BASE_URL")
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false)
-                    {
-                        CompilerChoice::Llm
-                    } else {
-                        CompilerChoice::Rules
-                    }
-                }
-                "rules" => CompilerChoice::Rules,
-                "llm" => CompilerChoice::Llm,
-                other => bail!("unknown compiler {other:?}: use auto, rules or llm"),
-            };
+            let choice = compiler_choice_from_name(compiler)?;
             let outcome = consolidate_session_with(
                 choice,
                 &ctx.project,
@@ -812,6 +1213,22 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     }
                 )
             })
+        }
+        Command::Maintain {
+            compiler,
+            drain_limit,
+        } => {
+            let choice = compiler_choice_from_name(compiler)?;
+            let report = maintain(&ctx, choice, *drain_limit).await?;
+            let rendered = if ctx.json {
+                serde_json::to_string(&report)?
+            } else {
+                report.render()
+            };
+            if report.needs_nonzero_exit() {
+                return Err(MaintainFailure { report: rendered }.into());
+            }
+            Ok(rendered)
         }
         Command::Sessions => {
             let sessions = ctx
@@ -1000,114 +1417,8 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
         Command::Publish => {
-            let loaded = ctx
-                .project
-                .load(&ctx.workspace, &ctx.project_id)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let watermark_path = publish_watermark_path(&ctx);
-            let embedder = qm_search::vector::embedder_from_env()?;
-            let embedded = embedder.is_some();
-            let watermark = read_watermark(&watermark_path);
-            // Enabling a provider has to re-embed pages that were published
-            // without one, and their sequence numbers have not moved. Without
-            // this the vector stream would stay empty forever on a machine
-            // that had already caught up.
-            let watermark = if embedded && !watermark.embedded {
-                0
-            } else {
-                watermark.manifest_seq
-            };
-            // A watermark is only meaningful for a bucket that actually
-            // holds what this machine published. Point the same cache at a
-            // bucket nobody has built here and the sequence numbers claim
-            // "done" for an index that does not exist; an empty catalog
-            // therefore wins over the watermark, and the publish is full.
-            let catalog = ctx
-                .project
-                .load_catalog(&ctx.workspace, &ctx.project_id)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let bucket_has_no_splits = catalog.catalog.splits.is_empty();
-            let since = if bucket_has_no_splits { 0 } else { watermark };
-            let mut docs = Vec::new();
-            for (path, entry) in &loaded.manifest.pages {
-                // Only what changed since this machine last published. Without
-                // the watermark (a fresh cache) everything is republished,
-                // which is wasteful but never wrong.
-                if entry.seq <= since {
-                    continue;
-                }
-                let page_path = PagePath::new(path)?;
-                let page = ctx
-                    .project
-                    .read_page_version(&ctx.workspace, &ctx.project_id, &page_path, &entry.page_id)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                docs.push(PageDoc::from_version(
-                    &ctx.workspace,
-                    &ctx.project_id,
-                    &page,
-                    entry.created_at_ms,
-                ));
-            }
-            if docs.is_empty() {
-                let reason = if loaded.manifest.pages.is_empty() {
-                    "nothing to publish: the project has no live pages".to_string()
-                } else {
-                    format!(
-                        "nothing to publish: this machine is up to date through seq {}",
-                        watermark
-                    )
-                };
-                return Ok(reason);
-            }
-            let docs = attach_embeddings(docs, embedder.as_deref()).await?;
-            let seq = loaded.manifest.seq + 1;
-            // One directory per invocation: building an index into a directory
-            // that already holds one fails, and seq+timestamp is not unique
-            // enough (two projects can publish in the same millisecond).
-            let build_dir = unique_build_dir(&ctx, "build");
-            let outcome = publish_split_index(
-                ctx.bucket.as_ref(),
-                &ctx.project,
-                &ctx.workspace,
-                &ctx.project_id,
-                &ctx.writer,
-                seq,
-                &docs,
-                &build_dir,
-                ctx.now_ms,
-            )
-            .await?;
-            write_watermark(&watermark_path, loaded.manifest.seq, embedded)?;
-            // Say why the whole project went in: to a reader comparing against
-            // the previous split set, an unexplained full publish looks like a
-            // regression rather than the recovery it is.
-            let because = if bucket_has_no_splits {
-                "; the bucket held no splits, so this was a full publish"
-            } else {
-                ""
-            };
-            Ok(if ctx.json {
-                serde_json::json!({
-                    "generation": outcome.generation,
-                    "already_present": outcome.already_present,
-                    "pages": docs.len(),
-                    "manifest_seq": loaded.manifest.seq,
-                    "embedded": embedded,
-                    "full_publish": bucket_has_no_splits,
-                })
-                .to_string()
-            } else if outcome.already_present {
-                format!("split already published ({} pages){because}", docs.len())
-            } else {
-                format!(
-                    "published {} page(s) as one split (generation {}){because}",
-                    docs.len(),
-                    outcome.generation
-                )
-            })
+            let report = publish_project(&ctx).await?;
+            Ok(report.render(ctx.json))
         }
         Command::Compact => {
             let build_dir = unique_build_dir(&ctx, "compact");
@@ -2433,6 +2744,26 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("qm").chain(args.iter().copied())).unwrap()
+    }
+
+    enum TestMaintainResult {
+        Success(MaintainReport),
+        Failure(MaintainReport),
+    }
+
+    /// Run `qm maintain --json` and decode its report from either the normal
+    /// success path or the typed failure path `main` prints before exiting.
+    async fn run_maintain(ctx: Context) -> TestMaintainResult {
+        let command = cli(&["maintain", "--compiler", "rules", "--json"]);
+        match execute(&command, ctx).await {
+            Ok(output) => TestMaintainResult::Success(serde_json::from_str(&output).unwrap()),
+            Err(error) => {
+                let failure = error
+                    .downcast_ref::<MaintainFailure>()
+                    .unwrap_or_else(|| panic!("maintain failed outside its report: {error}"));
+                TestMaintainResult::Failure(serde_json::from_str(failure.report()).unwrap())
+            }
+        }
     }
 
     /// The form a scope is stored in, read from the layout rather than guessed
@@ -4392,5 +4723,257 @@ mod tests {
 
         // The two flags are mutually exclusive rather than silently ranked.
         assert!(Cli::try_parse_from(["qm", "digest", "--hours", "1", "--since-ms", "0"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn maintain_drains_spool_consolidates_publishes_and_is_idempotent() {
+        let spool = TempDir::new().unwrap();
+        let unreachable: Arc<dyn ObjectStore> = Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name("unreachable")
+                .with_region("auto")
+                .with_endpoint("http://127.0.0.1:1")
+                .with_allow_http(true)
+                .with_access_key_id("test")
+                .with_secret_access_key("test")
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        );
+        let mut producer = context(unreachable, &TempDir::new().unwrap());
+        producer.spool_dir = spool.path().to_path_buf();
+        let captured = capture_hook_event(
+            &producer,
+            Some("sess-maintain"),
+            None,
+            Some("codex"),
+            r#"{"session_id":"sess-maintain","hook_event_name":"PostToolUse","tool_response":"cargo t passed"}"#,
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(captured.starts_with("spooled"), "{captured}");
+        assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 1);
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        let mut first_ctx = context(Arc::clone(&bucket), &cache);
+        first_ctx.spool_dir = spool.path().to_path_buf();
+        first_ctx.now_ms = 2_000;
+        let first = match run_maintain(first_ctx).await {
+            TestMaintainResult::Success(report) => report,
+            TestMaintainResult::Failure(report) => {
+                panic!("maintain must succeed on a healthy bucket: {report:?}")
+            }
+        };
+        assert_eq!(first.drained, 1);
+        assert_eq!(first.spool_kept, 0);
+        assert_eq!(first.sessions, 1);
+        assert_eq!(first.consolidated, 1);
+        assert_eq!(first.already_up_to_date, 0);
+        assert_eq!(first.skipped_locked, 0);
+        assert_eq!(first.failed, 0, "{first:?}");
+        assert!(first.published, "{first:?}");
+        assert_eq!(first.published_pages, 1);
+        assert_eq!(first.splits, 1);
+        assert_eq!(
+            std::fs::read_dir(spool.path()).unwrap().count(),
+            0,
+            "a successful drain must clear the spool"
+        );
+
+        let search = execute(
+            &cli(&["search", "cargo t passed", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let search: serde_json::Value = serde_json::from_str(&search).unwrap();
+        assert!(
+            search["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "sessions/sess-maintain.md"),
+            "maintain must publish the consolidated session: {search}"
+        );
+
+        let state = context(Arc::clone(&bucket), &cache);
+        let first_seq = state
+            .project
+            .load(&state.workspace, &state.project_id)
+            .await
+            .unwrap()
+            .manifest
+            .seq;
+        let first_splits = state
+            .project
+            .load_catalog(&state.workspace, &state.project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits
+            .len();
+        let history = execute(
+            &cli(&["history", "--path", "sessions/sess-maintain.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let history: Vec<qm_core::PageVersion> = serde_json::from_str(&history).unwrap();
+        assert_eq!(history.len(), 1);
+
+        let mut second_ctx = context(Arc::clone(&bucket), &cache);
+        second_ctx.spool_dir = spool.path().to_path_buf();
+        second_ctx.now_ms = 3_000;
+        let second = match run_maintain(second_ctx).await {
+            TestMaintainResult::Success(report) => report,
+            TestMaintainResult::Failure(report) => {
+                panic!("an already-maintained scope must be a successful no-op: {report:?}")
+            }
+        };
+        assert_eq!(second.drained, 0);
+        assert_eq!(second.sessions, 1);
+        assert_eq!(second.consolidated, 0);
+        assert_eq!(second.already_up_to_date, 1);
+        assert_eq!(second.skipped_locked, 0);
+        assert_eq!(second.failed, 0);
+        assert!(!second.published, "{second:?}");
+        assert_eq!(second.manifest_seq, first_seq);
+        assert_eq!(second.splits, first_splits);
+
+        let history = execute(
+            &cli(&["history", "--path", "sessions/sess-maintain.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let history: Vec<qm_core::PageVersion> = serde_json::from_str(&history).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "the second pass must not duplicate a version"
+        );
+
+        let mut human_ctx = context(Arc::clone(&bucket), &cache);
+        human_ctx.spool_dir = spool.path().to_path_buf();
+        human_ctx.now_ms = 4_000;
+        let human = execute(&cli(&["maintain", "--compiler", "rules"]), human_ctx)
+            .await
+            .unwrap();
+        assert!(
+            human.contains("already up to date 1") && human.contains("manifest: seq"),
+            "the human summary must expose the same no-op state: {human}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_counts_a_held_consolidation_lease_as_skipped_locked() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        execute(
+            &cli(&[
+                "capture",
+                "--session",
+                "sess-locked",
+                "--text",
+                "locked chain",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+
+        let lease_ctx = context(Arc::clone(&bucket), &cache);
+        let _lease = lease_ctx
+            .project
+            .acquire_lease(
+                "consolidate/acme/ai-memory/sess-locked",
+                &lease_ctx.writer,
+                1_000,
+                60_000,
+            )
+            .await
+            .unwrap()
+            .expect("the test must hold the lease");
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 2_000;
+        let report = match run_maintain(ctx).await {
+            TestMaintainResult::Success(report) => report,
+            TestMaintainResult::Failure(report) => {
+                panic!("a lease skip is not a failure: {report:?}")
+            }
+        };
+        assert_eq!(report.sessions, 1);
+        assert_eq!(report.consolidated, 0);
+        assert_eq!(report.skipped_locked, 1);
+        assert_eq!(report.failed, 0);
+        assert!(!report.published);
+        assert_eq!(
+            report.splits, 0,
+            "nothing was consolidated, so nothing was published"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_continues_after_a_session_failure_and_reports_nonzero() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        for (session, text) in [
+            ("sess-broken", "broken chain must not stop the pass"),
+            ("sess-good", "good chain must still become searchable"),
+        ] {
+            execute(
+                &cli(&["capture", "--session", session, "--text", text]),
+                context(Arc::clone(&bucket), &cache),
+            )
+            .await
+            .unwrap();
+        }
+
+        let ctx = context(Arc::clone(&bucket), &cache);
+        let broken = SessionId::new("sess-broken").unwrap();
+        let key = ctx
+            .project
+            .layout()
+            .session_head(&ctx.workspace, &ctx.project_id, &broken);
+        ctx.bucket
+            .put(
+                &object_store::path::Path::from(key),
+                b"not-json".to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        let mut maintenance_ctx = context(Arc::clone(&bucket), &cache);
+        maintenance_ctx.now_ms = 2_000;
+        let report = match run_maintain(maintenance_ctx).await {
+            TestMaintainResult::Success(report) => {
+                panic!("a corrupt session must make maintain exit non-zero: {report:?}")
+            }
+            TestMaintainResult::Failure(report) => report,
+        };
+        assert_eq!(report.sessions, 2);
+        assert_eq!(report.consolidated, 1);
+        assert_eq!(report.failed, 1, "{report:?}");
+        assert_eq!(report.failures[0].session, "sess-broken");
+        assert!(
+            report.published,
+            "the healthy session must still be published"
+        );
+        assert!(report.needs_nonzero_exit());
+
+        let search = execute(
+            &cli(&["search", "good chain", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let search: serde_json::Value = serde_json::from_str(&search).unwrap();
+        assert_eq!(search["hits"].as_array().unwrap().len(), 1, "{search}");
     }
 }

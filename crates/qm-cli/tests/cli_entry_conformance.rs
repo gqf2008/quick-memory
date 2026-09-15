@@ -14,6 +14,12 @@
 
 use std::process::{Command, Output};
 
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use qm_core::{KeyLayout, ProjectId, SessionId, WorkspaceId};
+use qm_probe::s3_stub::S3Stub;
+use tempfile::TempDir;
+
 /// The names `docs/ops.md` tells an operator to set. The endpoint points at a
 /// closed port on purpose: should a request ever be attempted, it stays on
 /// loopback and fails instead of reaching a real bucket.
@@ -40,6 +46,15 @@ fn run_qm(env: &[(&str, &str)]) -> Output {
     command
         .env_clear()
         .args(["read-page", "--path", "../not-portable"]);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("running the qm binary")
+}
+
+fn run_qm_args(args: &[&str], env: &[(&str, String)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qm"));
+    command.env_clear().args(args);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -132,4 +147,79 @@ fn the_real_binary_refuses_a_storage_form_it_does_not_know() {
              stderr was:\n{stderr}"
         );
     }
+}
+
+/// A maintain pass with one broken session must still print its complete JSON
+/// report on stdout and exit non-zero. This runs the real `qm` binary against a
+/// local S3 protocol stub, so the process boundary is part of the evidence.
+#[tokio::test]
+async fn the_real_binary_exits_nonzero_with_a_maintain_json_report() {
+    let stub = S3Stub::start().expect("starting the S3 stub");
+    let cache = TempDir::new().unwrap();
+    let spool = TempDir::new().unwrap();
+    let endpoint = stub.endpoint();
+    let env = vec![
+        ("QM_S3_ENDPOINT", endpoint.clone()),
+        ("QM_S3_BUCKET", stub.bucket().to_string()),
+        ("QM_S3_ACCESS_KEY_ID", "stub-access".to_string()),
+        ("QM_S3_SECRET_ACCESS_KEY", "stub-secret".to_string()),
+        ("QM_S3_FORCE_PATH_STYLE", "true".to_string()),
+        ("QM_CACHE_DIR", cache.path().to_string_lossy().to_string()),
+        ("QM_SPOOL_DIR", spool.path().to_string_lossy().to_string()),
+    ];
+
+    for (session, text) in [
+        ("sess-broken", "broken chain must not stop the pass"),
+        ("sess-good", "good chain must still become searchable"),
+    ] {
+        let output = run_qm_args(&["capture", "--session", session, "--text", text], &env);
+        assert!(
+            output.status.success(),
+            "capture for {session} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let bucket = AmazonS3Builder::new()
+        .with_bucket_name(stub.bucket())
+        .with_region("auto")
+        .with_endpoint(stub.endpoint())
+        .with_allow_http(true)
+        .with_access_key_id("stub-access")
+        .with_secret_access_key("stub-secret")
+        .with_virtual_hosted_style_request(false)
+        .build()
+        .unwrap();
+    let workspace = WorkspaceId::new("default").unwrap();
+    let project = ProjectId::new("default").unwrap();
+    let session = SessionId::new("sess-broken").unwrap();
+    let key = KeyLayout::new("v1").session_head(&workspace, &project, &session);
+    bucket
+        .put(
+            &object_store::path::Path::from(key),
+            b"not-json".to_vec().into(),
+        )
+        .await
+        .unwrap();
+
+    let output = run_qm_args(&["maintain", "--compiler", "rules", "--json"], &env);
+    assert!(
+        !output.status.success(),
+        "a broken session must make the real binary exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("maintain stdout must stay valid JSON ({error}):\n{stdout}")
+    });
+    assert_eq!(report["sessions"], 2);
+    assert_eq!(report["consolidated"], 1);
+    assert_eq!(report["failed"], 1);
+    assert_eq!(report["published"], true);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("maintain completed with failures"),
+        "the non-zero path must identify the failed maintain pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    stub.shutdown();
 }
