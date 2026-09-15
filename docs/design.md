@@ -389,6 +389,12 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
   `pages` 的排序是 `at_ms` 降序、`seq` 破平局：`at_ms` 是**调用方提供的时钟**，时钟偏斜下"提交顺序"与"时间顺序"
   可能不一致，这里的契约是时间顺序，而 `seq` 作为 tie-breaker 让顺序成为**全序**——
   两台机器读同一份日志必须对顺序一致，而不只是对集合一致。
+- **读代价是有界并发，不是 O(1)**：`digest`（以及共用 `read_commit_log` 的 `qm log`、
+  `qm history`、`version_at`）读**整条** commit log，`limit` 只封顶返回、不封顶读取，
+  所以读的对象数仍随提交数线性增长。`read_commit_log` 把这批读用 `buffer_unordered(16)`
+  重叠起来，延迟从 `N × RTT` 降到约 `⌈N/16⌉ × RTT`。
+  并发**不改变语义**：顺序来自上面的排序（`at_ms` 降序、`seq` 破平局），不来自读的完成先后；
+  相应的测试故意让最旧的提交最先读回来，再断言答案不变。
 - `--since-ms` 与 `--hours` **互斥**而不是按优先级静默取一个；人类输出分 `pages` / `sessions` / `handoffs`
   三段，整窗无活动时输出一句话而不是三个空标题。
 - MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
