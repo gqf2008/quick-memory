@@ -218,6 +218,12 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         recent_text.contains("sessions/sess-mcp.md"),
         "{recent_text}"
     );
+    // `created_at_ms` is a field `recent` has and the commit log does not, so a
+    // tool mis-wired to `Command::Log` cannot satisfy this.
+    assert!(
+        recent_text.contains("created_at_ms"),
+        "recent output should carry its own fields: {recent_text}"
+    );
 
     // Handoffs: open, list, claim, and refuse a second claim — over the wire.
     let opened = client.call_tool(

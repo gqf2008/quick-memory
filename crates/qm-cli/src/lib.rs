@@ -26,6 +26,12 @@ use qm_search::{
 };
 use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
+/// Default page count for `recent` / `memory_recent`.
+///
+/// One constant rather than a literal per surface: the CLI default and the MCP
+/// default are the same promise, so they must not be able to drift apart.
+pub const RECENT_DEFAULT_LIMIT: usize = 10;
+
 /// Command line interface.
 #[derive(Debug, Parser)]
 #[command(name = "qm", about = "Shared agent memory on object storage")]
@@ -289,7 +295,7 @@ pub enum Command {
     /// List pages by when they last changed, newest first.
     Recent {
         /// Maximum pages.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = RECENT_DEFAULT_LIMIT)]
         limit: usize,
     },
     /// Tombstone a page.
@@ -1611,7 +1617,12 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .collect();
                 serde_json::to_string(&described)?
             } else if pages.is_empty() {
-                "no pages".to_string()
+                // Asking for nothing is not the same as finding nothing.
+                if *limit == 0 {
+                    String::new()
+                } else {
+                    "no pages".to_string()
+                }
             } else {
                 pages
                     .iter()
@@ -2130,8 +2141,9 @@ mod tests {
             "2000\tnotes/second.md\tSecond\n1000\tnotes/first.md\tFirst"
         );
 
-        // `--limit` narrows it; the default is 10, so one page is not enough
-        // to tell the flag apart from the default. Ask for exactly one.
+        // `--limit` narrows it; a two-page corpus cannot tell the flag apart
+        // from the default, so ask for exactly one and assert the default
+        // separately — a default nothing checks is a default free to drift.
         let limited = execute(
             &cli(&["recent", "--limit", "1"]),
             context(Arc::clone(&bucket), &cache),
@@ -2139,6 +2151,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(limited, "2000\tnotes/second.md\tSecond");
+        assert!(matches!(
+            cli(&["recent"]).command,
+            Command::Recent {
+                limit: RECENT_DEFAULT_LIMIT
+            }
+        ));
+
+        // Asking for nothing prints nothing; it must not claim the project is
+        // empty.
+        let none = execute(
+            &cli(&["recent", "--limit", "0"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(none, "");
     }
 
     #[tokio::test]

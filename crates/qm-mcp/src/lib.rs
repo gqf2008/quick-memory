@@ -407,7 +407,7 @@ impl MemoryServer {
         Parameters(args): Parameters<RecentArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.dispatch(Command::Recent {
-            limit: args.limit.unwrap_or(10),
+            limit: args.limit.unwrap_or(qm_cli::RECENT_DEFAULT_LIMIT),
         })
         .await
     }

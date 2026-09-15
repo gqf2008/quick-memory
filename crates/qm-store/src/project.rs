@@ -10,6 +10,7 @@
 //! the loser re-reads, re-derives its page id (its `supersedes` may have
 //! changed) and tries again. No machine has to know another exists.
 
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use object_store::ObjectStore;
@@ -309,6 +310,22 @@ pub struct ProjectStore {
     retry: RetryPolicy,
 }
 
+/// Ordering for [`ProjectStore::recent_pages`]: newest commit first, path
+/// ascending to break ties.
+///
+/// The tie-breaker is defence in depth rather than the only source of order:
+/// `Manifest::pages` is a `BTreeMap` and `sort_by` is stable, so equal
+/// timestamps already come out path-ascending today. Stating it explicitly
+/// keeps the order *total* if the container or the sort changes underneath —
+/// and a total order is the thing two machines must agree on.
+fn recency_order(left: &(PagePath, PageEntry), right: &(PagePath, PageEntry)) -> Ordering {
+    right
+        .1
+        .created_at_ms
+        .cmp(&left.1.created_at_ms)
+        .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+}
+
 impl ProjectStore {
     /// Build a store over `store`, rooted at `root` (use `v1`).
     #[must_use]
@@ -364,19 +381,16 @@ impl ProjectStore {
 
     /// List the live pages of a scope, newest commit first.
     ///
-    /// Sorting is by `PageEntry::created_at_ms` descending with the path
-    /// ascending as a tie-breaker. The tie-breaker is what makes the order
-    /// total: two machines that committed inside the same millisecond would
-    /// otherwise be free to disagree, which is exactly the kind of drift an
-    /// object-store-backed list must not have.
+    /// Sorting is by `PageEntry::created_at_ms` — the *latest* commit's
+    /// timestamp, so a rewritten page moves to the top — descending, with the
+    /// path ascending as a tie-breaker (see [`recency_order`]).
     ///
     /// A tombstoned path is absent from `manifest.pages` by construction, so
     /// deleted pages need no extra filter here.
     ///
     /// # Errors
     /// [`StoreError::Corrupt`] when a committed path is no longer a valid page
-    /// path — a manifest that cannot be listed is a manifest to repair, not to
-    /// render partially.
+    /// path.
     pub async fn recent_pages(
         &self,
         workspace_id: &WorkspaceId,
@@ -391,13 +405,7 @@ impl ProjectStore {
             })?;
             pages.push((path, entry));
         }
-        pages.sort_by(|left, right| {
-            right
-                .1
-                .created_at_ms
-                .cmp(&left.1.created_at_ms)
-                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
-        });
+        pages.sort_by(recency_order);
         pages.truncate(limit);
         Ok(pages)
     }
@@ -1936,13 +1944,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recency_order_is_total_for_equal_timestamps() {
+        let entry = |at_ms: i64, title: &str| PageEntry {
+            page_id: qm_core::PageId::new("page-1").unwrap(),
+            seq: 1,
+            created_at_ms: at_ms,
+            writer_id: WriterId::new("mbp-a").unwrap(),
+            title: title.to_string(),
+            supersedes: None,
+        };
+        let pair = |path: &str, at_ms: i64| (PagePath::new(path).unwrap(), entry(at_ms, path));
+
+        // Equal timestamps in both argument orders: the comparator must impose
+        // a direction rather than answering `Equal` and leaving the result to
+        // whatever the caller's sort happens to do with it.
+        let (a, b) = (pair("notes/a.md", 5_000), pair("notes/b.md", 5_000));
+        assert_eq!(recency_order(&a, &b), Ordering::Less);
+        assert_eq!(recency_order(&b, &a), Ordering::Greater);
+        assert_eq!(recency_order(&a, &a), Ordering::Equal);
+
+        // A newer commit wins even when its path sorts the other way, so the
+        // timestamp outranks the tie-breaker.
+        let newer = pair("notes/z.md", 9_000);
+        assert_eq!(recency_order(&newer, &a), Ordering::Less);
+        assert_eq!(recency_order(&a, &newer), Ordering::Greater);
+    }
+
     #[tokio::test]
     async fn recent_pages_break_ties_on_the_path() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = machine(&bucket);
 
-        // Same millisecond: without the path tie-breaker the order would be
-        // whatever the map iteration happened to produce.
+        // Same millisecond, committed in deliberately unsorted path order, so
+        // this pins the *direction* the tie-break has to run (a path-descending
+        // tie-break fails it). The comparator test above is what fails when the
+        // tie-break is dropped outright.
         for path in ["notes/b.md", "notes/a.md", "notes/c.md"] {
             store
                 .commit_page(request("mbp-a", path, "body", 5_000))
