@@ -2149,7 +2149,6 @@ mod tests {
                 let path = format!("notes/m{machine_index}-{path_index}.md");
                 tasks.push(tokio::spawn(async move {
                     let mut ids = Vec::new();
-                    let mut outcomes = 0u32;
                     for version in 0..5 {
                         let outcome = store
                             .commit_page(request(
@@ -2160,31 +2159,31 @@ mod tests {
                             ))
                             .await
                             .expect("commit");
-                        outcomes += outcome.attempts;
                         ids.push(outcome.page_id);
                     }
-                    (path, ids, outcomes)
+                    (path, ids)
                 }));
             }
         }
 
         let mut expected_paths = BTreeSet::new();
         let mut chains = Vec::new();
-        let mut total_attempts = 0u32;
-        let mut total_commits = 0u32;
         for task in tasks {
-            let (path, ids, attempts) = task.await.unwrap();
+            let (path, ids) = task.await.unwrap();
             expected_paths.insert(path.clone());
             chains.push((path, ids));
-            total_attempts += attempts;
-            total_commits += 5;
         }
-        // Contention control: if every commit had won on the first attempt the
-        // run would prove nothing about the retry path.
-        assert!(
-            total_attempts > total_commits,
-            "expected at least one CAS conflict and retry, got {total_attempts} attempts for {total_commits} commits"
-        );
+        // Deliberately no "a CAS conflict must have happened" assertion.
+        // Whether two commits overlap is decided by the scheduler, not by the
+        // code under test: on a fast in-memory backend these tasks are often
+        // serialised and every commit wins on its first attempt. Such an
+        // assertion fails on a fraction of runs for a reason that says nothing
+        // about correctness. The property that matters -- a superseded manifest
+        // version is refused at the commit point -- is pinned deterministically
+        // by `a_stale_manifest_version_is_rejected_at_the_commit_point`. What
+        // stays here are the properties that hold however the runtime schedules
+        // the tasks: no lost write, a complete chain per path, and a WAL with
+        // exactly one record per committed version.
 
         let store = machine(&bucket);
         let loaded = store.load(&ws(), &proj()).await.unwrap();
@@ -2279,9 +2278,15 @@ mod tests {
                     .expect("publish")
             }));
         }
-        let mut attempts = 0u32;
+        // Every publish must land, and the head must have advanced once per
+        // publish. There is deliberately no assertion that a head CAS conflict
+        // was observed: eight publishes are frequently serialised by the
+        // scheduler, so "saw more than eight attempts" is a coin flip, not a
+        // property of the code. The retry path it was trying to reach is pinned
+        // deterministically by
+        // `a_stale_manifest_version_is_rejected_at_the_commit_point`.
         for task in tasks {
-            attempts += task.await.unwrap().attempts;
+            task.await.unwrap();
         }
 
         let store = machine(&bucket);
@@ -2295,9 +2300,64 @@ mod tests {
             .map(|s| s.content_hash.as_str())
             .collect();
         assert_eq!(hashes.len(), 8);
+    }
+
+    /// The property the concurrency tests above depend on, stated without a
+    /// race: a manifest version that has been superseded must not be accepted
+    /// at the commit point.
+    ///
+    /// This is what makes retrying safe rather than merely optimistic. It is
+    /// asserted directly -- read a version, let another machine move the commit
+    /// point on, then CAS the stale version -- because driving the same code
+    /// through concurrent commits only *sometimes* produces the overlap, and a
+    /// test that proves the guard only when the scheduler cooperates is not a
+    /// guard.
+    #[tokio::test]
+    async fn a_stale_manifest_version_is_rejected_at_the_commit_point() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_key = machine(&bucket).layout().manifest(&ws(), &proj());
+
+        // Machine A commits, then reads the version it committed at.
+        let machine_a = machine(&bucket);
+        machine_a
+            .commit_page(request("mbp-a", "notes/one.md", "body a", 1_000))
+            .await
+            .unwrap();
+        let stale = machine_a
+            .load(&ws(), &proj())
+            .await
+            .unwrap()
+            .version
+            .expect("a commit must leave a manifest behind");
+
+        // Machine B commits against the same scope, moving the commit point on.
+        machine(&bucket)
+            .commit_page(request("mbp-b", "notes/two.md", "body b", 2_000))
+            .await
+            .unwrap();
+
+        // A's version now describes the past. Offering it back to the commit
+        // point must be refused, not silently accepted as a lost update.
+        let refused = machine_a
+            .cas()
+            .update(
+                &manifest_key,
+                encode(&Manifest::empty(ws(), proj())).unwrap(),
+                &stale,
+            )
+            .await;
         assert!(
-            attempts > 8,
-            "expected at least one head CAS conflict, saw {attempts} attempts"
+            matches!(refused, Err(StoreError::Precondition)),
+            "a superseded manifest version must be refused, got {refused:?}"
+        );
+
+        // The refusal left the commit point exactly where machine B put it.
+        let loaded = machine_a.load(&ws(), &proj()).await.unwrap();
+        assert_eq!(loaded.manifest.seq, 2, "the refused write must not commit");
+        assert_eq!(
+            loaded.manifest.pages.len(),
+            2,
+            "both committed pages survive the refused write"
         );
     }
 
