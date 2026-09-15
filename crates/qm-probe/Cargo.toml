@@ -1,5 +1,8 @@
 [package]
 name = "qm-probe"
+# Probe tooling: the S3 stub and the acceptance scenarios are not a published
+# API surface, so nothing here is a compatibility promise.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
