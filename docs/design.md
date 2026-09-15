@@ -120,13 +120,16 @@ FileMetadata = 8 字节版本头（magic = 403881646，version = 1）+ JSON {"fi
 已实现的边界：footer 的所有长度都按**不可信输入**做 checked 运算（损坏/恶意 split 必须报错，不得 panic 或越界），
 元数据里的文件名拒绝路径穿越，越界偏移一律拒绝。
 
-**未决风险（必须用真实二进制验证）**：Quickwit v0.9.0 依赖的是 **tantivy 的 fork**
-（`git rev 057458b`），不是 crates.io 的 tantivy 0.26。所以"Quickwit 写出的索引文件能否被我们的 tantivy 打开"
-仍要看实际字节。两种结局都已铺好路：
+**兼容性证据（2026-09 核对源码）**：Quickwit v0.9.0 依赖的是 tantivy 的 fork（`quickwit-oss/tantivy`，
+rev `057458b`）。核对结果是该 fork 的 `Cargo.toml` 版本为 **0.26.0**，且 `lib.rs` 里
+`INDEX_FORMAT_VERSION = 7`、`INDEX_FORMAT_OLDEST_SUPPORTED_VERSION = 4`，与本仓库使用的 crates.io
+**tantivy 0.26.2 完全相同**。也就是说读方与 Quickwit 属于同一索引格式代次，"解包后能不能打开"这一层的
+风险已经很小区间。
 
-- 兼容 → Quickwit 直接当构建器，读方保持纯 tantivy；
-- 不兼容 → 要么把整个工作区的 tantivy 换成同一个 fork（构建器与读方统一），
-  要么让 Quickwit 只做服务化加速层、构建器用 tantivy。
+仍待闭环的一步是**真实字节验证**：用 Quickwit v0.9.0 产出一个 split，让本仓的 tantivy 打开它。
+GitHub 资产在本机被限速（73.9MB 只稳定拿到约 1MB），因此这一步需要外部条件（可用的 `QW_BIN`
+或能换网的环境）。无论结果如何，两条路都已经铺好：兼容 → Quickwit 当构建器；不兼容 → 把工作区切到
+同一个 fork（构建器与读方统一），或让 Quickwit 只做服务化加速层。
 
 无论哪种结局，"任何一台机器独立搜全量"都不受影响：它由我们自己的 split 目录与上面的解包路径保证。
 
@@ -332,6 +335,6 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）。
 2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）。
 3. ~~Quickwit 产出的 `.split` 能否解包成 tantivy 目录被进程内直读~~ —— **格式已实现并测试**（见 §6.4）；
-   剩下的是**格式版本兼容性**：用真实 Quickwit v0.9.0 产出一个 split，看我们的 tantivy 0.26 能否打开它
-   （Quickwit 用的是 tantivy fork `057458b`）；
+   ~~格式版本是否兼容~~ —— **源码核对一致**（fork 0.26.0，`INDEX_FORMAT_VERSION = 7`，与本仓 tantivy 0.26.2 相同）；
+   仅剩**真实字节**验证，需要 `QW_BIN`（本机下载被限速，见 §6.4）；
 4. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`。
