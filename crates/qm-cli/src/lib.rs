@@ -17,15 +17,17 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use object_store::ObjectStore;
 use qm_core::{
-    CommitKind, HandoffState, MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId,
-    WorkspaceId, WriterId,
+    CommitKind, HandoffState, MANIFEST_FORMAT_SHARDED, MANIFEST_FORMAT_WHOLE, MANIFEST_SCHEMA,
+    Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId,
 };
 use qm_search::consolidate::{CompilerChoice, consolidate_session_with};
 use qm_search::{
     PageDoc, attach_embeddings, compact_project, publish_split_index, search_project_tuned,
     search_workspace_tuned,
 };
-use qm_store::{CommitPageRequest, Digest, IngestObservationsRequest, ProjectStore};
+use qm_store::{
+    CommitPageRequest, Digest, IngestObservationsRequest, MigrateOutcome, ProjectStore,
+};
 
 /// Default page count for `recent` / `memory_recent`.
 ///
@@ -254,6 +256,12 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         strict: bool,
     },
+    /// Convert this project's manifest between the whole and sharded forms.
+    MigrateManifest {
+        /// Storage form to convert to: 1 (one object) or 2 (root + shards).
+        #[arg(long, default_value_t = MANIFEST_FORMAT_SHARDED)]
+        to: u32,
+    },
     /// Reclaim unreachable objects (dry run unless `--apply`).
     Gc {
         /// Actually delete instead of reporting.
@@ -331,6 +339,13 @@ pub enum Command {
     },
 }
 
+/// Names the storage form new commits are written in.
+///
+/// One name, read in exactly two places that share this constant: the CLI's
+/// context and the MCP server's. A second spelling would let the surface that
+/// is supposed to be the same protocol write a different form.
+pub const MANIFEST_FORMAT_ENV: &str = "QM_MANIFEST_FORMAT";
+
 const S3_ENDPOINT_ENV_NAMES: &[&str] = &["QM_S3_ENDPOINT", "R2_ENDPOINT"];
 const S3_BUCKET_ENV_NAMES: &[&str] = &["QM_S3_BUCKET", "R2_BUCKET"];
 const S3_ACCESS_KEY_ENV_NAMES: &[&str] = &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"];
@@ -345,6 +360,37 @@ const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET
 /// consulting different name tables.
 fn env_lookup() -> impl FnMut(&str) -> Option<String> {
     |name: &str| std::env::var(name).ok()
+}
+
+/// Parse the write-form setting out of an injected name -> value lookup.
+///
+/// Unset means [`MANIFEST_FORMAT_WHOLE`], which is what every version before
+/// format 2 wrote. A value that is not a form this build knows is an error and
+/// not a fallback: quietly writing the whole form because someone typed `3`
+/// would make the setting look like it took effect.
+///
+/// # Errors
+/// Fails on anything but `1` or `2`.
+pub fn manifest_format_from(mut get: impl FnMut(&str) -> Option<String>) -> Result<u32> {
+    let Some(raw) = env_first_with(&[MANIFEST_FORMAT_ENV], &mut get) else {
+        return Ok(MANIFEST_FORMAT_WHOLE);
+    };
+    match raw.trim() {
+        "1" => Ok(MANIFEST_FORMAT_WHOLE),
+        "2" => Ok(MANIFEST_FORMAT_SHARDED),
+        other => bail!(
+            "{MANIFEST_FORMAT_ENV}={other:?} is not a manifest form this build knows: \
+             set 1 (whole manifest) or 2 (root pointer plus content-addressed shards)"
+        ),
+    }
+}
+
+/// Parse the write-form setting out of the environment.
+///
+/// # Errors
+/// Fails on anything but `1` or `2`.
+pub fn manifest_format_from_env() -> Result<u32> {
+    manifest_format_from(env_lookup())
 }
 
 fn env_first_with(names: &[&str], get: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
@@ -444,6 +490,49 @@ fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// Render what a storage-form change did.
+///
+/// Reports the form it started in and the form it is in now rather than only
+/// the one that was asked for: a migration that found the scope already in the
+/// target form changed nothing, and an operator reading the output has to be
+/// able to tell that apart from a migration that moved objects.
+fn render_migrate(outcome: &MigrateOutcome, json: bool) -> String {
+    if json {
+        return serde_json::json!({
+            "from": outcome.from,
+            "to": outcome.to,
+            "shards": outcome.shards,
+            "already_there": outcome.already_there,
+            "archive": outcome.archive,
+            "manifest_seq": outcome.manifest_seq,
+            "attempts": outcome.attempts,
+        })
+        .to_string();
+    }
+    let mut report = if outcome.already_there {
+        format!(
+            "manifest form: already {} (no change), {} shard(s)",
+            outcome.to, outcome.shards
+        )
+    } else {
+        format!(
+            "manifest form: {} -> {}, {} shard(s)",
+            outcome.from, outcome.to, outcome.shards
+        )
+    };
+    report.push_str(&format!("\n  manifest seq: {}", outcome.manifest_seq));
+    match &outcome.archive {
+        Some(key) => report.push_str(&format!(
+            "\n  archived whole manifest: {key} (kept: `--to 1` goes back)"
+        )),
+        None if outcome.to == MANIFEST_FORMAT_SHARDED => {
+            report.push_str("\n  no archive: this project had no whole manifest to keep")
+        }
+        None => {}
+    }
+    report
 }
 
 /// Render a digest as three labelled sections: pages, sessions, handoffs.
@@ -556,7 +645,8 @@ impl Context {
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("qm-spool"));
         Ok(Self {
-            project: ProjectStore::new(Arc::clone(&bucket), "v1"),
+            project: ProjectStore::new(Arc::clone(&bucket), "v1")
+                .with_manifest_format(manifest_format_from_env()?),
             bucket,
             bucket_identity: String::new(),
             spool_dir,
@@ -578,6 +668,17 @@ impl Context {
     #[must_use]
     pub fn with_bucket_identity(mut self, identity: impl Into<String>) -> Self {
         self.bucket_identity = identity.into();
+        self
+    }
+
+    /// Select the storage form this context's writes use.
+    ///
+    /// [`Context::new`] resolves it from `QM_MANIFEST_FORMAT` already; this is
+    /// for a surface that has to override it after construction — the MCP
+    /// server keeps the setting on the server so every tool call shares it.
+    #[must_use]
+    pub fn with_manifest_format(mut self, format: u32) -> Self {
+        self.project = self.project.with_manifest_format(format);
         self
     }
 
@@ -1061,6 +1162,8 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "workspace": ctx.workspace.to_string(),
                     "project": ctx.project_id.to_string(),
                     "manifest_seq": loaded.manifest.seq,
+                    "manifest_format": loaded.storage_format(),
+                    "manifest_shards": loaded.root.as_ref().map_or(0, |root| root.shards.len()),
                     "pages": loaded.manifest.pages.len(),
                     "tombstones": loaded.manifest.tombstones.len(),
                     "catalog_generation": catalog.catalog.generation,
@@ -1070,12 +1173,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .to_string()
             } else {
                 format!(
-                    "{} / {}\n  pages: {}\n  tombstones: {}\n  manifest seq: {}\n  splits: {} (generation {})\n  sessions: {}",
+                    "{} / {}\n  pages: {}\n  tombstones: {}\n  manifest: seq {} format {} ({} shard(s); `qm migrate-manifest` changes it)\n  splits: {} (generation {})\n  sessions: {}",
                     ctx.workspace,
                     ctx.project_id,
                     loaded.manifest.pages.len(),
                     loaded.manifest.tombstones.len(),
                     loaded.manifest.seq,
+                    loaded.storage_format(),
+                    loaded.root.as_ref().map_or(0, |root| root.shards.len()),
                     catalog.catalog.splits.len(),
                     catalog.catalog.generation,
                     sessions.len()
@@ -1589,6 +1694,26 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 bail!("{text}");
             }
             Ok(text)
+        }
+        Command::MigrateManifest { to } => {
+            let outcome = match *to {
+                MANIFEST_FORMAT_SHARDED => {
+                    ctx.project
+                        .migrate_manifest_to_sharded(&ctx.workspace, &ctx.project_id)
+                        .await
+                }
+                MANIFEST_FORMAT_WHOLE => {
+                    ctx.project
+                        .rollback_manifest_to_whole(&ctx.workspace, &ctx.project_id)
+                        .await
+                }
+                other => bail!(
+                    "--to {other} is not a manifest form this build knows: \
+                     set 1 (whole manifest) or 2 (root pointer plus content-addressed shards)"
+                ),
+            }
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(render_migrate(&outcome, ctx.json))
         }
         Command::Gc { apply, grace_ms } => {
             let outcome = ctx
@@ -2308,6 +2433,250 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("qm").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The form a scope is stored in, read from the layout rather than guessed
+    /// from what the command printed.
+    async fn stored_form(ctx: &Context) -> u32 {
+        ctx.project
+            .load(&ctx.workspace, &ctx.project_id)
+            .await
+            .unwrap()
+            .storage_format()
+    }
+
+    /// How many shards the stored commit point names.
+    async fn stored_shards(ctx: &Context) -> usize {
+        ctx.project
+            .load(&ctx.workspace, &ctx.project_id)
+            .await
+            .unwrap()
+            .root
+            .map_or(0, |root| root.shards.len())
+    }
+
+    /// Run `qm verify --strict`, which reports a problem rather than panicking,
+    /// and return its output.
+    async fn verify_strict(ctx: Context) -> Result<String> {
+        execute(&cli(&["verify", "--strict"]), ctx).await
+    }
+
+    /// The switch reads one name, and an unrecognised value is an error rather
+    /// than a silent fallback to the default.
+    #[test]
+    fn the_write_form_is_read_from_one_name_and_refuses_what_it_does_not_know() {
+        // Unset, and set-but-blank, both mean the form every earlier version
+        // wrote.
+        assert_eq!(
+            manifest_format_from(|_| None).unwrap(),
+            MANIFEST_FORMAT_WHOLE
+        );
+        assert_eq!(
+            manifest_format_from(|name| {
+                assert_eq!(name, MANIFEST_FORMAT_ENV);
+                Some("   ".to_string())
+            })
+            .unwrap(),
+            MANIFEST_FORMAT_WHOLE
+        );
+        for (value, expected) in [
+            ("1", MANIFEST_FORMAT_WHOLE),
+            ("2", MANIFEST_FORMAT_SHARDED),
+            (" 2 ", MANIFEST_FORMAT_SHARDED),
+        ] {
+            assert_eq!(
+                manifest_format_from(|_| Some(value.to_string())).unwrap(),
+                expected,
+                "{value:?} must select form {expected}"
+            );
+        }
+        let error = manifest_format_from(|_| Some("3".to_string())).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("QM_MANIFEST_FORMAT") && message.contains("\"3\""),
+            "the refusal has to name the setting and the value: {message}"
+        );
+    }
+
+    /// The switch reaches the store from the CLI surface, and the default keeps
+    /// writing the objects it always wrote.
+    #[tokio::test]
+    async fn the_manifest_form_switch_reaches_the_store_and_the_default_does_not() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        execute(
+            &cli(&["write-page", "--path", "notes/plain.md", "--body", "v1"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let plain = context(Arc::clone(&bucket), &cache);
+        assert_eq!(
+            stored_form(&plain).await,
+            MANIFEST_FORMAT_WHOLE,
+            "the default must still write the single commit point"
+        );
+        assert_eq!(stored_shards(&plain).await, 0);
+        assert!(verify_strict(plain).await.is_ok());
+
+        let sharded_bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sharded = context(Arc::clone(&sharded_bucket), &cache)
+            .with_manifest_format(MANIFEST_FORMAT_SHARDED);
+        execute(
+            &cli(&["write-page", "--path", "notes/split.md", "--body", "v1"]),
+            sharded,
+        )
+        .await
+        .unwrap();
+        let sharded = context(Arc::clone(&sharded_bucket), &cache)
+            .with_manifest_format(MANIFEST_FORMAT_SHARDED);
+        assert_eq!(
+            stored_form(&sharded).await,
+            MANIFEST_FORMAT_SHARDED,
+            "the switch has to reach the store's writes"
+        );
+        assert_eq!(stored_shards(&sharded).await, 1);
+        assert!(verify_strict(sharded).await.is_ok());
+
+        // And `status` reports the form the scope is *stored* in, which is the
+        // thing an operator needs before deciding to migrate.
+        let status = execute(
+            &cli(&["status", "--json"]),
+            context(Arc::clone(&sharded_bucket), &cache)
+                .with_manifest_format(MANIFEST_FORMAT_SHARDED),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(parsed["manifest_format"], MANIFEST_FORMAT_SHARDED);
+        assert_eq!(parsed["manifest_shards"], 1);
+        let status = execute(
+            &cli(&["status", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(parsed["manifest_format"], MANIFEST_FORMAT_WHOLE);
+        assert_eq!(parsed["manifest_shards"], 0);
+    }
+
+    /// The operator's round trip: migrate, migrate again, roll back.
+    #[tokio::test]
+    async fn migrate_manifest_converts_and_rolls_back() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        for (path, body) in [
+            ("notes/a.md", "first"),
+            ("notes/b.md", "second"),
+            ("notes/c.md", "third"),
+        ] {
+            execute(
+                &cli(&["write-page", "--path", path, "--body", body]),
+                context(Arc::clone(&bucket), &cache),
+            )
+            .await
+            .unwrap();
+        }
+
+        let out = execute(
+            &cli(&["migrate-manifest", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["from"], MANIFEST_FORMAT_WHOLE);
+        assert_eq!(parsed["to"], MANIFEST_FORMAT_SHARDED);
+        assert_eq!(parsed["already_there"], false);
+        assert_eq!(parsed["manifest_seq"], 3);
+        let archive = parsed["archive"]
+            .as_str()
+            .expect("the old body is archived");
+        assert!(
+            archive.contains("/manifest/archive/"),
+            "the archive is the key the root will name: {archive}"
+        );
+        // `verify` reads the archive the root names and fails if it is missing
+        // or hashes differently, so a green pass is evidence the pre-migration
+        // body survived the switch.
+        assert!(
+            verify_strict(context(Arc::clone(&bucket), &cache))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            stored_form(&context(Arc::clone(&bucket), &cache)).await,
+            MANIFEST_FORMAT_SHARDED
+        );
+        assert!(stored_shards(&context(Arc::clone(&bucket), &cache)).await >= 1);
+
+        // The scope still reads, through the default form, with the same pages.
+        let read = execute(
+            &cli(&["read-page", "--path", "notes/b.md"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(read.contains("second"), "{read}");
+
+        let out = execute(
+            &cli(&["migrate-manifest", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["already_there"], true, "a second run is a no-op");
+
+        let out = execute(
+            &cli(&["migrate-manifest", "--to", "1", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["from"], MANIFEST_FORMAT_SHARDED);
+        assert_eq!(parsed["to"], MANIFEST_FORMAT_WHOLE);
+        assert_eq!(parsed["manifest_seq"], 3);
+        let read = execute(
+            &cli(&["read-page", "--path", "notes/c.md"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(read.contains("third"), "{read}");
+
+        let rolled_back = context(Arc::clone(&bucket), &cache);
+        assert_eq!(
+            stored_form(&rolled_back).await,
+            MANIFEST_FORMAT_WHOLE,
+            "the scope is whole again after the rollback"
+        );
+        assert!(verify_strict(rolled_back).await.is_ok());
+
+        let error = execute(
+            &cli(&["migrate-manifest", "--to", "9"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not a manifest form this build knows"),
+            "{error}"
+        );
+    }
+
+    /// The MCP surface resolves the same setting through the same parser.
+    #[test]
+    fn the_mcp_surface_reads_the_same_environment_name() {
+        // The name is a constant shared by both binaries, so the only thing
+        // this has to pin is that it is the documented one and that the MCP
+        // crate's entry point uses this parser (it calls
+        // `manifest_format_from_env`, see `qm-mcp/src/main.rs`).
+        assert_eq!(MANIFEST_FORMAT_ENV, "QM_MANIFEST_FORMAT");
     }
 
     #[tokio::test]

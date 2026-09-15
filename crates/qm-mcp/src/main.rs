@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use qm_cli::{bucket_identity_from_env, build_bucket_from_env};
+use qm_cli::{bucket_identity_from_env, build_bucket_from_env, manifest_format_from_env};
 use qm_mcp::MemoryServer;
 use rmcp::ServiceExt;
 use rmcp::transport::io::stdio;
@@ -50,7 +50,10 @@ async fn main() -> Result<()> {
     // changes the endpoint or bucket in the MCP configuration.
     let bucket_identity = bucket_identity_from_env();
     let server = MemoryServer::new(bucket, workspace, project, writer, cache_dir)
-        .with_bucket_identity(bucket_identity);
+        .with_bucket_identity(bucket_identity)
+        // Resolved through the same parser the `qm` binary uses, so the two
+        // surfaces cannot disagree about what the setting means.
+        .with_manifest_format(manifest_format_from_env()?);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

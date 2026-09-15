@@ -88,3 +88,48 @@ fn the_real_binary_reads_the_documented_bucket_environment() {
          reachable; stderr was:\n{stderr}"
     );
 }
+
+/// The storage-form switch is read by the real binary, and an unrecognised
+/// value stops it before it touches a bucket.
+///
+/// The bucket environment here is complete but points at a closed port, so the
+/// only thing that can produce this failure is the switch itself: `Context::new`
+/// resolves it before the command runs, and the command is the first thing that
+/// would ever send a request. A build that ignored `QM_MANIFEST_FORMAT` would
+/// instead reach the command's own path validation and print `is not portable`,
+/// which is the assertion that makes this test discriminating.
+#[test]
+fn the_real_binary_refuses_a_storage_form_it_does_not_know() {
+    let with_bad_form: Vec<(&str, &str)> = DOCUMENTED_BUCKET_ENV
+        .iter()
+        .copied()
+        .chain([("QM_MANIFEST_FORMAT", "3")])
+        .collect();
+    let stderr = stderr_of(&run_qm(&with_bad_form));
+    assert!(
+        stderr.contains("QM_MANIFEST_FORMAT") && stderr.contains("\"3\""),
+        "the binary has to reject a form it does not know, naming the setting and \
+         the value; stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("is not portable"),
+        "the refusal must happen while the context is built, not after the command \
+         ran; stderr was:\n{stderr}"
+    );
+
+    // Both documented values are accepted, so the rejection above is about the
+    // value and not about the variable existing at all.
+    for form in ["1", "2"] {
+        let env: Vec<(&str, &str)> = DOCUMENTED_BUCKET_ENV
+            .iter()
+            .copied()
+            .chain([("QM_MANIFEST_FORMAT", form)])
+            .collect();
+        let stderr = stderr_of(&run_qm(&env));
+        assert!(
+            stderr.contains("is not portable"),
+            "QM_MANIFEST_FORMAT={form} must be accepted and reach the command; \
+             stderr was:\n{stderr}"
+        );
+    }
+}

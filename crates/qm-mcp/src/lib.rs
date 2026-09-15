@@ -215,6 +215,9 @@ pub struct PageArgs {
 pub struct MemoryServer {
     bucket: Arc<dyn ObjectStore>,
     bucket_identity: String,
+    /// Storage form new commits are written in, from `QM_MANIFEST_FORMAT`.
+    /// Reads do not use it: they dispatch on what the bucket actually holds.
+    manifest_format: u32,
     workspace: String,
     project: String,
     writer: String,
@@ -244,6 +247,7 @@ impl MemoryServer {
         Self {
             bucket,
             bucket_identity: String::new(),
+            manifest_format: qm_core::MANIFEST_FORMAT_WHOLE,
             workspace,
             project,
             writer,
@@ -261,6 +265,20 @@ impl MemoryServer {
     #[must_use]
     pub fn with_bucket_identity(mut self, identity: impl Into<String>) -> Self {
         self.bucket_identity = identity.into();
+        self
+    }
+
+    /// Select the storage form this server's writes use.
+    ///
+    /// The value is resolved once from the process environment by the binary
+    /// that starts the server, and threaded through here so every tool call
+    /// writes the same form. A server that fell back to the default while the
+    /// operator had asked for shards would write a whole manifest into a
+    /// sharded scope, which the store refuses — loudly, but only after the
+    /// misconfiguration reached a write.
+    #[must_use]
+    pub fn with_manifest_format(mut self, format: u32) -> Self {
+        self.manifest_format = format;
         self
     }
 
@@ -284,7 +302,8 @@ impl MemoryServer {
             true,
         )
         .map_err(|error| McpError::invalid_params(error.to_string(), None))?
-        .with_bucket_identity(self.bucket_identity.clone());
+        .with_bucket_identity(self.bucket_identity.clone())
+        .with_manifest_format(self.manifest_format);
         let output = execute(&cli, context)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;

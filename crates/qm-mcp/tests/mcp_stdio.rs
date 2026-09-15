@@ -696,3 +696,48 @@ fn mcp_search_no_vector_switches_the_vector_stream_off() {
         "no_vector must keep the vector stream out: {off_json}"
     );
 }
+
+/// `QM_MANIFEST_FORMAT` reaches the store through the MCP binary.
+///
+/// The switch is resolved once, by the process that starts the server, and has
+/// to survive every tool call after that: a server that fell back to the
+/// default would write a whole manifest into a scope the operator declared
+/// sharded, and the store would refuse it — correctly, but only once a write is
+/// attempted. `memory_status` reports the form the scope is *stored* in, so it
+/// is what shows which shape the writes actually took.
+#[test]
+fn the_manifest_form_switch_reaches_the_mcp_store() {
+    let mut server = Client::start_with(&[("QM_MANIFEST_FORMAT", "2")]);
+    server.handshake();
+    let written = server.call_tool(
+        1,
+        "memory_write_page",
+        serde_json::json!({"path": "notes/sharded.md", "body": "written while sharded"}),
+    );
+    let written_text = tool_text(&written);
+    assert!(
+        !written_text.contains("refusing to commit"),
+        "the server has to write the form it was told to: {written_text}"
+    );
+
+    let status = server.call_tool(2, "memory_status", serde_json::json!({}));
+    let status: serde_json::Value = serde_json::from_str(&tool_text(&status))
+        .unwrap_or_else(|error| panic!("status must return JSON: {error}"));
+    assert_eq!(status["manifest_format"], 2, "{status}");
+    assert_eq!(status["manifest_shards"], 1, "{status}");
+    assert_eq!(status["pages"], 1, "{status}");
+
+    // The premise: the same call on a server that was not told anything keeps
+    // writing the single object, so the assertion above is about the switch.
+    let mut plain = Client::start();
+    plain.handshake();
+    plain.call_tool(
+        1,
+        "memory_write_page",
+        serde_json::json!({"path": "notes/plain.md", "body": "written by default"}),
+    );
+    let status = plain.call_tool(2, "memory_status", serde_json::json!({}));
+    let status: serde_json::Value = serde_json::from_str(&tool_text(&status)).unwrap();
+    assert_eq!(status["manifest_format"], 1, "{status}");
+    assert_eq!(status["manifest_shards"], 0, "{status}");
+}
