@@ -2136,13 +2136,18 @@ impl ProjectStore {
             .await
     }
 
-    /// Read every committed WAL record.
+    /// Read every WAL record of the scope.
     ///
     /// The result is a *set*, ordered deterministically by page id for stable
     /// output: commit ordering lives in the manifest, and per-path ordering in
-    /// the `supersedes` chain. Nothing is returned for an attempt that never
-    /// won its CAS, because an uncommitted record is simply an unreferenced
-    /// object.
+    /// the `supersedes` chain. It is the set of records that are *there*, not
+    /// the set that is committed. A record left behind by an attempt that lost
+    /// its CAS race is returned like any other: the record and its page version
+    /// are written before the manifest update is offered, and a retry whose
+    /// predecessor moved derives a different page id (`derive_page_id` covers
+    /// `supersedes`), so the losing attempt's objects stay in the bucket,
+    /// unreferenced by anything the manifest names. Only the manifest decides
+    /// what counts as committed — this read never does.
     ///
     /// The whole WAL is listed and read, so the number of objects fetched is
     /// the number of records and not less; the fetch is what overlaps, up to
@@ -2152,10 +2157,15 @@ impl ProjectStore {
     /// position, records that share a page id keep the listing's order.
     ///
     /// A key the listing named and the bucket no longer has is a *failure*, not
-    /// a skip: unlike a session head, a WAL record is never deleted by a
-    /// concurrent writer, so an absence is a broken bucket rather than a
-    /// snapshot race (the uncommitted case above is an object that was never
-    /// written, not one that went missing).
+    /// a skip. No commit path ever deletes a WAL record — a losing attempt only
+    /// *adds* one, and nothing rewrites a key in place — so an absence means the
+    /// object was removed outside the write path: [`ProjectStore::gc_orphans`]
+    /// with `apply` (the reclaimer, and the eventual collector of the
+    /// unreferenced record described above, once it is older than the grace
+    /// window), or a probe's scope teardown. A read racing either gets an error
+    /// rather than a short answer: skipping the absence would turn "the bucket
+    /// was collected under me" into a count that looks complete and is not, and
+    /// no write-path race produces that absence in the first place.
     ///
     /// # Errors
     /// Propagates listing failures, a failing read as a failure of the whole
