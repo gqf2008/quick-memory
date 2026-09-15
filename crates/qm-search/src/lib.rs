@@ -2796,6 +2796,12 @@ mod tests {
             live.stream_candidates.get("vector").copied().unwrap_or(0) >= 1,
             "the premise: only the vector stream can reach this page: {live:?}"
         );
+        assert_eq!(
+            live.stream_candidates.get("body"),
+            Some(&0),
+            "the premise: the page's words must not match the query, or a body \
+             hit would explain the recall instead of the embedding: {live:?}"
+        );
         assert_eq!(live.hits.len(), 1, "{live:?}");
         assert_eq!(live.hits[0].page_id, first.page_id.as_str());
 
