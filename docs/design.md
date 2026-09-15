@@ -129,6 +129,16 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
 - **两个故障注入的对照**：stub 忽略 `If-Match` → `cas-conformance` 必须在 `stale-etag-rejected` /
   `consumed-etag-rejected` 上报 FAIL 并退出非零（测试同时跑一遍正常 stub 确认这不是环境问题）；
   stub 回一个从未写过的读 ETag → 探针也必须失败。
+- **检索路径也走真实 HTTP，而且是跨进程的**：`search-probe build` 与 `search-probe query` 是**两个独立
+  进程**打同一个 stub——第一个进程发布分片，第二个进程只有桶访问权、自己新建的缓存目录，必须把分片对象
+  全部取回并命中全量页面。测试断言的是 stub **收到**的 PUT/GET（每个 key 都被第二个进程取过），而不是
+  探针自称的数字；stub 刻意按每页 1 个对象分页，所以"读到全量"必须真的跟着 `continuation-token` 走。
+  多机目录场景（`search-probe project`：三写一读、旧版本被目录过滤掉）也在同一 socket 上跑通。
+- **两个检索侧的故障注入对照**：stub 把 listing 的第一页当成完整答案（`--fault truncate-listing`）→
+  读者只被告知 1 个对象、材料化出来的目录缺 `meta.json`，`query` 必须退出非零且不打印命中；
+  stub 把每个 `GET` 的 body 截成 1 字节、`content-length` 仍然诚实（`--fault truncate-read-body`）→
+  传输全部 200 成功，读者仍必须在打开索引时报 `Data corrupted`。前者证明"搜到全量"不是因为列表恰好够短，
+  后者证明损坏的内容不会被静默当成有效索引。
 
 **这层仍然没有测到什么**（不要把它读成真 R2 验证）：
 
@@ -136,6 +146,8 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   它证明的是"客户端在真实 HTTP 往返下的行为"，不是"R2 真的这样回答"。
 - **服务端签名校验**：stub 记录并忽略 `Authorization`；签名是否正确，只有真后端才能拒。
 - **R2 的延迟、配额、区域行为、一致性、错误 XML 变体**：stub 一律立刻回答、无错误变体。
+- **检索路径同样只有 stub 级证据**：`search-probe` 的 build/query 与 project 已经真打 socket，但**没有
+  在真 R2 上跑过**（§11 第 2 项）；`project` 里的"多台机器"是同一进程内的并发任务，只有桶访问是跨进程的。
 - **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
   所以"大对象"这条路径没有被覆盖。
 - **真实网络故障**：重试/退避只被单元测试覆盖，stub 不制造超时、5xx 或连接断裂。
@@ -839,7 +851,10 @@ mTLS 之外的完整读写链路、多机协作语义。
 待验证（需要真 R2 凭据 / Quickwit 二进制）：
 
 1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）。
-2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）。
+2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）—— **协议层已验证（stub），真 R2 待验证**
+   （无凭据）：两个独立 `search-probe` 进程在本地 S3 stub 上跑通 build → query，
+   并有"第二个进程取回全部分片对象、命中全量页面"的线上（socket）证据；多机目录场景
+   `search-probe project` 也在同一 socket 上跑通。见 §5.1 与 `crates/qm-probe/tests/search_probe_stub.rs`。
 3. ~~Quickwit 产出的 `.split` 能否解包成 tantivy 目录被进程内直读~~ —— **格式已实现并测试**（见 §6.4）；
    ~~格式版本是否兼容~~ —— **源码核对一致**（fork 0.26.0，`INDEX_FORMAT_VERSION = 7`，与本仓 tantivy 0.26.2 相同）；
    仅剩**真实字节**验证，需要 `QW_BIN`（本机下载被限速，见 §6.4）；
