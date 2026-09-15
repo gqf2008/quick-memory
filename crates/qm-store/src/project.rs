@@ -2144,20 +2144,41 @@ impl ProjectStore {
     /// won its CAS, because an uncommitted record is simply an unreferenced
     /// object.
     ///
+    /// The whole WAL is listed and read, so the number of objects fetched is
+    /// the number of records and not less; the fetch is what overlaps, up to
+    /// [`CONCURRENT_READ_LIMIT`]. The order comes from the sort below, never
+    /// from the order the reads finish in — and because that sort is stable and
+    /// [`ProjectStore::read_all`] files each record under its own key's
+    /// position, records that share a page id keep the listing's order.
+    ///
+    /// A key the listing named and the bucket no longer has is a *failure*, not
+    /// a skip: unlike a session head, a WAL record is never deleted by a
+    /// concurrent writer, so an absence is a broken bucket rather than a
+    /// snapshot race (the uncommitted case above is an object that was never
+    /// written, not one that went missing).
+    ///
     /// # Errors
-    /// Propagates backend failures and [`StoreError::Corrupt`] on bad content.
+    /// Propagates listing failures, a failing read as a failure of the whole
+    /// call — a partial WAL is never returned — and [`StoreError::Corrupt`] on
+    /// bad content. The failure reported is the one belonging to the *smallest*
+    /// key, so which read finishes first decides nothing.
     pub async fn read_wal(
         &self,
         workspace_id: &WorkspaceId,
         project_id: &ProjectId,
     ) -> Result<Vec<WalEntry>, StoreError> {
         let prefix = self.layout.wal_prefix(workspace_id, project_id);
-        let listed = self.cas.list(&prefix).await?;
-        let mut entries = Vec::with_capacity(listed.len());
-        for (key, _) in listed {
-            let (bytes, _) = self.cas.read(&key).await?;
-            entries.push(decode::<WalEntry>(&bytes, &key)?);
-        }
+        let keys: Vec<String> = self
+            .cas
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        // Every listed key is read, exactly as the serial loop did: the WAL has
+        // no non-record objects under its prefix to filter out, and filtering
+        // here would silently drop a record some other writer named.
+        let mut entries: Vec<WalEntry> = self.read_all(keys).await?;
         entries.sort_by(|a, b| a.page_id.cmp(&b.page_id));
         Ok(entries)
     }
