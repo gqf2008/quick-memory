@@ -112,34 +112,48 @@ CAS 层把两者都归一为"条件未满足"，但**不接受**泛化的后端�
 **read-your-writes**：本机刚写入但尚未发布分片的内容，由本地尾部（权威对象 + 本地索引）覆盖；
 跨机可见性允许有界滞后，但必须在结果里给出 `covered_until`。
 
-## 6.4 与 Quickwit 的格式兼容（S3 实证）
+## 6.4 与 Quickwit 的格式兼容（已用真分片验证）
 
-Quickwit 的 split 容器格式是**公开且可解析**的（上游 `docs/internals/split-format.md`）：
+Quickwit 的 split 容器格式是公开的，读方**不需要 Quickwit 集群**就能打开它：
 
 ```
-[ 所有文件首尾相接 ][ FileMetadata ][ metadata 长度 u64 LE ][ hotcache ][ hotcache 长度 u64 LE ]
-FileMetadata = 8 字节版本头（magic = 403881646，version = 1）+ JSON {"files": {name: {start, end}}}
+[ 所有文件首尾相接 ][ FileMetadata ][ metadata 长度 ][ hotcache ][ hotcache 长度 ]
+FileMetadata = 8 字节版本头（magic = 403881646 / 0x1812BEAE，version = 1）+ JSON {"files": {name: {start, end}}}
 ```
 
-因此读方**不需要 Quickwit 集群**就能打开一个 `.split`：解析 footer、把文件切出来、用 tantivy 打开
-（`qm-search::quickwit_split`）。`materialize` 会自动识别前缀下的 `.split` 并就地解包，于是
-"Quickwit 构建器产出的分片"与"tantivy 构建器产出的目录"在读方是同一种东西。
+**长度字段是 u32**（不是 u64）——这一点由真实分片的字节决定，而不是由文档决定：Quickwit 0.9.0 产出的分片尾部
+`hotcache_len = 3431`、`metadata_len = 485` 都是 4 字节小端；Quickwit 自己的 storage 侧 reader 用的是 8 字节，
+属于它内部两处实现不一致。我们的解析器**两种宽度都接受**，由版本头 magic 判定实际是哪种，
+所以两种写法都能读。
 
-已实现的边界：footer 的所有长度都按**不可信输入**做 checked 运算（损坏/恶意 split 必须报错，不得 panic 或越界），
-元数据里的文件名拒绝路径穿越，越界偏移一律拒绝。
+读 Quickwit 分片还需要 tantivy 的两个非默认特性，已在本工作区启用：
 
-**兼容性证据（2026-09 核对源码）**：Quickwit v0.9.0 依赖的是 tantivy 的 fork（`quickwit-oss/tantivy`，
-rev `057458b`）。核对结果是该 fork 的 `Cargo.toml` 版本为 **0.26.0**，且 `lib.rs` 里
-`INDEX_FORMAT_VERSION = 7`、`INDEX_FORMAT_OLDEST_SUPPORTED_VERSION = 4`，与本仓库使用的 crates.io
-**tantivy 0.26.2 完全相同**。也就是说读方与 Quickwit 属于同一索引格式代次，"解包后能不能打开"这一层的
-风险已经很小区间。
+| 特性 | 为什么需要 |
+|---|---|
+| `zstd-compression` | Quickwit 的 docstore 用 zstd（`zstd(compression_level=8)`），不启用会报 `unsupported variant zstd` |
+| `quickwit`（含 `sstable`） | Quickwit 的 term dictionary 是 SSTable，上游默认是 Fst，不启用会报 `Unsupported dictionary type` |
 
-仍待闭环的一步是**真实字节验证**：用 Quickwit v0.9.0 产出一个 split，让本仓的 tantivy 打开它。
-GitHub 资产在本机被限速（73.9MB 只稳定拿到约 1MB），因此这一步需要外部条件（可用的 `QW_BIN`
-或能换网的环境）。无论结果如何，两条路都已经铺好：兼容 → Quickwit 当构建器；不兼容 → 把工作区切到
-同一个 fork（构建器与读方统一），或让 Quickwit 只做服务化加速层。
+**已用真分片验证（2026-09-15）**：用官方 `quickwit/quickwit:0.9.0` 容器跑一个单节点、创建索引、
+灌 3 条文档，产出 `/quickwit/qwdata/indexes/qm-split-test/<id>.split`（6893 字节）。把它拷出来交给
+`split-probe --file <split> --query tantivy`：
 
-无论哪种结局，"任何一台机器独立搜全量"都不受影响：它由我们自己的 split 目录与上面的解包路径保证。
+```
+split=... bytes=6893 recognised=true
+extracted 8 file(s), hotcache 3431 bytes
+  <segment>.fast/.fieldnorm/.idx/.pos/.store/.term, meta.json, split_fields
+hits=1
+```
+
+也就是：**一个没有 Quickwit 的进程，读到了 Quickwit 产出的索引并检索出结果**。这正是"任何一台机器独立搜全量"
+在跨引擎情形下的那一半。
+
+顺带的效果：由于 `quickwit` 特性是编译期的，我们自己写出的分片也使用 SSTable 词表，与 Quickwit 同族；
+`materialize` 会自动识别前缀下的 `.split` 并就地解包，于是"Quickwit 构建器产出的分片"与"tantivy 构建器产出的目录"
+在读方是同一种东西。
+
+边界仍然明确：抽取出来的文件名会经过校验（拒绝路径穿越），所有长度都做 checked 运算（损坏/恶意 footer 只报错不 panic），
+外来 schema 的分片没有 `path`/`page_id` 字段时，命中会退化为"有正文、无身份"——这是读别人的索引时诚实的语义，
+而不是伪造身份。
 
 ## 6.5 提交协议（S1 已实现）
 
@@ -444,6 +458,7 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 | CLI 端到端（quickstart 路径） | capture → consolidate → publish → search 命中 → write-page → history（含提交时间）→ log → **`verify --strict`：no problems** → `gc`：scanned 19 / live 19 / collectable 0 |
 | 跨机器 | B（新 writer + 新缓存）读到 A 的页面与正文；B 写入并 publish 后 A 能搜到；handoff 由 B 认领后 A 再认领被拒（`is not open (state: Claimed)`） |
 | export / import | 导出 3 页 + 1 会话 → 导入到同桶另一项目 → 再导入 `0 page(s) (3 unchanged)` → publish → search 命中 → `verify --strict` 通过 |
+| **Quickwit 真分片** | 官方 `quickwit/quickwit:0.9.0` 容器产出 6893 字节分片 → `split-probe` 解包 8 个文件 → 本仓 tantivy **检索命中 1 条**（无 Quickwit 集群参与） |
 
 **这次验证覆盖了什么**：真实 HTTP + S3 协议路径（签名、endpoint、path-style、条件头、412 语义、列目录）、真实网络下的 CAS 冲突与重试、
 mTLS 之外的完整读写链路、多机协作语义。
@@ -453,7 +468,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - **R2 特有行为**：MinIO 的 PUT 不返回 `x-amz-version-id`（探针输出 `version=None`），
   所以"PUT 带 version、GET 不带"那条 R2 教训没有被这次运行触发。CAS 层按 ETag 判定并拒绝无 ETag 的后端，
   逻辑上已经对这种情况免疫，但仍建议在真 R2 上再跑一次 `cas-conformance`。
-- **Quickwit 二进制**：仍是格式级验证（解析器 + `INDEX_FORMAT_VERSION = 7` 一致性），没有用真分片跑过字节级往返。
+- **Quickwit 二进制**：~~仍是格式级验证~~ —— 已用官方 0.9.0 容器产出的真分片完成字节级验证（见上表）。
 
 ## 11. 实证结论（截至本次提交）
 

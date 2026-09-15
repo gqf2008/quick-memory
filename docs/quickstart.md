@@ -122,7 +122,18 @@ qm consolidate --session sess-1 --compiler llm       # 失败自动回落规则�
 | `handoff ... is not open` | 别的机器已经认领，或它已完成 |
 | `spooled (...)` | 桶暂时不可达；恢复后跑 `qm hook-drain` |
 
-## 8. 自检探针（需要真桶）
+## 8. 读 Quickwit 产出的分片
+
+如果某个索引器用 Quickwit 而不是 quick-memory 构建分片，本仓库的读方仍能直接检索它：
+
+```bash
+cargo run -p qm-probe --bin split-probe -- --file /path/to/<split-id>.split --query "tantivy"
+```
+
+它会解包容器（u32/u64 两种 footer 都认）、列出内部文件、用 tantivy 查询并打印命中。
+依赖两个编译期特性（`zstd-compression`、`quickwit`/`sstable`），仓库已经启用。
+
+## 9. 自检探针（需要真桶）
 
 ```bash
 cargo run -p qm-probe --bin cas-conformance            # 条件写契约

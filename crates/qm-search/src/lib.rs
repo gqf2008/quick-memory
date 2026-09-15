@@ -255,37 +255,57 @@ pub fn search_stream(
 ) -> Result<Vec<Hit>> {
     let index = Index::open_in_dir(dir).context("opening index")?;
     let s = index.schema();
-    let title = s.get_field("title").expect("title field");
-    let body = s.get_field("body").expect("body field");
-    let entities_field = s.get_field("entities").expect("entities field");
-    let links_field = s.get_field("links").expect("links field");
+
+    // A split carries whatever schema its producer used. Our own splits have
+    // path/page_id/title/body/entities/links; a split another indexer produced
+    // has its own fields. Resolve what exists and fall back to the split's own
+    // indexed text fields rather than refusing to search it at all.
     let selected: Vec<tantivy::schema::Field> = fields
         .iter()
-        .map(|name| match *name {
-            "title" => title,
-            "body" => body,
-            "entities" => entities_field,
-            "links" => links_field,
-            other => panic!("unknown search field {other}"),
-        })
+        .filter_map(|name| s.get_field(name).ok())
         .collect();
+    let search_fields = if selected.is_empty() {
+        let all: Vec<tantivy::schema::Field> = s
+            .fields()
+            .filter(|(_, entry)| entry.is_indexed() && !entry.is_fast())
+            .map(|(field, _)| field)
+            .collect();
+        if all.is_empty() {
+            bail!("split has no indexed fields to search");
+        }
+        all
+    } else {
+        selected
+    };
+
     let reader = index.reader().context("opening reader")?;
     let searcher = reader.searcher();
-    let parser = QueryParser::for_index(&index, selected);
+    let parser = QueryParser::for_index(&index, search_fields);
     let parsed = parser.parse_query(query).context("parsing query")?;
     let top = searcher
         .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
         .context("running query")?;
-    let path_field = s.get_field("path").expect("path field");
-    let page_field = s.get_field("page_id").expect("page_id field");
-    let workspace_field = s.get_field("workspace_id").expect("workspace_id field");
-    let project_field = s.get_field("project_id").expect("project_id field");
+
+    let optional = |name: &str| s.get_field(name).ok();
+    let path_field = optional("path");
+    let page_field = optional("page_id");
+    let workspace_field = optional("workspace_id");
+    let project_field = optional("project_id");
+    let title_field = optional("title");
+    // Foreign splits have no title: use the first stored text field so a hit is
+    // still identifiable to a human.
+    let title_fallback: Option<tantivy::schema::Field> = s
+        .fields()
+        .find(|(_, entry)| entry.is_stored())
+        .map(|(field, _)| field);
+
     let mut hits = Vec::with_capacity(top.len());
     for (score, addr) in top {
         let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
-        let get = |field| {
-            doc.get_first(field)
-                .and_then(|v| v.as_str())
+        let get = |field: Option<tantivy::schema::Field>| {
+            field
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_str())
                 .unwrap_or_default()
                 .to_string()
         };
@@ -294,7 +314,14 @@ pub fn search_stream(
             project_id: get(project_field),
             path: get(path_field),
             page_id: get(page_field),
-            title: get(title),
+            title: {
+                let title = get(title_field);
+                if title.is_empty() {
+                    get(title_fallback)
+                } else {
+                    title
+                }
+            },
             score,
             streams: vec![stream.to_string()],
         });
@@ -460,8 +487,18 @@ pub fn fuse_rrf(lists: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
     for list in lists {
         for (rank, hit) in list.into_iter().enumerate() {
             let weight = 1.0 / (k + rank as f32 + 1.0);
+            // Our splits identify a page by id; a foreign split has none, so
+            // fall back to the path and then the title rather than collapsing
+            // every hit into one bucket.
+            let key = if !hit.page_id.is_empty() {
+                hit.page_id.clone()
+            } else if !hit.path.is_empty() {
+                hit.path.clone()
+            } else {
+                hit.title.clone()
+            };
             scores
-                .entry(hit.page_id.clone())
+                .entry(key)
                 .and_modify(|(existing, score)| {
                     *score += weight;
                     existing.score = existing.score.max(hit.score);

@@ -5,10 +5,16 @@
 //! ```text
 //! [ file bytes concatenated ]
 //! [ FileMetadata: 8-byte header + JSON {files: {name: {start, end}}} ]
-//! [ FileMetadata length: u64 LE ]
+//! [ FileMetadata length ]
 //! [ hotcache ]
-//! [ hotcache length: u64 LE ]
+//! [ hotcache length ]
 //! ```
+//!
+//! The length fields are read as **u32** because that is what Quickwit 0.9.0
+//! actually writes (verified against a split produced by the released binary:
+//! hotcache 3431, metadata 485, magic `0x1812BEAE`). Quickwit's own storage-side
+//! reader uses 8-byte fields, so this parser accepts either width and lets the
+//! versioned header magic decide which one it is looking at.
 //!
 //! The layout is public (`docs/internals/split-format.md` upstream), so a
 //! machine that has no Quickwit cluster can still read a split: parse the
@@ -30,8 +36,10 @@ use serde::Deserialize;
 pub const FILE_METADATA_MAGIC: u32 = 403_881_646;
 /// Supported version of that header.
 pub const FILE_METADATA_VERSION: u32 = 1;
-/// Bytes of each footer length field.
-const FOOTER_LENGTH_BYTES: usize = 8;
+/// Length-field widths this parser accepts, tried in order.
+///
+/// 4 matches the released Quickwit writer; 8 matches its storage-side reader.
+const FOOTER_LENGTH_WIDTHS: [usize; 2] = [4, 8];
 /// Bytes of the versioned component header.
 const COMPONENT_HEADER_BYTES: usize = 8;
 
@@ -103,27 +111,39 @@ pub fn extract_split(bytes: &[u8], dest: &Path) -> Result<ExtractReport> {
 
 /// Parse the footer, returning the metadata and the hotcache length.
 fn parse_footer(bytes: &[u8]) -> Result<(FileMetadata, usize)> {
+    let mut last_error = None;
+    for width in FOOTER_LENGTH_WIDTHS {
+        match parse_footer_with_width(bytes, width) {
+            Ok(parsed) => return Ok(parsed),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("unrecognised split footer")))
+}
+
+/// Parse the footer assuming `width`-byte length fields.
+fn parse_footer_with_width(bytes: &[u8], width: usize) -> Result<(FileMetadata, usize)> {
     let len = bytes.len();
-    if len < 2 * FOOTER_LENGTH_BYTES + COMPONENT_HEADER_BYTES {
+    if len < 2 * width + COMPONENT_HEADER_BYTES {
         bail!("file is too small to be a split ({len} bytes)");
     }
 
     // Every length here comes from an untrusted file, so all arithmetic is
     // checked: a corrupt footer must produce an error, never an overflow.
-    let hotcache_len = read_len(bytes, len - FOOTER_LENGTH_BYTES)?;
+    let hotcache_len = read_len(bytes, len - width, width)?;
     let metadata_len_end = len
-        .checked_sub(FOOTER_LENGTH_BYTES)
+        .checked_sub(width)
         .and_then(|end| end.checked_sub(hotcache_len))
         .with_context(|| format!("hotcache length {hotcache_len} exceeds the file"))?;
-    if metadata_len_end < FOOTER_LENGTH_BYTES + COMPONENT_HEADER_BYTES {
+    if metadata_len_end < width + COMPONENT_HEADER_BYTES {
         bail!("hotcache length {hotcache_len} leaves no room for file metadata");
     }
-    let metadata_len = read_len(bytes, metadata_len_end - FOOTER_LENGTH_BYTES)?;
+    let metadata_len = read_len(bytes, metadata_len_end - width, width)?;
     let metadata_start = metadata_len_end
-        .checked_sub(FOOTER_LENGTH_BYTES)
+        .checked_sub(width)
         .and_then(|end| end.checked_sub(metadata_len))
         .with_context(|| format!("metadata length {metadata_len} exceeds the file"))?;
-    let metadata_bytes = &bytes[metadata_start..metadata_len_end - FOOTER_LENGTH_BYTES];
+    let metadata_bytes = &bytes[metadata_start..metadata_len_end - width];
 
     if metadata_bytes.len() < COMPONENT_HEADER_BYTES {
         bail!("file metadata is truncated");
@@ -131,22 +151,26 @@ fn parse_footer(bytes: &[u8]) -> Result<(FileMetadata, usize)> {
     let magic = u32::from_le_bytes(metadata_bytes[0..4].try_into().expect("4 bytes"));
     let version = u32::from_le_bytes(metadata_bytes[4..8].try_into().expect("4 bytes"));
     if magic != FILE_METADATA_MAGIC {
-        bail!("not a quickwit split: metadata magic {magic} != {FILE_METADATA_MAGIC}");
+        bail!("metadata magic {magic} != {FILE_METADATA_MAGIC} (width {width})");
     }
     if version != FILE_METADATA_VERSION {
         bail!("unsupported split metadata version {version}");
     }
 
     let metadata: FileMetadata = serde_json::from_slice(&metadata_bytes[COMPONENT_HEADER_BYTES..])
-        .context("parsing split file metadata")?;
+        .with_context(|| format!("parsing split file metadata (width {width})"))?;
     Ok((metadata, hotcache_len))
 }
 
-fn read_len(bytes: &[u8], at: usize) -> Result<usize> {
+fn read_len(bytes: &[u8], at: usize, width: usize) -> Result<usize> {
     let slice = bytes
-        .get(at..at + FOOTER_LENGTH_BYTES)
-        .context("footer length field is out of bounds")?;
-    let value = u64::from_le_bytes(slice.try_into().expect("8 bytes"));
+        .get(at..at + width)
+        .with_context(|| format!("{width}-byte footer length field is out of bounds"))?;
+    let value = match width {
+        4 => u64::from(u32::from_le_bytes(slice.try_into().expect("4 bytes"))),
+        8 => u64::from_le_bytes(slice.try_into().expect("8 bytes")),
+        other => bail!("unsupported footer length width {other}"),
+    };
     usize::try_from(value).context("footer length does not fit in usize")
 }
 
@@ -195,13 +219,59 @@ mod tests {
         metadata.extend_from_slice(&FILE_METADATA_VERSION.to_le_bytes());
         metadata.extend_from_slice(offsets.as_bytes());
 
+        bundle_with_width(files, 4)
+    }
+
+    /// Build a container with a chosen length-field width. 4 is what the
+    /// released Quickwit writes; 8 is what its storage-side reader assumes.
+    fn bundle_with_width(files: &[(&str, Vec<u8>)], width: usize) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut offsets = String::from("{\"files\":{");
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            let start = body.len();
+            body.extend_from_slice(bytes);
+            if index > 0 {
+                offsets.push(',');
+            }
+            offsets.push_str(&format!(
+                "\"{name}\":{{\"start\":{start},\"end\":{}}}",
+                body.len()
+            ));
+        }
+        offsets.push_str("}}");
+
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&FILE_METADATA_MAGIC.to_le_bytes());
+        metadata.extend_from_slice(&FILE_METADATA_VERSION.to_le_bytes());
+        metadata.extend_from_slice(offsets.as_bytes());
+
         let mut out = body;
         out.extend_from_slice(&metadata);
-        out.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        match width {
+            4 => out.extend_from_slice(&(metadata.len() as u32).to_le_bytes()),
+            8 => out.extend_from_slice(&(metadata.len() as u64).to_le_bytes()),
+            other => panic!("unsupported width {other}"),
+        }
         let hotcache = b"hotcache-bytes".to_vec();
         out.extend_from_slice(&hotcache);
-        out.extend_from_slice(&(hotcache.len() as u64).to_le_bytes());
+        match width {
+            4 => out.extend_from_slice(&(hotcache.len() as u32).to_le_bytes()),
+            8 => out.extend_from_slice(&(hotcache.len() as u64).to_le_bytes()),
+            other => panic!("unsupported width {other}"),
+        }
         out
+    }
+
+    #[test]
+    fn both_footer_widths_are_accepted() {
+        let files: [(&str, Vec<u8>); 1] = [("meta.json", b"{\"segments\":[]}".to_vec())];
+        for width in [4usize, 8] {
+            let split = bundle_with_width(&files, width);
+            let dest = tempfile::TempDir::new().unwrap();
+            let report = extract_split(&split, dest.path())
+                .unwrap_or_else(|error| panic!("width {width}: {error}"));
+            assert_eq!(report.files, vec!["meta.json"]);
+        }
     }
 
     #[test]
