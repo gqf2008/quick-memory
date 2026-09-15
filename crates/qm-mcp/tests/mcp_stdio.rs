@@ -226,6 +226,29 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "recent output should carry its own fields: {recent_text}"
     );
 
+    // `limit` is documented as a per-section cap, so it must bound *every*
+    // section. A zero cap is the sharpest probe: under a cap that only reached
+    // `pages`, the session head and handoff sections would still come back
+    // full, and this call would not be empty.
+    let bounded = client.call_tool(29, "memory_digest", serde_json::json!({"limit": 0}));
+    let bounded_json: serde_json::Value = serde_json::from_str(&tool_text(&bounded)).unwrap();
+    assert!(
+        bounded_json["pages"].as_array().is_some_and(Vec::is_empty),
+        "limit 0 must cap the pages section: {bounded_json}"
+    );
+    assert!(
+        bounded_json["sessions"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "limit 0 must cap the sessions section, not only pages: {bounded_json}"
+    );
+    assert!(
+        bounded_json["handoffs"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "limit 0 must cap the handoffs section, not only pages: {bounded_json}"
+    );
+
     // `memory_digest` is the "what did I miss?" open. It must carry all three
     // sections, and it must see the activity this round trip just produced:
     // a page commit and a session head.

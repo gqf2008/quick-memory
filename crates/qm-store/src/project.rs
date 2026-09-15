@@ -637,8 +637,11 @@ impl ProjectStore {
     /// removed" is exactly the kind of thing a new session needs to know, and
     /// dropping it would make a digest launder a deletion into silence.
     ///
-    /// Each part is sorted by its own clock, newest first, and any part may be
-    /// empty — an empty window is an answer, never an error.
+    /// `limit` caps **each** of the three sections independently, after
+    /// ordering and before returning: a digest is a summary, so it must not be
+    /// able to grow one unbounded section while the others stay bounded. Each
+    /// part is sorted by its own clock, newest first, and any part may be empty
+    /// — an empty window is an answer, never an error.
     ///
     /// # Errors
     /// Propagates backend and decode failures.
@@ -688,6 +691,7 @@ impl ProjectStore {
                 .cmp(&a.last_seen_ms)
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
+        sessions.truncate(limit);
 
         let mut handoffs: Vec<Handoff> = self
             .list_handoffs(workspace_id, project_id)
@@ -700,6 +704,7 @@ impl ProjectStore {
                 .cmp(&handoff_activity_ms(a))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        handoffs.truncate(limit);
 
         Ok(Digest {
             pages,
@@ -3515,5 +3520,83 @@ mod tests {
         let capped = store.digest(&ws(), &proj(), 0, 1).await.unwrap();
         assert_eq!(capped.pages.len(), 1);
         assert_eq!(capped.pages[0].path.as_str(), "notes/late-clock.md");
+    }
+
+    /// `limit` is "per section", and the user-visible wording says so. A digest
+    /// whose sessions or handoffs grow without bound while only pages are
+    /// capped is not a summary — so every one of the three is capped, and the
+    /// cap keeps the newest end of each.
+    #[tokio::test]
+    async fn digest_caps_every_section_not_just_pages() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let writer = WriterId::new("mbp-1").unwrap();
+
+        // More of everything than the cap will allow.
+        for index in 0..3 {
+            store
+                .commit_page(request(
+                    "mbp-1",
+                    &format!("notes/p{index}.md"),
+                    "body",
+                    1_000 + index,
+                ))
+                .await
+                .unwrap();
+            store
+                .ingest_observations(ingest(&format!("sess-{index}"), &["x"], 2_000 + index))
+                .await
+                .unwrap();
+            store
+                .open_handoff(
+                    &ws(),
+                    &proj(),
+                    &format!("batons/{index}"),
+                    "carry on",
+                    &writer,
+                    3_000 + index,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Unbounded: three of each, so the capped run below is not vacuous.
+        let full = store.digest(&ws(), &proj(), 0, usize::MAX).await.unwrap();
+        assert_eq!(
+            (full.pages.len(), full.sessions.len(), full.handoffs.len()),
+            (3, 3, 3)
+        );
+
+        let capped = store.digest(&ws(), &proj(), 0, 1).await.unwrap();
+        assert_eq!(
+            (
+                capped.pages.len(),
+                capped.sessions.len(),
+                capped.handoffs.len()
+            ),
+            (1, 1, 1),
+            "every section must honour `limit`, not just pages"
+        );
+
+        // And each surviving entry is the newest of its section.
+        assert_eq!(capped.pages[0].path.as_str(), "notes/p2.md");
+        assert_eq!(capped.sessions[0].session_id.as_str(), "sess-2");
+        assert_eq!(capped.handoffs[0].title, "batons/2");
+
+        // A cap of two keeps the two newest of each section, in order.
+        let two = store.digest(&ws(), &proj(), 0, 2).await.unwrap();
+        assert_eq!(two.pages.len(), 2);
+        assert_eq!(two.sessions.len(), 2);
+        assert_eq!(two.handoffs.len(), 2);
+        assert_eq!(two.pages[1].path.as_str(), "notes/p1.md");
+        assert_eq!(two.sessions[1].session_id.as_str(), "sess-1");
+        assert_eq!(two.handoffs[1].title, "batons/1");
+
+        // The cap is a cap, not a floor: a section that is smaller than the
+        // limit is returned whole. `since_ms` 2_500 leaves only the handoffs.
+        let tail = store.digest(&ws(), &proj(), 2_500, 2).await.unwrap();
+        assert_eq!(tail.pages.len(), 0, "no page commit is in this window");
+        assert_eq!(tail.sessions.len(), 0, "no session head is in this window");
+        assert_eq!(tail.handoffs.len(), 2);
     }
 }
