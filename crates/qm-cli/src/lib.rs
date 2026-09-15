@@ -3892,6 +3892,13 @@ mod tests {
     /// the same constant; what covers the production entry point is
     /// `tests/cli_entry_conformance.rs`, which runs the real binary, together
     /// with the one-line delegation in `build_bucket_from_env`.
+    ///
+    /// The blind spot is symmetric: inlining the shared constant into a
+    /// separately spelled-out table on each side leaves *both* this test and
+    /// `tests/cli_entry_conformance.rs` green, because the two sides still
+    /// resolve the same names. What drifts then is only "the two paths share
+    /// one constant" — a watermark-adjacent property of the code, not of the
+    /// bucket, and one nothing here can see.
     #[test]
     fn bucket_identity_and_client_share_the_same_environment_names() {
         assert_eq!(S3_ENDPOINT_ENV_NAMES, &["QM_S3_ENDPOINT", "R2_ENDPOINT"]);

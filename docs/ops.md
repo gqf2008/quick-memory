@@ -164,12 +164,25 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 - 一次 `qm digest` 的**三段都读整份对象**，读的对象数各自随对象数**线性**增长，并发上限统一是
   **16**，所以每段延迟约 `⌈N/16⌉ × RTT`，而不是 `N × RTT`：
   - **pages**：整条 commit log（N 条提交 = N 次对象读）。`qm log` / `qm history` /
-    `qm read-page --as-of`（`memory_log` / `memory_read_page`）走的是同一段；
+    `qm read-page --as-of`（`memory_log` / `memory_history` / `memory_read_page`）走的是同一段；
   - **sessions**：每个会话一个 head（N 个会话 = N 次对象读）；
   - **handoffs**：每个交接棒一个对象（N 个交接棒 = N 次对象读）。`qm handoff list`
     （`memory_handoff_list`）走的是同一段，而且没有窗口，列多少就读多少。
-  这是**有界并发**，不是 O(1)：`--limit` 只封顶返回几条，不封顶读几条，窗口里没有变化时
-  也要付这个代价。代价换来的是「刚启动的机器和有缓存的机器看到同一个答案」。
+  这是**有界并发**，不是 O(1)：`--limit` 只封顶**返回**几条，不封顶**读取**几条，窗口里没有
+  变化时也要付这个代价。封顶的到底是哪一头，逐命令看：
+
+  - `qm digest --limit k`（`memory_digest`）：先把窗口里的对象读完，再**每段**截断到 k
+    （`read_commit_log(..., usize::MAX)` 之后 `truncate`）；
+  - `qm log --limit k`（`memory_log`）：`k` 直接交给 `read_commit_log`，而它的契约是
+    **列全 prefix、读完全部对象、最后才 `truncate(k)`**（见该函数自己的文档注释）。所以
+    listing 与对象读都是全量，封顶的只有返回条数——**`k` 小不代表读得少**，这是最容易读错的
+    一条；
+  - `qm history`（`memory_history`）与 `qm read-page --as-of`（`memory_read_page`）**没有**
+    `--limit`：读的就是整条 commit log；
+  - `qm recent --limit k`（`memory_recent`）：只读一份 manifest 再截断到 k，读代价随 manifest
+    大小走，与 k 无关。
+
+  代价换来的是「刚启动的机器和有缓存的机器看到同一个答案」。
 - 这三批读**任一失败就整次失败**，不会返回部分结果；报出的是**listing 序里最小的那个 key** 的失败，
   而不是先失败的那条，所以同一个桶坏掉几条对象时，每次报错都说同一个 key。
   唯独**会话被删**是容忍的：head 在 listing 之后被删除是快照读的正常竞争，digest 跳过它而不是
@@ -199,6 +212,12 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 
 边际成本随 `seq` 位数每涨一个数量级只加 1 B（242 → 243 → 244），所以**这是这个形状的数字，
 不是通用常数**：title 每多一字节就多一字节，`supersedes` 从 `null` 变成 64 位 hex 是 +62 B/path。
+
+改写行的 **305** 是**同一个形状**在 9 000 → 10 000 之间的边际（和上面几行一样是跨尺度的边际），
+复跑命令会把它打印在 `marginal_b_per_path` 那一列，并由
+`manifest_size_is_linear_in_paths` 用字面量断言钉住。它与"同样的 path 数下和新鲜行的差"**不是**
+同一个数——后者是 `supersedes` 的单价（62 B/path，由 `manifest_bytes_are_accounted_for_field_by_field`
+钉住）；一张表里只有一个列名，这两者混起来会让数字不可复跑。
 
 单条构成（`manifest_bytes_are_accounted_for_field_by_field` 逐字段实测；entry JSON 各字段相加
 **恰好**等于实测的 205 B，多于或少于都会让该测试红）：
@@ -237,9 +256,12 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 拒绝发生在**写出任何对象之前**，所以被拒的提交是干净的空操作：不留孤立 page 对象，也不留 WAL
 记录（`a_manifest_at_the_ceiling_commits_and_one_path_past_it_is_refused` 用桶内对象列表钉住这一点）。
 
-**删除路径不受这条上限约束**：删除是当前唯一能缩减 manifest 的操作，卡住它会让一个已经超限的
-scope 再也修不回来。代价是超限的 scope 仍可能被写入略大的对象（tombstone 可能比它替换掉的
-entry 大几个字节），这是刻意选的（守卫见 `encode_manifest`，豁免见 `encode_manifest_for_delete`）。
+**删除路径不受这条上限约束**：删除是唯一**可能**缩减 manifest 的操作——删掉一个已经写过的 path
+会去掉它的 entry——卡住它会让一个已经超限的 scope 再也修不回来。但"可能"不是"一定"：删一个
+**从未写入过**的 path 只会**新增**一条 tombstone，manifest 反而变大。而这条路径没有守卫，
+所以这种增长是**无声的**：每条 delete 最多加一条 tombstone，但没有任何东西限制能加多少条。
+这是刻意选的代价——守卫见 `encode_manifest`，豁免见 `encode_manifest_for_delete`，下一个走守卫的
+提交才会把它拒掉。
 
 ### 离上限还有多远
 
@@ -269,8 +291,8 @@ entry 大几个字节），这是刻意选的（守卫见 `encode_manifest`，�
   `handoffs`）本身就是信息。`--limit` 是**每段**的封顶，`--limit 0` 会把三段一起清空；
   此时若打 `no recent activity`，就把"你要了零条"谎报成"窗口里什么都没有"。
   所以它打的是截断说明，而不是空窗口说明。
-- `--limit` 一致地**只封顶输出、不封顶读取**：窗口由 `--since-ms` / `--hours` 决定，
-  `--limit 0` 不会让命令跳过该读的对象（读代价见上一节）。
+- `--limit 0` 不会让命令少读一个对象：`digest` 与 `log` 都是**先读完再截断**，
+  窗口由 `--since-ms` / `--hours` 决定（逐命令的封顶口径见上一节「成本与容量」）。
 - **JSON 面不受影响**：`qm recent --json` / `qm digest --json` 以及 MCP 的
   `memory_recent` / `memory_digest` 都原样返回空数组/空窗口，形状不变——
   上面这两句人类可读文案只在非 JSON 输出里出现。
