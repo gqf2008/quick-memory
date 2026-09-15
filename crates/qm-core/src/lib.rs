@@ -187,7 +187,9 @@ impl KeyLayout {
         }
     }
 
-    fn scope_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+    /// Key prefix of one project scope.
+    #[must_use]
+    pub fn scope_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
         format!("{}/ws/{}/proj/{}", self.root, ws, proj)
     }
 

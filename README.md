@@ -39,6 +39,7 @@ cargo run -p qm-cli --bin qm -- capture --session sess-1 --text "ran the suite"
 cargo run -p qm-cli --bin qm -- consolidate --session sess-1
 cargo run -p qm-cli --bin qm -- publish
 cargo run -p qm-cli --bin qm -- search "suite" --json
+cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
 ```
 
 作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，

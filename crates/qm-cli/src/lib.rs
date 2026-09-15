@@ -89,6 +89,15 @@ pub enum Command {
     Compact,
     /// Show what the project currently contains.
     Status,
+    /// Reclaim unreachable objects (dry run unless `--apply`).
+    Gc {
+        /// Actually delete instead of reporting.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Leave anything modified more recently than this (default: one hour).
+        #[arg(long, default_value_t = 3_600_000)]
+        grace_ms: i64,
+    },
     /// Commit a page.
     WritePage {
         /// Path inside the project.
@@ -511,6 +520,36 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             })
         }
+        Command::Gc { apply, grace_ms } => {
+            let outcome = ctx
+                .project
+                .gc_orphans(
+                    &ctx.workspace,
+                    &ctx.project_id,
+                    ctx.now_ms,
+                    *grace_ms,
+                    *apply,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::to_string(&outcome)?
+            } else {
+                format!(
+                    "{}: scanned {}, live {}, collectable {}, kept within grace {}, deleted {}",
+                    if outcome.dry_run {
+                        "dry run"
+                    } else {
+                        "applied"
+                    },
+                    outcome.scanned,
+                    outcome.live,
+                    outcome.collectable,
+                    outcome.kept_recent,
+                    outcome.deleted
+                )
+            })
+        }
         Command::WritePage { path, title, body } => {
             let page_path = ctx.page(path)?;
             let body = match body {
@@ -749,6 +788,47 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("\"sessions\":1"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn gc_defaults_to_a_dry_run_and_never_touches_live_objects() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/raft.md",
+                "--body",
+                "leader election",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+
+        let out = execute(
+            &cli(&["gc", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("\"dry_run\":true"), "{out}");
+        assert!(out.contains("\"deleted\":0"), "{out}");
+
+        // Applying it still keeps the live page readable.
+        execute(
+            &cli(&["gc", "--apply", "--grace-ms", "0"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 5_000;
+        let page = execute(&cli(&["read-page", "--path", "notes/raft.md"]), ctx)
+            .await
+            .unwrap();
+        assert_eq!(page, "leader election");
     }
 
     #[test]

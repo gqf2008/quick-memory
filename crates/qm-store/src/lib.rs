@@ -129,8 +129,10 @@ impl From<OsError> for StoreError {
     }
 }
 
+mod gc;
 mod project;
 
+pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
     LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome, ReplaceCatalogOutcome,
@@ -219,6 +221,22 @@ impl CasStore {
         let path = self.path(key)?;
         let meta = self.store.head(&path).await?;
         ObjectVersion::from_meta(&meta)
+    }
+
+    /// Last-modified time of an object in milliseconds since the epoch.
+    ///
+    /// `None` means the object is gone, which every caller here treats as
+    /// "nothing to do" rather than an error.
+    ///
+    /// # Errors
+    /// Propagates backend failures other than a missing object.
+    pub async fn last_modified_ms(&self, key: &str) -> Result<Option<i64>, StoreError> {
+        let path = self.path(key)?;
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(Some(meta.last_modified.timestamp_millis())),
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
     }
 
     /// Create an object that must not already exist (`If-None-Match: *`).

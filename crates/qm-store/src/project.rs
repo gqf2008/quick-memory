@@ -262,6 +262,12 @@ impl ProjectStore {
         &self.layout
     }
 
+    /// The CAS layer, for reachability walks and maintenance.
+    #[must_use]
+    pub(crate) fn cas(&self) -> &CasStore {
+        &self.cas
+    }
+
     /// Load the manifest, treating "absent" as an empty scope.
     ///
     /// # Errors
