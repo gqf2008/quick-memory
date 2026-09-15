@@ -129,6 +129,29 @@ pub enum StoreError {
         /// Current claimer.
         owner: String,
     },
+    /// A scope's manifest outgrew the single-object commit point.
+    ///
+    /// The commit was refused before anything was written: shipping it anyway
+    /// would either fail inside the bucket at a size nobody can predict from
+    /// here, or (if a future change truncated it) drop paths from the commit
+    /// point without saying so.
+    #[error(
+        "refusing to commit: manifest for {workspace_id}/{project_id} holds {paths} paths \
+         and encodes to {bytes} bytes, over the {limit}-byte limit of the single-object \
+         commit point"
+    )]
+    ManifestTooLarge {
+        /// Workspace whose manifest was refused.
+        workspace_id: String,
+        /// Project whose manifest was refused.
+        project_id: String,
+        /// Paths the refused manifest carries: current versions plus tombstones.
+        paths: usize,
+        /// Bytes the refused manifest encoded to.
+        bytes: usize,
+        /// The limit those bytes exceeded.
+        limit: usize,
+    },
     /// Any other backend failure.
     #[error("object store error: {0}")]
     Backend(String),
@@ -162,8 +185,9 @@ pub use digest::{Digest, SessionSummary, handoff_activity_ms};
 pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
-    LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, ProposalRequest, PublishOutcome,
-    ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
+    LeaseGuard, LoadedCatalog, LoadedManifest, MANIFEST_MAX_BYTES, ProjectStore, ProposalRequest,
+    PublishOutcome, ReplaceCatalogOutcome, RetentionPlan, RetryPolicy, SessionRewriteOutcome,
+    plan_retention,
 };
 pub use verify::{Problem, VerifyReport};
 

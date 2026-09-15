@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use qm_core::{
@@ -41,6 +42,21 @@ const MAX_HISTORY_DEPTH: usize = 100_000;
 /// others while staying small next to what the records cost (a few hundred
 /// bytes each).
 const COMMIT_LOG_READ_CONCURRENCY: usize = 16;
+
+/// Largest manifest body the single-object commit point will ship.
+///
+/// `manifest.json` holds every path in the scope's current state, so it grows
+/// with the project and *every* commit rewrites the whole thing: at this size a
+/// single page write already re-uploads this many bytes. The ceiling is
+/// deliberately far below what a bucket will take (R2 and S3 accept objects in
+/// the GiB range) because the binding cost is the commit path, not the backend:
+/// past this point the manifest has to be sharded, which is a protocol change
+/// (see the design note in `docs/design.md`).
+///
+/// How many paths this buys is *measured*, not assumed — see
+/// `manifest_size_is_linear_in_paths`, which pins the documented range and
+/// fails if a `PageEntry` grows enough to move it.
+pub const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 
 /// How hard to fight for the commit point before giving up.
 #[derive(Debug, Clone)]
@@ -325,6 +341,40 @@ pub struct ProjectStore {
     retry: RetryPolicy,
 }
 
+/// Encode a manifest for the single-object commit point.
+///
+/// Refuses a manifest that outgrew [`MANIFEST_MAX_BYTES`] instead of shipping
+/// it. Callers run this *before* writing anything, so a refused commit is a
+/// no-op rather than a trail of orphaned page objects.
+fn encode_manifest(
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    manifest: &Manifest,
+) -> Result<Bytes, StoreError> {
+    let bytes = encode(manifest)?;
+    if bytes.len() > MANIFEST_MAX_BYTES {
+        return Err(StoreError::ManifestTooLarge {
+            workspace_id: workspace_id.to_string(),
+            project_id: project_id.to_string(),
+            paths: manifest.pages.len() + manifest.tombstones.len(),
+            bytes: bytes.len(),
+            limit: MANIFEST_MAX_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Encode a manifest on the delete path, where [`MANIFEST_MAX_BYTES`] does not
+/// apply.
+///
+/// Deletion is the only shipped operation that can shrink a manifest, so
+/// refusing it would leave a scope that is already over the limit with no way
+/// back under it. The exemption costs a bounded overshoot (a tombstone can be
+/// a few bytes larger than the entry it replaces) and buys an escape hatch.
+fn encode_manifest_for_delete(manifest: &Manifest) -> Result<Bytes, StoreError> {
+    encode(manifest)
+}
+
 /// Ordering for [`ProjectStore::recent_pages`]: newest commit first, path
 /// ascending to break ties.
 ///
@@ -482,8 +532,6 @@ impl ProjectStore {
                 &request.path,
                 &page_id,
             );
-            let page_object_created = self.create_or_verify(&page_key, &page).await?;
-
             let entry = WalEntry {
                 schema: MANIFEST_SCHEMA,
                 writer_id: request.writer_id.clone(),
@@ -491,10 +539,6 @@ impl ProjectStore {
                 path: request.path.clone(),
                 supersedes: supersedes.clone(),
             };
-            let wal_key =
-                self.layout
-                    .wal_entry(&request.workspace_id, &request.project_id, entry.event_id());
-            self.create_or_verify(&wal_key, &entry).await?;
 
             let mut manifest = loaded.manifest;
             manifest.record(
@@ -508,7 +552,17 @@ impl ProjectStore {
                     supersedes: supersedes.clone(),
                 },
             );
-            let bytes = encode(&manifest)?;
+            // Sized before anything is written: a manifest that outgrew the
+            // commit point is refused here, so the refusal leaves no page
+            // object and no WAL entry behind.
+            let bytes = encode_manifest(&request.workspace_id, &request.project_id, &manifest)?;
+
+            let page_object_created = self.create_or_verify(&page_key, &page).await?;
+            let wal_key =
+                self.layout
+                    .wal_entry(&request.workspace_id, &request.project_id, entry.event_id());
+            self.create_or_verify(&wal_key, &entry).await?;
+
             let committed = match loaded.version {
                 Some(version) => self.cas.update(&manifest_key, bytes, &version).await,
                 None => self.cas.create(&manifest_key, bytes).await,
@@ -1409,7 +1463,7 @@ impl ProjectStore {
                     last_page_id: removed.clone(),
                 },
             );
-            let bytes = encode(&manifest)?;
+            let bytes = encode_manifest_for_delete(&manifest)?;
             let committed = match loaded.version {
                 Some(version) => self.cas.update(&manifest_key, bytes, &version).await,
                 None => self.cas.create(&manifest_key, bytes).await,
@@ -2039,6 +2093,7 @@ mod tests {
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
         PutOptions, PutPayload, PutResult,
     };
+    use qm_core::PageId;
 
     use super::*;
 
