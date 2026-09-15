@@ -6862,6 +6862,14 @@ mod tests {
         // finds, and the rollback wrote a *newer* body, so the second archive is
         // a different object at a different key. The first archive is no longer
         // referenced by anything once the scope is whole again.
+        //
+        // Read this assertion as a statement about *this* scene, not about round
+        // trips in general: the scope is written to between the migration and
+        // the rollback, and that write is what makes the second archive a
+        // different body. A round trip with no write in between archives bytes
+        // identical to the first one, so it reuses the same key and the bucket
+        // still holds a single archive — delete the commit above and this line
+        // would have to become `assert_eq!`, not disappear.
         assert_ne!(
             again.archive.as_deref(),
             migration.archive.as_deref(),
