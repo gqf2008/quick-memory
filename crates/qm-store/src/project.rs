@@ -388,10 +388,19 @@ impl ProjectStore {
     /// A tombstoned path is absent from `manifest.pages` by construction, so
     /// deleted pages need no extra filter here.
     ///
+    /// Each returned path is the canonical spelling the store keys pages by,
+    /// which is not always the spelling the key was committed from: `PagePath`
+    /// trims, then strips one leading `/`, and that pair is not idempotent
+    /// (`"/ x"` normalises to `" x"`, which normalises again to `"x"`). A key
+    /// stored under such a spelling therefore lists under its re-normalised
+    /// form. Corrupting the listing instead would make one odd path unlistable
+    /// for the whole project, and making the normaliser idempotent would change
+    /// `PagePath::new`'s public semantics — so this stays as it is, on purpose.
+    ///
     /// # Errors
-    /// [`StoreError::Corrupt`] when a committed path is no longer a valid, or
-    /// no longer a canonical, page path — a manifest that cannot be listed is a
-    /// manifest to repair, not to render partially.
+    /// [`StoreError::Corrupt`] when a committed path is no longer a valid page
+    /// path — a manifest that cannot be listed is a manifest to repair, not to
+    /// render partially.
     pub async fn recent_pages(
         &self,
         workspace_id: &WorkspaceId,
@@ -404,16 +413,6 @@ impl ProjectStore {
             let path = PagePath::new(&raw).map_err(|error| {
                 StoreError::Corrupt(format!("manifest page path {raw:?}: {error}"))
             })?;
-            // `PagePath::new` trims and strips a leading `/`, so a hand-edited
-            // key can name a path that reads *canonically* — and would then
-            // never be found by `read_page`, which looks keys up by `as_str()`.
-            // Listing a page nobody can open is worse than refusing to list.
-            if path.as_str() != raw {
-                return Err(StoreError::Corrupt(format!(
-                    "manifest page path {raw:?} is not canonical ({})",
-                    path.as_str()
-                )));
-            }
             pages.push((path, entry));
         }
         pages.sort_by(recency_order);
@@ -2050,39 +2049,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_pages_refuses_a_key_the_read_path_could_never_find() {
+    async fn recent_pages_list_a_page_committed_under_an_odd_spelling() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = machine(&bucket);
 
-        // A manifest whose key is not the canonical spelling of its own path.
-        // Nothing in this crate can commit such a key; a hand edit can. It has
-        // to be refused rather than normalised: `read_page` looks paths up by
-        // their canonical form, so a normalised listing would advertise a page
-        // that no reader can open.
-        let mut manifest = Manifest::empty(ws(), proj());
-        manifest.pages.insert(
-            "/notes/a.md".to_string(),
-            PageEntry {
-                page_id: qm_core::PageId::new("page-1").unwrap(),
-                seq: 1,
-                created_at_ms: 1_000,
-                writer_id: WriterId::new("mbp-a").unwrap(),
-                title: "A".to_string(),
-                supersedes: None,
-            },
-        );
-        let key = store.layout().manifest(&ws(), &proj());
+        // `PagePath::new` trims and then strips a leading `/`, and that pair is
+        // not idempotent: this spelling commits under the key `" notes/odd.md"`.
+        // The listing must still work — one odd path may not make a whole
+        // project unlistable — and it reports the re-normalised spelling.
+        let odd = PagePath::new("/ notes/odd.md").unwrap();
+        assert_eq!(odd.as_str(), " notes/odd.md");
         store
-            .cas()
-            .create(&key, encode(&manifest).unwrap())
+            .commit_page(CommitPageRequest {
+                path: odd,
+                ..request("mbp-a", "notes/filler.md", "body", 1_000)
+            })
             .await
-            .expect("seed a hand-edited manifest");
+            .expect("commit");
 
-        let error = store.recent_pages(&ws(), &proj(), 10).await.unwrap_err();
-        assert!(
-            matches!(error, StoreError::Corrupt(_)),
-            "expected Corrupt, got {error}"
-        );
+        let listed = store.recent_pages(&ws(), &proj(), 10).await.unwrap();
+        assert_eq!(listed.len(), 1, "an odd key must not break the listing");
+        assert_eq!(listed[0].0.as_str(), "notes/odd.md");
     }
 
     #[tokio::test]
