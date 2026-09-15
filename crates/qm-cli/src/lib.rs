@@ -1631,7 +1631,11 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                             "{}\t{}\t{}",
                             entry.created_at_ms,
                             path.as_str(),
-                            entry.title
+                            // One page per line is the whole contract of this
+                            // output; a title carrying a newline would break
+                            // it, and titles are not validated. Search flattens
+                            // titles the same way.
+                            entry.title.replace('\n', " ")
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2140,6 +2144,7 @@ mod tests {
             text,
             "2000\tnotes/second.md\tSecond\n1000\tnotes/first.md\tFirst"
         );
+        assert_eq!(text.lines().count(), 2, "one page per line");
 
         // `--limit` narrows it; a two-page corpus cannot tell the flag apart
         // from the default, so ask for exactly one and assert the default
@@ -2157,6 +2162,31 @@ mod tests {
                 limit: RECENT_DEFAULT_LIMIT
             }
         ));
+
+        // One page per line is the contract, and titles are not validated, so a
+        // title with a newline in it must not be able to break it.
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/multiline.md",
+                "--title",
+                "two\nlines",
+                "--body",
+                "body",
+            ]),
+            Context {
+                now_ms: 3_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        let tricky = execute(&cli(&["recent"]), context(Arc::clone(&bucket), &cache))
+            .await
+            .unwrap();
+        assert_eq!(tricky.lines().count(), 3, "one page per line: {tricky}");
+        assert!(tricky.contains("two lines"), "{tricky}");
 
         // Asking for nothing prints nothing; it must not claim the project is
         // empty.
