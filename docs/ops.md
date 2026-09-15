@@ -164,14 +164,16 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 
 ## 验证状态
 
-代码已在**真实 S3 实现**（本地 MinIO）上验证过完整链路：条件写契约、多机并发提交（含真实 CAS 冲突重试）、
-多机检索与过期过滤、采集→编译→检索、跨机器读写与 handoff、export/import、`verify --strict`。
-细节与原始数字见 `design.md` §10.5。
+代码已在**真实 S3-compatible MinIO HTTP 后端**上做 current-head 复验（2026-09-16，`main @ c9006a0`）：
+`cas-conformance` 7/7、`manifest-probe --machines 3 --writes 5`、`search-probe project`、
+`session-probe`、跨进程 `digest-probe seed/read`、向量 publish/query 协议闭环、`qm maintain` 两次幂等运行，
+以及 `qm verify --strict`。细节与原始数字见 `design.md` §10.5。向量行的 embedding 是本地 deterministic
+HTTP stub，不是真 provider；MinIO 也不是 R2，不能把这组结果扩展成 R2 验证。
 
-Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `design.md` §6.4/§10.5），这不是真 R2 证据。
-仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**向量检索链在真 R2 上的行为**，
-以及**在真 R2 上跑一遍跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project` 必填，两者必须传同一组唯一值）。
-有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这组后端差异；
+Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `design.md` §6.4），这不是真 R2 证据。
+仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**ACL/签名/区域/一致性/配额/延迟/错误 XML 变体**，
+以及**在真 R2 上跑一遍向量闭环与跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project`
+必填，两者必须传同一组唯一值）。有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这组后端差异；
 向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点，digest 另有 `digest-probe` 的跨进程闭环。
 
 没有凭据时能走多远：`qm-probe` 里有一个进程内的最小 S3 stub（`s3-stub` 二进制 / `qm_probe::s3_stub`），
@@ -196,7 +198,8 @@ manifest 仍认账的 live pages，所以「manifest 已不再返回那条 path�
 防复用的 best-effort 检查，不是并发锁。`read` 只读。当前 probe 不自动清理，
 所以真桶应使用专用 bucket/prefix，并为每次运行显式传唯一 scope。`QM_S3_PREFIX` 只被
 `cas-conformance` 与 `search-probe build/query` 采用，不是所有 probe 的全局隔离。
-它与其他 stub 证据一样，**只在协议层验证过，真 R2 仍未验证**。
+这些 stub 路径本身仍只证明协议层；其中 digest 的同一命令形状也已在 MinIO current-head 跑过（§10.5），
+但**真 R2 仍未验证**。
 
 ## 完整性自检
 
@@ -516,7 +519,7 @@ archive。差的这一点是有意的：从 archive 恢复会静默丢掉迁移�
   **已有压测点，但边界仍窄**：上述 8 写者 × 50 轮持续竞争已量到 400 次成功提交、1 581 次提交点写入、
   1 180 次 CAS 拒绝和迁移 5 次尝试；它仍只跑在 `InMemory` + 单线程确定性调度上，真桶多核 RTT、
   不同写者数、多 scope 与持续 supersession 未覆盖。
-- 真 S3/R2 上未验证：这套断言全部跑在 `InMemory` 上。
+- 该持续竞争压测没有在真桶上验证：这套断言全部跑在 `InMemory` 上；MinIO current-head 复验未覆盖它。
 
 详见 `design.md` §6.21。
 
