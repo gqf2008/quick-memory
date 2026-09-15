@@ -152,7 +152,7 @@ export QM_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
 export QM_S3_BUCKET="<bucket>"
 export QM_S3_ACCESS_KEY_ID="..."
 export QM_S3_SECRET_ACCESS_KEY="..."
-export QM_S3_PREFIX="qm-probe"          # 可选，探针对象都放在这个前缀下
+export QM_S3_PREFIX="qm-probe"          # 仅部分探针采用；不是全局隔离
 export QM_S3_FORCE_PATH_STYLE=true      # R2 需要 path-style
 
 # 1) 条件写一致性：create-if-absent / 陈旧 ETag 必须被拒
@@ -175,6 +175,10 @@ cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 query
 
 `--local <dir>` 只用于冒烟测试探针本身，**预期会失败**：本机文件系统不支持条件写，
 探针会在预检阶段拒绝它。
+
+`QM_S3_PREFIX` 目前只被 `cas-conformance` 的对象 key 与 `search-probe build/query` 的分片前缀采用；
+其它探针路径不能把它当全局隔离。真桶验收仍应使用专用 bucket 或专用 prefix，并显式传入唯一 scope；
+`digest-probe` 不自动清理，`seed` 在写入前发现目标 scope 非空就会拒绝。
 
 `docs.jsonl` 每行一个 `PageDoc`：
 

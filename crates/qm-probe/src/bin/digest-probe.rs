@@ -15,21 +15,25 @@
 //! manifest but still in the digest" into a checkable claim instead of a
 //! slogan. Neither process reaches an index, a cache, or the other's memory.
 
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use object_store::ObjectStore;
 use qm_core::{
     MANIFEST_SCHEMA, Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId,
     derive_observation_id,
 };
 use qm_probe::{S3Config, init_tracing};
-use qm_store::{CommitPageRequest, IngestObservationsRequest, ProjectStore};
+use qm_store::{CasStore, CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
-/// The fixed scope both processes agree on.
+/// Compatibility defaults for callers that still omit the scope flags.
 ///
-/// Every stub carries its own fresh bucket, so a constant scope stays
-/// hermetic while still letting process B start from nothing but the bucket.
-const WORKSPACE: &str = "probe-digest-ws";
-const PROJECT: &str = "probe-digest-proj";
+/// Every stub carries its own fresh bucket, so these constants stay hermetic
+/// there. A real bucket must pass an explicit unique scope to both processes;
+/// `seed` refuses to reuse any non-empty scope.
+const DEFAULT_WORKSPACE: &str = "probe-digest-ws";
+const DEFAULT_PROJECT: &str = "probe-digest-proj";
 
 /// The scenario timeline.
 ///
@@ -66,12 +70,36 @@ struct Args {
     command: Command,
 }
 
+#[derive(Debug, clap::Args)]
+struct ScopeArgs {
+    /// Workspace ID to write/read. Use one unique value for both processes.
+    #[arg(long, default_value = DEFAULT_WORKSPACE)]
+    workspace: String,
+    /// Project ID to write/read. Use one unique value for both processes.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    project: String,
+}
+
+impl ScopeArgs {
+    fn resolve(&self) -> Result<(WorkspaceId, ProjectId)> {
+        Ok((
+            WorkspaceId::new(&self.workspace)?,
+            ProjectId::new(&self.project)?,
+        ))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Process A: commit the scope's whole history and print the ground truth.
-    Seed,
+    Seed {
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
     /// Process B: read the digest from the bucket and print it.
     Read {
+        #[command(flatten)]
+        scope: ScopeArgs,
         /// Only report activity at or after this caller clock (ms).
         #[arg(long, default_value_t = 0)]
         since_ms: i64,
@@ -89,17 +117,57 @@ async fn main() -> Result<()> {
     // so this exercises the real HTTP path rather than an in-memory backend.
     let config = S3Config::from_env()?;
     let bucket = config.build_store()?;
-    let store = ProjectStore::new(bucket, "v1");
+    let store = ProjectStore::new(Arc::clone(&bucket), "v1");
 
     match args.command {
-        Command::Seed => {
-            let report = seed(&store).await?;
+        Command::Seed { scope } => {
+            let (workspace, project) = scope.resolve()?;
+            ensure_scope_empty(&store, &bucket, &workspace, &project).await?;
+            let report = seed(&store, &workspace, &project).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Read { since_ms, limit } => {
-            let report = read(&store, since_ms, limit).await?;
+        Command::Read {
+            scope,
+            since_ms,
+            limit,
+        } => {
+            let (workspace, project) = scope.resolve()?;
+            let report = read(&store, &workspace, &project, since_ms, limit).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+    }
+    Ok(())
+}
+
+/// Refuse to seed a scope that already contains any object.
+///
+/// The listing is deliberately over the scope prefix and then filtered with a
+/// trailing slash, so a neighbouring scope such as `foo-other` cannot make
+/// `foo` look non-empty. This check is a safety boundary, not a cleanup path:
+/// no object is deleted and no automatic namespace is selected.
+async fn ensure_scope_empty(
+    store: &ProjectStore,
+    bucket: &Arc<dyn ObjectStore>,
+    workspace: &WorkspaceId,
+    project: &ProjectId,
+) -> Result<()> {
+    let scope = store.layout().scope_prefix(workspace, project);
+    let cas = CasStore::new(Arc::clone(bucket), "");
+    let scope_with_slash = format!("{scope}/");
+    let existing: Vec<String> = cas
+        .list(&scope)
+        .await?
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key == &scope || key.starts_with(&scope_with_slash))
+        .collect();
+    if let Some(first) = existing.first() {
+        bail!(
+            "refusing to seed {scope}: the target scope is not empty ({} object(s), first: {first}); \
+             choose a unique --workspace/--project and, on a real bucket, use a dedicated \
+             bucket or prefix",
+            existing.len()
+        );
     }
     Ok(())
 }
@@ -109,9 +177,11 @@ async fn main() -> Result<()> {
 /// Every step is asserted here rather than assumed: a deletion that removed
 /// nothing must not be reported as a deletion, and a session head that did not
 /// move must not be reported as activity.
-async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
-    let workspace = WorkspaceId::new(WORKSPACE)?;
-    let project = ProjectId::new(PROJECT)?;
+async fn seed(
+    store: &ProjectStore,
+    workspace: &WorkspaceId,
+    project: &ProjectId,
+) -> Result<serde_json::Value> {
     let writer = WriterId::new("probe-digest")?;
 
     let mut commits = Vec::new();
@@ -137,8 +207,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
 
     let deleted = store
         .delete_page(
-            &workspace,
-            &project,
+            workspace,
+            project,
             &PagePath::new(BETA)?,
             &writer,
             BETA_DELETED_AT_MS,
@@ -214,8 +284,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
     let claimer = WriterId::new("probe-digest-claimer")?;
     let (started, created) = store
         .open_handoff(
-            &workspace,
-            &project,
+            workspace,
+            project,
             "carry the digest work",
             "the S3 stub leg still needs a reader",
             &writer,
@@ -227,8 +297,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
     }
     let claimed = store
         .claim_handoff(
-            &workspace,
-            &project,
+            workspace,
+            project,
             &started.id,
             &claimer,
             HANDOFF_CLAIMED_AT_MS,
@@ -238,8 +308,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
     // into the reader's window and makes it the newest one.
     let finished = store
         .finish_handoff(
-            &workspace,
-            &project,
+            workspace,
+            project,
             &claimed.id,
             &claimer,
             HANDOFF_FINISHED_AT_MS,
@@ -258,8 +328,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
     }
     let (later, _) = store
         .open_handoff(
-            &workspace,
-            &project,
+            workspace,
+            project,
             "a later baton",
             "opened inside the window",
             &writer,
@@ -268,8 +338,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
         .await?;
     let (early, _) = store
         .open_handoff(
-            &workspace,
-            &project,
+            workspace,
+            project,
             "an early baton",
             "every stage is before the window",
             &writer,
@@ -278,8 +348,8 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
         .await?;
 
     Ok(serde_json::json!({
-        "workspace": WORKSPACE,
-        "project": PROJECT,
+        "workspace": workspace.as_str(),
+        "project": project.as_str(),
         "commits": commits,
         "sessions": sessions,
         "handoffs": [
@@ -306,21 +376,27 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
 }
 
 /// Read the digest as a machine that has never seen the writer's memory.
-async fn read(store: &ProjectStore, since_ms: i64, limit: usize) -> Result<serde_json::Value> {
-    let workspace = WorkspaceId::new(WORKSPACE)?;
-    let project = ProjectId::new(PROJECT)?;
-    let digest = store.digest(&workspace, &project, since_ms, limit).await?;
+async fn read(
+    store: &ProjectStore,
+    workspace: &WorkspaceId,
+    project: &ProjectId,
+    since_ms: i64,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let digest = store.digest(workspace, project, since_ms, limit).await?;
     // The manifest's own answer, read through the ordinary recent-pages path:
     // the deleted path must not be among the live ones, so the digest keeping
     // it is a claim about history rather than a stale manifest entry.
     let live: Vec<String> = store
-        .recent_pages(&workspace, &project, usize::MAX)
+        .recent_pages(workspace, project, usize::MAX)
         .await?
         .into_iter()
         .map(|(path, _)| path.as_str().to_string())
         .collect();
 
     Ok(serde_json::json!({
+        "workspace": workspace.as_str(),
+        "project": project.as_str(),
         "since_ms": since_ms,
         "limit": limit,
         "live_pages": live,

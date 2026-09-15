@@ -4,7 +4,7 @@
 //! runs against `object_store`'s `InMemory` backend, which has no HTTP layer
 //! at all. These tests run the `digest-probe` binary as **separate processes**
 //! against [`qm_probe::s3_stub::S3Stub`]: process A builds a whole history —
-//! two page commits, a deletion, two session heads, two handoffs — and process
+//! two page commits, a deletion, two session heads, three batons — and process
 //! B, with its own handle and nothing shared but the bucket, has to rebuild the
 //! same three-section digest from the objects alone.
 //!
@@ -31,6 +31,11 @@ use serde_json::Value;
 const ACCESS_KEY: &str = "stub-access";
 const SECRET_KEY: &str = "stub-secret";
 
+const SCOPE_A_WORKSPACE: &str = "probe-digest-a-ws";
+const SCOPE_A_PROJECT: &str = "probe-digest-a-proj";
+const SCOPE_B_WORKSPACE: &str = "probe-digest-b-ws";
+const SCOPE_B_PROJECT: &str = "probe-digest-b-proj";
+
 /// Run one `digest-probe` command, hermetically: a fresh OS process with an
 /// empty environment, so nothing it knows can come from this one.
 fn probe(stub: &S3Stub, args: &[&str]) -> Output {
@@ -50,17 +55,27 @@ fn probe(stub: &S3Stub, args: &[&str]) -> Output {
 }
 
 /// Process A: build the scope and hand back the ground truth it created.
-fn seed(stub: &S3Stub) -> Value {
-    parse(&probe(stub, &["seed"]), "seed")
+fn seed(stub: &S3Stub, workspace: &str, project: &str) -> Value {
+    parse(
+        &probe(
+            stub,
+            &["seed", "--workspace", workspace, "--project", project],
+        ),
+        "seed",
+    )
 }
 
 /// Process B: read the digest, sharing nothing with `seed` but the socket.
-fn read(stub: &S3Stub, since_ms: i64, limit: usize) -> Value {
+fn read(stub: &S3Stub, workspace: &str, project: &str, since_ms: i64, limit: usize) -> Value {
     parse(
         &probe(
             stub,
             &[
                 "read",
+                "--workspace",
+                workspace,
+                "--project",
+                project,
                 "--since-ms",
                 &since_ms.to_string(),
                 "--limit",
@@ -310,13 +325,17 @@ fn paging_stub() -> S3Stub {
 #[test]
 fn a_second_process_reads_the_whole_digest_from_the_bucket() {
     let stub = paging_stub();
-    let seed = seed(&stub);
+    let seed = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
+    assert_eq!(seed["workspace"], SCOPE_A_WORKSPACE);
+    assert_eq!(seed["project"], SCOPE_A_PROJECT);
     assert_eq!(seed["commits"].as_array().unwrap().len(), 3);
     assert_eq!(seed["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(seed["handoffs"].as_array().unwrap().len(), 3);
 
     let after_seed = stub.requests();
-    let read = read(&stub, 0, 20);
+    let read = read(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 0, 20);
+    assert_eq!(read["workspace"], SCOPE_A_WORKSPACE);
+    assert_eq!(read["project"], SCOPE_A_PROJECT);
 
     let violations = digest_violations(&seed, &read);
     assert!(
@@ -471,16 +490,82 @@ fn a_second_process_reads_the_whole_digest_from_the_bucket() {
 }
 
 #[test]
+fn seed_refuses_a_non_empty_scope_without_touching_it() {
+    let stub = paging_stub();
+    let seeded = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
+    assert_eq!(seeded["workspace"], SCOPE_A_WORKSPACE);
+    let before = stub.objects();
+    assert!(
+        !before.is_empty(),
+        "the first seed must actually populate the scope"
+    );
+
+    let refused = probe(
+        &stub,
+        &[
+            "seed",
+            "--workspace",
+            SCOPE_A_WORKSPACE,
+            "--project",
+            SCOPE_A_PROJECT,
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a second seed must fail loudly:\n{}",
+        combined(&refused)
+    );
+    assert!(
+        combined(&refused).contains("target scope is not empty"),
+        "the refusal must name the non-empty target scope:\n{}",
+        combined(&refused)
+    );
+    assert_eq!(
+        stub.objects(),
+        before,
+        "the failed preflight must not add, replace or remove an object"
+    );
+
+    stub.shutdown();
+}
+
+#[test]
+fn a_read_of_another_scope_does_not_see_the_seeded_digest() {
+    let stub = paging_stub();
+    let seeded = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
+    assert!(
+        !seeded["commits"].as_array().unwrap().is_empty(),
+        "the source scope must be non-empty: {seeded}"
+    );
+
+    let other = read(&stub, SCOPE_B_WORKSPACE, SCOPE_B_PROJECT, 0, 20);
+    assert_eq!(other["workspace"], SCOPE_B_WORKSPACE);
+    assert_eq!(other["project"], SCOPE_B_PROJECT);
+    for section in ["pages", "sessions", "handoffs"] {
+        assert!(
+            other["digest"][section].as_array().unwrap().is_empty(),
+            "scope B must not inherit scope A's {section}: {other}"
+        );
+    }
+    assert!(
+        other["live_pages"].as_array().unwrap().is_empty(),
+        "scope B must not inherit scope A's live pages: {other}"
+    );
+
+    stub.shutdown();
+}
+
+#[test]
 fn the_window_filters_each_section_by_its_own_clock() {
     let stub = paging_stub();
-    let seed = seed(&stub);
+    let seed = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
 
     // 2_000ms. The older session head and the older page write are out. The
     // finished baton is *in* even though both its open (400ms) and its claim
     // (900ms) are outside, because its finish is at 3_200ms — that is the whole
     // point of following the latest stage. The baton whose every stage is at
     // 300ms is out.
-    let windowed = read(&stub, 2_000, 20);
+    let windowed = read(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 2_000, 20);
     let windowed_violations = digest_violations(&seed, &windowed);
     assert!(
         windowed_violations.is_empty(),
@@ -520,7 +605,7 @@ fn the_window_filters_each_section_by_its_own_clock() {
 
     // The same scope with a window wide enough for everything, so the window
     // above is shown narrowing an answer rather than describing an empty one.
-    let full = read(&stub, 0, 20);
+    let full = read(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 0, 20);
     assert!(
         full["digest"]["sessions"].as_array().unwrap().len() > sessions.len(),
         "{full}"
@@ -532,10 +617,10 @@ fn the_window_filters_each_section_by_its_own_clock() {
 #[test]
 fn the_limit_caps_each_section_independently() {
     let stub = paging_stub();
-    let seed = seed(&stub);
+    let seed = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
 
-    let full = read(&stub, 0, 20);
-    let capped = read(&stub, 0, 1);
+    let full = read(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 0, 20);
+    let capped = read(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 0, 1);
     let capped_violations = digest_violations(&seed, &capped);
     assert!(
         capped_violations.is_empty(),
@@ -572,11 +657,11 @@ fn a_listing_that_stops_at_its_first_page_makes_the_digest_short() {
 
     // The writer does not enumerate anything, so the fault is a reader-side
     // one: process A still commits the whole history.
-    let seed = seed(&broken);
+    let seed = seed(&broken, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
     assert_eq!(seed["commits"].as_array().unwrap().len(), 3);
     let after_seed = broken.requests().len();
 
-    let read = read(&broken, 0, 20);
+    let read = read(&broken, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT, 0, 20);
     let violations = digest_violations(&seed, &read);
     assert!(
         !violations.is_empty(),

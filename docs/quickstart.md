@@ -228,14 +228,16 @@ cargo run -p qm-probe --bin session-probe              # 采集 → 编译 → �
 # 向量闭环（需要 embedding 配置；pages.jsonl 的每行是 {path,title,body}）
 cargo run -p qm-probe --bin search-probe -- vector-publish --workspace acme --project my-project ./pages.jsonl
 cargo run -p qm-probe --bin search-probe -- vector-query --workspace acme --project my-project "语义查询"
-# 最近变化摘要的跨进程真桶验收
-cargo run -p qm-probe --bin digest-probe -- seed
-cargo run -p qm-probe --bin digest-probe -- read --since-ms 0 --limit 20
+# 最近变化摘要的跨进程真桶验收；两个进程必须使用同一组唯一 scope
+DIGEST_WS="probe-digest-$(date +%s)-$$"
+DIGEST_PROJECT="run-$(date +%s)-$$"
+cargo run -p qm-probe --bin digest-probe -- seed --workspace "$DIGEST_WS" --project "$DIGEST_PROJECT"
+cargo run -p qm-probe --bin digest-probe -- read --workspace "$DIGEST_WS" --project "$DIGEST_PROJECT" --since-ms 0 --limit 20
 ```
 
 ### 本地 S3 stub（协议层；不是真 R2）
 
-无凭据时，下面的测试会自动启动 `s3-stub`，并在独立进程中实际运行跨进程检索、
+无凭据时，下面的测试会启动进程内 `S3Stub`，并让探针以独立进程打本地 HTTP，实际运行跨进程检索、
 `vector-publish` / `vector-query` 与 `digest-probe`：
 
 ```bash
@@ -256,3 +258,8 @@ cargo run -p qm-probe --bin digest-probe -- read --help
 ```
 
 stub 证据只覆盖本地 HTTP 协议层；真 R2 的签名、ETag/版本行为、一致性、配额、延迟与错误 XML 变体仍未验证。
+
+`digest-probe` 不自动清理；`seed` 写入前会列出目标 scope，发现任何既有对象就 fail-loud，`read` 只读。
+`--workspace` / `--project` 必须由两个进程显式传入同一组唯一值；兼容默认值只留给桩测试和历史调用。
+真桶请优先使用专用 bucket 或专用 prefix。`QM_S3_PREFIX` 只被 `cas-conformance` 与
+`search-probe build/query` 的分片前缀采用，**不能当所有 probe 的全局隔离**。
