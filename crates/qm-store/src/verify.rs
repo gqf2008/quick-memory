@@ -257,8 +257,9 @@ impl ProjectStore {
 mod tests {
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use object_store::memory::InMemory;
-    use qm_core::{WriterId, content_hash};
+    use qm_core::{MANIFEST_FORMAT_SHARDED, WriterId, content_hash};
 
     use super::*;
     use crate::{CommitPageRequest, RetryPolicy};
@@ -407,6 +408,95 @@ mod tests {
                 .iter()
                 .any(|problem| problem.kind == "session_chain"),
             "{:?}",
+            report.problems
+        );
+    }
+
+    /// A shard filed under a key that is not its content hash is reported —
+    /// even though every read of the scope still works.
+    ///
+    /// This is the check that keeps the layout *canonical*: a shard body lives
+    /// at the key its own content produced. It cannot be caught by reading,
+    /// because the reader takes whatever key the root names and checks the bytes
+    /// against the recorded hash — which is exactly why a scope like this
+    /// answers perfectly and why `verify` is the only place that can say so.
+    ///
+    /// The comment on the check says a non-canonical key "would break the rest
+    /// of the tooling": de-duplication, the reachability walk and the local
+    /// object cache all address a shard by its content hash, so a body living
+    /// somewhere else is unreachable by anything except this root.
+    #[tokio::test]
+    async fn a_shard_filed_under_a_non_canonical_key_is_reported() {
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = store(&bucket).with_manifest_format(MANIFEST_FORMAT_SHARDED);
+        commit(&store, "notes/raft.md", "first", 1).await;
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        let root = loaded
+            .root
+            .clone()
+            .expect("the premise: the scope is sharded");
+        assert_eq!(root.shards.len(), 1, "the premise: one shard was written");
+        let original = root.shards[0].clone();
+        let canonical = store
+            .layout()
+            .manifest_shard(&ws(), &proj(), &original.content_hash);
+        assert_eq!(
+            original.key, canonical,
+            "the premise: it starts out filed where its content says"
+        );
+
+        // Same bytes, another legal key, and a root that points at the copy.
+        let renamed = format!("{}-copy.json", canonical.trim_end_matches(".json"));
+        let (body, _) = store.cas().read(&canonical).await.unwrap();
+        store.cas().create(&renamed, body).await.unwrap();
+        let mut renamed_root = (*root).clone();
+        renamed_root.shards[0].key = renamed.clone();
+        let manifest_key = store.layout().manifest(&ws(), &proj());
+        let (_, version) = store.cas().read(&manifest_key).await.unwrap();
+        store
+            .cas()
+            .update(
+                &manifest_key,
+                Bytes::from(serde_json::to_vec(&renamed_root).unwrap()),
+                &version,
+            )
+            .await
+            .unwrap();
+
+        // Premise for the check existing at all: the scope still reads, so this
+        // is not a "missing object" problem the reader would have caught.
+        assert!(
+            store
+                .read_page(&ws(), &proj(), &PagePath::new("notes/raft.md").unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "the premise: a non-canonical key still answers"
+        );
+
+        let report = store.verify_project(&ws(), &proj()).await.unwrap();
+        let problem = report
+            .problems
+            .iter()
+            .find(|problem| problem.kind == "manifest_shard_key")
+            .unwrap_or_else(|| {
+                panic!(
+                    "a shard filed under a non-canonical key must be reported: {:?}",
+                    report.problems
+                )
+            });
+        assert_eq!(problem.subject, renamed);
+        assert!(
+            problem.detail.contains(&canonical),
+            "the report has to name the key it should have been at: {problem:?}"
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .all(|problem| problem.kind != "manifest_shard"),
+            "the bytes are fine, so this must not read as a broken shard: {:?}",
             report.problems
         );
     }

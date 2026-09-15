@@ -3369,6 +3369,15 @@ mod tests {
         out
     }
 
+    /// The keys under `prefix`, sorted: a shard-set comparison, not a count.
+    async fn keys_under(bucket: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> {
+        all_keys(bucket)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with(prefix))
+            .collect()
+    }
+
     /// The bytes of one object, exactly as stored.
     async fn stored_bytes(bucket: &Arc<dyn ObjectStore>, key: &str) -> Bytes {
         let (bytes, _) = CasStore::new(Arc::clone(bucket), "")
@@ -6789,6 +6798,17 @@ mod tests {
         let while_sharded = store.load(&ws(), &proj()).await.unwrap();
         assert_eq!(while_sharded.manifest.seq, 2);
 
+        let shard_prefix = store.layout().manifest_shards_prefix(&ws(), &proj());
+        let shards_while_sharded = keys_under(&bucket, &shard_prefix).await;
+        assert_eq!(
+            shards_while_sharded.len(),
+            while_sharded
+                .root
+                .as_ref()
+                .map_or(0, |root| root.shards.len()),
+            "the premise: every shard the root names exists"
+        );
+
         let rolled_back = store
             .rollback_manifest_to_whole(&ws(), &proj())
             .await
@@ -6829,6 +6849,31 @@ mod tests {
             .await
             .unwrap();
         assert!(!again.already_there);
+        // The shards are recomputed from the same entries, so they land on the
+        // same content-addressed keys — re-migrating does not accumulate shard
+        // objects.
+        assert_eq!(
+            keys_under(&bucket, &shard_prefix).await,
+            shards_while_sharded,
+            "the round trip must not mint new shard objects"
+        );
+        // The archive is a different story, and it is worth pinning because it
+        // is easy to claim otherwise: a migration archives the whole body it
+        // finds, and the rollback wrote a *newer* body, so the second archive is
+        // a different object at a different key. The first archive is no longer
+        // referenced by anything once the scope is whole again.
+        assert_ne!(
+            again.archive.as_deref(),
+            migration.archive.as_deref(),
+            "the second migration archives the body the rollback wrote, not the \
+             first migration's copy"
+        );
+        assert!(
+            all_keys(&bucket)
+                .await
+                .contains(&again.archive.clone().unwrap()),
+            "and that new archive really is in the bucket"
+        );
         assert_eq!(
             store.load(&ws(), &proj()).await.unwrap().manifest.pages,
             loaded.manifest.pages,

@@ -232,6 +232,32 @@ mod tests {
         ProjectId::new("ai-memory").unwrap()
     }
 
+    /// Every key under a prefix, sorted, so a test can compare the *set* of
+    /// objects before and after a pass rather than count them.
+    async fn keys_under(store: &ProjectStore, prefix: &str) -> Vec<String> {
+        store
+            .cas()
+            .list(prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// The prefix a sharded commit point keeps its shard bodies under.
+    fn shard_prefix(store: &ProjectStore) -> String {
+        store.layout().manifest_shards_prefix(&ws(), &proj())
+    }
+
+    /// The prefix a migration keeps the pre-migration body under.
+    fn archive_prefix(store: &ProjectStore) -> String {
+        format!(
+            "{}/manifest/archive",
+            store.layout().scope_prefix(&ws(), &proj())
+        )
+    }
+
     #[tokio::test]
     async fn gc_collects_only_unreferenced_objects() {
         let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -341,5 +367,113 @@ mod tests {
         assert_eq!(outcome.deleted, 0);
         assert!(outcome.kept_recent >= 1);
         assert!(store.cas().head(orphan).await.is_ok());
+    }
+
+    /// A sharded commit point's shards, and the archive a migration wrote, are
+    /// live — and the reclaimer has to know that.
+    ///
+    /// Neither is reachable any other way: the shards are named only by the root
+    /// pointer, and the archive only by that root's `predecessor`. A
+    /// reachability walk that had not been taught about the sharded form would
+    /// therefore collect the entire project state, one object at a time, and
+    /// every read afterwards would fail with `NotFound` — the worst thing a
+    /// reclaimer can do, and invisible to any test that does not migrate first.
+    ///
+    /// Three of the assertions here are premises, and they are the ones that
+    /// keep the test from passing for the wrong reason: the scope really is
+    /// sharded (one shard, one archive), and the pass really did reclaim
+    /// something — an earlier version of this test would have passed on a
+    /// reclaimer that did nothing at all.
+    #[tokio::test]
+    async fn gc_keeps_the_shards_and_the_archive_of_a_migrated_scope() {
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = store(&bucket);
+        let path = PagePath::new("notes/raft.md").unwrap();
+        store
+            .commit_page(CommitPageRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                path: path.clone(),
+                title: "Raft".into(),
+                body: "leader election".into(),
+                writer_id: WriterId::new("mbp-a").unwrap(),
+                now_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(
+            !migration.already_there,
+            "the premise: the scope was converted, not already sharded"
+        );
+        let shards_before = keys_under(&store, &shard_prefix(&store)).await;
+        let archives_before = keys_under(&store, &archive_prefix(&store)).await;
+        assert_eq!(
+            shards_before.len(),
+            1,
+            "the premise: the commit point names one shard, so one shard exists"
+        );
+        assert_eq!(
+            archives_before.len(),
+            1,
+            "the premise: the migration archived the body it replaced"
+        );
+        assert_eq!(
+            migration.archive.as_deref(),
+            archives_before.first().map(String::as_str),
+            "the premise: the root names the archive that is in the bucket"
+        );
+
+        // Something for this pass to reclaim, so that a pass which collected
+        // nothing cannot be mistaken for one that kept the right objects.
+        let orphan = "v1/ws/acme/proj/ai-memory/index/catalog/feedface.json";
+        store
+            .cas()
+            .create(orphan, bytes::Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        let applied = store
+            .gc_orphans(&ws(), &proj(), 10_000, 0, true)
+            .await
+            .unwrap();
+        assert!(
+            applied.deleted_keys.iter().any(|key| key == orphan),
+            "the premise: this pass really collected something: {applied:?}"
+        );
+
+        // The conclusion: both sets are untouched, key for key.
+        assert_eq!(
+            keys_under(&store, &shard_prefix(&store)).await,
+            shards_before,
+            "a shard the root names is live; collecting it loses the project state"
+        );
+        assert_eq!(
+            keys_under(&store, &archive_prefix(&store)).await,
+            archives_before,
+            "the archive the root's predecessor names is live too"
+        );
+
+        // And the scope still answers — collecting a shard shows up here as a
+        // `NotFound` out of the read path.
+        let page = store
+            .read_page(&ws(), &proj(), &path)
+            .await
+            .unwrap()
+            .expect("the page is still there");
+        assert_eq!(page.body, "leader election");
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the listing still sees the scope"
+        );
     }
 }
