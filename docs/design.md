@@ -414,9 +414,12 @@ manifest/archive/<content_hash>.json # 迁移前那一份整份对象，只增�
 - `MANIFEST_MAX_BYTES`（1 MiB）在 format 2 下按**单片**生效：约束的是"一次提交要移动多少字节"，
   而一次分片提交移动的是一片，不是整个 project。两条 path 各自 600 KB 时，整份 write 会被拒绝，
   分片 write 各自通过（`two_shards_can_hold_what_one_whole_manifest_cannot`）。
-- 根指针有独立上限 `MANIFEST_ROOT_MAX_BYTES`（64 KiB）。最坏形状（256 片、key 与 hash 取最长、
-  `path_count` 取 `usize::MAX`）实测远低于它，由
-  `a_root_with_every_shard_fits_under_its_ceiling` 钉住并打印。
+- 根指针有独立上限 `MANIFEST_ROOT_MAX_BYTES`（256 KiB）。最坏形状（256 片、**scope 名取布局允许的
+  128 字符**、hash 取满长、`path_count` 取 `usize::MAX`）实测 **126 467 B**，由
+  `a_root_with_every_shard_fits_under_its_ceiling` 钉住（断言"不超过上限的一半"，所以布局长一个字段
+  会被测试抓到，而不是在迁移时才被拒）。这条上限不是拍出来的：最初按**短** scope 名量到 64 016 B 就
+  定了 64 KiB，换成合法的最长名之后是 126 467 B——测试用的名字长度本身会把这个数字差掉一倍。
+  正常 scope 名（`v1/ws/acme/proj/ai-memory/...`）下每片引用约 160 B，37 片时根指针约 6 KB。
 - 两者都**在写出任何对象之前**判定：被拒绝的提交不留下页面对象、WAL 记录或孤儿分片
   （测试比较拒绝前后的桶内对象集合）。
 

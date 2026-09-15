@@ -69,9 +69,23 @@ pub const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 /// unlike the whole form, which grows with the project. The bound is enforced
 /// anyway, in the same place and the same way as the whole form's, because a
 /// root that outgrew its layout would be a protocol problem and not something
-/// to discover from a 5 GiB bucket error. `a_root_with_every_shard_fits_under_
-/// the_ceiling` measures the worst case the split allows and pins it here.
-pub const MANIFEST_ROOT_MAX_BYTES: usize = 64 * 1024;
+/// to discover from a 5 GiB bucket error.
+///
+/// The value is measured, not guessed. `a_root_with_every_shard_fits_under_its_
+/// ceiling` builds the worst case the layout allows — 256 shards, every key at
+/// the longest identifier length the layout permits (128 characters per scope
+/// segment), a full-length content hash, `path_count` at `usize::MAX` — and it
+/// comes to **126 467 bytes**. That same test is why this ceiling is not
+/// smaller: an earlier 64 KiB value was under it by a factor of two, and the
+/// test builds the *long* names on purpose so the margin cannot be read off the
+/// short ones. 256 KiB keeps the worst case at about half the ceiling, so a
+/// field added to a shard reference is caught by the test rather than by a
+/// refused migration.
+pub const MANIFEST_ROOT_MAX_BYTES: usize = 256 * 1024;
+
+/// A root that cost as much to move as the object it replaced would make the
+/// split pointless, so the two ceilings are ordered by construction.
+const _: () = assert!(MANIFEST_ROOT_MAX_BYTES < MANIFEST_MAX_BYTES);
 
 /// How a fan-out over a listing treats a key the listing named but the bucket
 /// no longer has.
@@ -7410,30 +7424,43 @@ mod tests {
     /// How much room the root pointer can possibly need, measured.
     #[test]
     fn a_root_with_every_shard_fits_under_its_ceiling() {
+        // The longest identifiers the layout allows, not the short ones this
+        // fixture happens to use: a root carries full object keys, and a
+        // workspace name may be 128 characters, which is ~300 bytes more per
+        // shard reference than the short case — sizing the ceiling from short
+        // names would have understated it by ~76 KB.
+        let longest = "w".repeat(128);
+        let long_ws = WorkspaceId::new(longest.clone()).unwrap();
+        let long_proj = ProjectId::new(longest).unwrap();
         let layout = KeyLayout::new("v1");
         let root = ManifestRoot {
             shards: (0..qm_core::MANIFEST_SHARD_COUNT)
                 .map(|index| ShardRef {
                     shard: index,
-                    key: layout.manifest_shard(&ws(), &proj(), &"f".repeat(64)),
+                    key: layout.manifest_shard(&long_ws, &long_proj, &"f".repeat(64)),
                     content_hash: "f".repeat(64),
                     path_count: usize::MAX,
                 })
                 .collect(),
-            ..ManifestRoot::empty(ws(), proj())
+            ..ManifestRoot::empty(long_ws.clone(), long_proj.clone())
         };
         assert_eq!(
             root.shards.len(),
             usize::from(qm_core::MANIFEST_SHARD_COUNT)
         );
-        let bytes = encode_root(&ws(), &proj(), &root).unwrap();
+        let bytes = encode_root(&long_ws, &long_proj, &root).unwrap();
         println!("root bytes with a full split = {}", bytes.len());
         assert!(
-            bytes.len() <= MANIFEST_ROOT_MAX_BYTES,
-            "the fixed split bounds the root, so the worst case has to fit: {} > {}",
+            bytes.len() * 2 <= MANIFEST_ROOT_MAX_BYTES,
+            "the fixed split bounds the root, so the worst case has to fit with room \
+             to spare: {} bytes is more than half of {}",
             bytes.len(),
             MANIFEST_ROOT_MAX_BYTES
         );
+        // The other half of the relation — the root's ceiling has to be smaller
+        // than the whole form's, or the split would have bought nothing — is a
+        // fact about two constants, so it is checked where it can be: at compile
+        // time, next to them.
     }
 
     /// The whole form refuses what two shards fit — which is the reason the
