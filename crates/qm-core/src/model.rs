@@ -361,6 +361,12 @@ pub struct ShardRef {
     /// Content hash of the shard body: the key's suffix, and the reader's check.
     pub content_hash: String,
     /// Paths the shard carries: current versions plus tombstones.
+    ///
+    /// A summary, for a caller that has the root and does not want to fetch the
+    /// shard to ask how big it is — not a checked invariant. It cannot drift
+    /// from the shard it describes: the shard's key is the hash of its bytes, so
+    /// a `path_count` that disagreed with the body would mean different bytes,
+    /// which the reader refuses before it reads this field.
     pub path_count: usize,
 }
 

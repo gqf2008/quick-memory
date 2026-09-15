@@ -273,6 +273,10 @@ impl Recorded {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateOutcome {
     /// Storage form the scope was in when the call started.
+    ///
+    /// Reported as the whole form when the scope had no commit point at all:
+    /// there was no object, and a scope nobody has written reads as the form
+    /// every earlier version wrote.
     pub from: u32,
     /// Storage form it is in now.
     pub to: u32,
