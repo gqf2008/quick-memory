@@ -7,6 +7,7 @@ members = [
     "crates/qm-probe",
     "crates/qm-cli",
     "crates/qm-mcp",
+    "crates/qm-llm",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ qm-store = { path = "crates/qm-store", version = "0.1.0" }
 qm-search = { path = "crates/qm-search", version = "0.1.0" }
 qm-cli = { path = "crates/qm-cli", version = "0.1.0" }
 qm-mcp = { path = "crates/qm-mcp", version = "0.1.0" }
+qm-llm = { path = "crates/qm-llm", version = "0.1.0" }
 schemars = "1"
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
 
