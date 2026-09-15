@@ -161,10 +161,13 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 - R2 出口免费，读分片不产生出口费；写入按 Class A 操作计费。
 - 一次 `qm capture` = 1 段 + 1 个 head CAS；一次 `qm publish` = 分片文件数 + 1 个 catalog + 1 次 CAS。
 - 分片随发布次数增长，压缩把 N 个分片并回 1 个；检索成本 ≈ 分片数 × 流数（3）。
-- `qm digest` / `qm log` / `qm history`（`memory_digest` / `memory_log`）读**整条 commit log**：
-  读的对象数随提交数**线性**增长（N 条提交 = N 次对象读），并发上限 16，所以延迟约 `⌈N/16⌉ × RTT`，
-  而不是 `N × RTT`。这是**有界并发**，不是 O(1)：`--limit` 只封顶返回几条，不封顶读几条，
-  窗口里没有变化时也要付这个代价。代价换来的是「刚启动的机器和有缓存的机器看到同一个答案」。
+- `qm digest` / `qm log` / `qm history` / `qm read-page --as-of`（`memory_digest` /
+  `memory_log` / `memory_read_page`）读**整条 commit log**：读的对象数随提交数**线性**增长
+  （N 条提交 = N 次对象读），并发上限 16，所以延迟约 `⌈N/16⌉ × RTT`，而不是 `N × RTT`。
+  这是**有界并发**，不是 O(1)：`--limit` 只封顶返回几条，不封顶读几条，窗口里没有变化时
+  也要付这个代价。代价换来的是「刚启动的机器和有缓存的机器看到同一个答案」。
+- 这一批读**任一失败就整次失败**，不会返回半条日志；报出的是**listing 序里最小的那个 key** 的失败，
+  而不是先失败的那条，所以同一个桶坏掉几条对象时，每次报错都说同一个 key。
 - 桶内对象布局见 `design.md` §4；用 `qm status --json` 看当前规模。
 
 ## 空输出：`--limit 0` 的两种口径
