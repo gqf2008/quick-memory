@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use qm_cli::build_bucket_from_env;
+use qm_cli::{bucket_identity_from_env, build_bucket_from_env};
 use qm_mcp::MemoryServer;
 use rmcp::ServiceExt;
 use rmcp::transport::io::stdio;
@@ -45,7 +45,12 @@ async fn main() -> Result<()> {
     } else {
         build_bucket_from_env()?
     };
-    let server = MemoryServer::new(bucket, workspace, project, writer, cache_dir);
+    // Cache keys such as the publish watermark are facts about one bucket.
+    // Naming the bucket keeps the same cache directory safe when an operator
+    // changes the endpoint or bucket in the MCP configuration.
+    let bucket_identity = bucket_identity_from_env();
+    let server = MemoryServer::new(bucket, workspace, project, writer, cache_dir)
+        .with_bucket_identity(bucket_identity);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

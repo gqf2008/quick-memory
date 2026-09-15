@@ -6,6 +6,7 @@
 //! the real one is verified by the probes, with credentials.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 struct Client {
@@ -126,6 +127,111 @@ fn tool_text(response: &serde_json::Value) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("no text content: {response}"))
         .to_string()
+}
+
+fn publish_watermarks(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = std::fs::read_dir(cache_dir)
+        .expect("reading cache dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("publish-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+/// A publish watermark describes one bucket, not just one machine and cache.
+///
+/// The first server publishes into bucket A and leaves its watermark in the
+/// shared cache. The second server then compacts a non-empty index into bucket
+/// B (without touching the publish watermark) and publishes. If the MCP
+/// context does not carry the bucket identity, it reads A's watermark while
+/// pointing at B and incorrectly reports that B is up to date.
+#[test]
+fn mcp_publish_watermarks_are_scoped_to_the_bucket() {
+    let root = std::env::temp_dir().join(format!("qm-mcp-bucket-identity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).expect("creating cache dir");
+    let cache_arg = cache.to_str().expect("cache dir is UTF-8");
+    let endpoint = "https://synthetic.invalid";
+    let writer = "switching-machine";
+
+    {
+        let mut bucket_a = Client::start_with(&[
+            ("QM_S3_ENDPOINT", endpoint),
+            ("QM_S3_BUCKET", "bucket-a"),
+            ("QM_CACHE_DIR", cache_arg),
+            ("QM_WRITER", writer),
+        ]);
+        bucket_a.handshake();
+        bucket_a.call_tool(
+            1,
+            "memory_write_page",
+            serde_json::json!({"path": "notes/from-a.md", "body": "only in bucket a"}),
+        );
+        let published = bucket_a.call_tool(2, "memory_publish", serde_json::json!({}));
+        let published_text = tool_text(&published);
+        assert!(
+            !published_text.contains("nothing to publish"),
+            "bucket A's first publish must build its index: {published_text}"
+        );
+    }
+
+    // Premise: bucket A has left a watermark in the shared cache. Bucket B's
+    // state will be seeded without calling publish, so this file can only
+    // describe A when it is read after the switch.
+    let watermarks_from_a = publish_watermarks(&cache);
+    assert_eq!(
+        watermarks_from_a.len(),
+        1,
+        "one published bucket must leave one watermark"
+    );
+
+    let mut bucket_b = Client::start_with(&[
+        ("QM_S3_ENDPOINT", endpoint),
+        ("QM_S3_BUCKET", "bucket-b"),
+        ("QM_CACHE_DIR", cache_arg),
+        ("QM_WRITER", writer),
+    ]);
+    bucket_b.handshake();
+    bucket_b.call_tool(
+        3,
+        "memory_write_page",
+        serde_json::json!({"path": "notes/from-b.md", "body": "written in bucket b"}),
+    );
+    let compacted = bucket_b.call_tool(4, "memory_compact", serde_json::json!({}));
+    let compacted_json: serde_json::Value = serde_json::from_str(&tool_text(&compacted))
+        .unwrap_or_else(|error| panic!("compact must return JSON: {error}"));
+    assert_eq!(compacted_json["splits_after"], 1, "{compacted_json}");
+
+    let status = bucket_b.call_tool(5, "memory_status", serde_json::json!({}));
+    let status_json: serde_json::Value = serde_json::from_str(&tool_text(&status))
+        .unwrap_or_else(|error| panic!("status must return JSON: {error}"));
+    assert_eq!(status_json["splits"], 1, "{status_json}");
+
+    // Premise: compacting B did not consume or replace A's watermark.
+    let watermarks_before_publish = publish_watermarks(&cache);
+    assert_eq!(
+        watermarks_before_publish, watermarks_from_a,
+        "compaction must not write a publish watermark"
+    );
+
+    let published = bucket_b.call_tool(6, "memory_publish", serde_json::json!({}));
+    let published_text = tool_text(&published);
+    assert!(
+        !published_text.contains("nothing to publish"),
+        "switching buckets must publish into B, not read A's watermark: {published_text}"
+    );
+    let published_json: serde_json::Value = serde_json::from_str(&published_text)
+        .unwrap_or_else(|error| panic!("publish must return JSON: {error}: {published_text}"));
+    assert_eq!(published_json["pages"], 1, "{published_json}");
+
+    drop(bucket_b);
+    std::fs::remove_dir_all(&root).expect("cleaning synthetic test dir");
 }
 
 #[test]

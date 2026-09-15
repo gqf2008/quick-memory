@@ -214,6 +214,7 @@ pub struct PageArgs {
 #[derive(Clone)]
 pub struct MemoryServer {
     bucket: Arc<dyn ObjectStore>,
+    bucket_identity: String,
     workspace: String,
     project: String,
     writer: String,
@@ -242,6 +243,7 @@ impl MemoryServer {
     ) -> Self {
         Self {
             bucket,
+            bucket_identity: String::new(),
             workspace,
             project,
             writer,
@@ -249,6 +251,17 @@ impl MemoryServer {
             now_ms: wall_clock_ms(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Name the bucket the server's object store points at.
+    ///
+    /// The value is used as the scope for local facts about the bucket, such
+    /// as the publish watermark. Without it, one cache directory shared by
+    /// two buckets can suppress the first publish into the second.
+    #[must_use]
+    pub fn with_bucket_identity(mut self, identity: impl Into<String>) -> Self {
+        self.bucket_identity = identity.into();
+        self
     }
 
     /// Run one command through the shared dispatch and return its JSON.
@@ -270,7 +283,8 @@ impl MemoryServer {
             self.now_ms,
             true,
         )
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        .map_err(|error| McpError::invalid_params(error.to_string(), None))?
+        .with_bucket_identity(self.bucket_identity.clone());
         let output = execute(&cli, context)
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
