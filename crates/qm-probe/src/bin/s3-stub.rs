@@ -63,6 +63,12 @@ struct Args {
     /// Objects per list page, to force the client to paginate.
     #[arg(long, default_value_t = 1000)]
     page_size: usize,
+    /// Answer this many conditional writes that pass their preconditions with
+    /// `409 Conflict` before behaving. One exercises the client's retry; more
+    /// than its retry budget shows a bucket that never recovers failing the
+    /// probe.
+    #[arg(long, default_value_t = 0)]
+    conflict_conditional_puts: usize,
 }
 
 fn main() -> ExitCode {
@@ -70,6 +76,7 @@ fn main() -> ExitCode {
     let mut options = StubOptions::default()
         .with_bucket(&args.bucket)
         .with_page_size(args.page_size)
+        .with_conditional_put_conflicts(args.conflict_conditional_puts)
         .with_put_version_id(args.r2_version_id);
     for fault in &args.fault {
         options = options.with_fault((*fault).into());
@@ -91,10 +98,11 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "s3 stub listening on {} bucket={} faults={:?}",
+        "s3 stub listening on {} bucket={} faults={:?} conditional-put-conflicts={}",
         stub.endpoint(),
         stub.bucket(),
-        args.fault
+        args.fault,
+        args.conflict_conditional_puts,
     );
     println!(
         "export QM_S3_ENDPOINT={} QM_S3_BUCKET={} \

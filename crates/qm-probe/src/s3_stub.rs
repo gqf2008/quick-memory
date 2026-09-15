@@ -28,15 +28,24 @@
 //!   `x-amz-version-id` header appears on `PUT` responses only — the shape
 //!   `docs/design.md` §5.1 claims the CAS layer is immune to. GET/HEAD never
 //!   repeat it.
+//! - **Conflict retries**: with [`StubOptions::with_conditional_put_conflicts`]
+//!   the next N conditional writes that *satisfy* their preconditions answer
+//!   `409 Conflict` instead of writing — the answer real S3 gives when
+//!   concurrent `If-Match` writes are in flight, and the one write mode
+//!   `object_store` retries on that status. A count of one proves the retry
+//!   covers it; a count past the client's retry budget proves a bucket that
+//!   never recovers still fails the probe rather than passing quietly.
 //!
 //! Still not modelled: request signatures (the `Authorization` header is
 //! recorded and ignored), multipart uploads, real XML variants, durability,
-//! latency, quotas and region behaviour. See `docs/design.md` §5.1.
+//! latency, quotas and region behaviour — and conditional **reads**, which
+//! are refused rather than answered (see [`State::get`]). See
+//! `docs/design.md` §5.1.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -81,6 +90,15 @@ pub struct StubOptions {
     pub faults: Vec<Fault>,
     /// Objects per `ListObjectsV2` page, to force client pagination.
     pub page_size: usize,
+    /// How many conditional writes that satisfy their preconditions to answer
+    /// with `409 Conflict` before behaving.
+    ///
+    /// Unlike [`Self::faults`] this is not a broken backend: a real bucket
+    /// answers `409` when conflicting `If-Match` writes overlap, and the
+    /// client is expected to retry. One is therefore a *transient* condition
+    /// the probe must survive; more than the client's retry budget is one it
+    /// must not survive silently.
+    pub conditional_put_conflicts: usize,
 }
 
 impl Default for StubOptions {
@@ -90,6 +108,7 @@ impl Default for StubOptions {
             put_version_id: false,
             faults: Vec::new(),
             page_size: 1000,
+            conditional_put_conflicts: 0,
         }
     }
 }
@@ -120,6 +139,14 @@ impl StubOptions {
     #[must_use]
     pub fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = page_size.max(1);
+        self
+    }
+
+    /// Answer the next `count` conditional writes that satisfy their
+    /// preconditions with `409 Conflict`, then behave normally.
+    #[must_use]
+    pub fn with_conditional_put_conflicts(mut self, count: usize) -> Self {
+        self.conditional_put_conflicts = count;
         self
     }
 }
@@ -159,6 +186,8 @@ struct State {
     requests: Mutex<Vec<RecordedRequest>>,
     etag_seq: AtomicU64,
     version_seq: AtomicU64,
+    /// Conditional writes left to answer with an injected `409`.
+    conditional_put_conflicts: AtomicUsize,
 }
 
 /// A running stub server.
@@ -200,6 +229,7 @@ impl S3Stub {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let addr = listener.local_addr()?;
         let state = Arc::new(State {
+            conditional_put_conflicts: AtomicUsize::new(options.conditional_put_conflicts),
             options,
             objects: Mutex::new(BTreeMap::new()),
             requests: Mutex::new(Vec::new()),
@@ -543,7 +573,7 @@ impl State {
         match request.method.as_str() {
             "PUT" if !route.key.is_empty() => self.put(&route.key, request),
             "GET" if route.key.is_empty() => self.list(&route.query),
-            "GET" | "HEAD" => self.get(&route.key),
+            "GET" | "HEAD" => self.get(&route.key, request),
             "DELETE" if !route.key.is_empty() => self.delete(&route.key),
             other => Response::error(
                 501,
@@ -551,6 +581,23 @@ impl State {
                 &format!("the stub does not implement {other} on this target"),
             ),
         }
+    }
+
+    /// Consume one injected conflict, if any are left to spend.
+    fn take_conditional_put_conflict(&self) -> bool {
+        let mut remaining = self.conditional_put_conflicts.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.conditional_put_conflicts.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => remaining = actual,
+            }
+        }
+        false
     }
 
     /// Check the preconditions and store the body as one atomic step.
@@ -568,10 +615,15 @@ impl State {
             // The fault is injected here rather than in the comparison so the
             // rest of the response stays byte-identical to a correct backend.
             if !self.faulted(Fault::IgnoreIfMatch) {
+                // `If-Match: *` is HTTP's "any current representation" form:
+                // it asserts existence, not identity. Comparing it as an ETag
+                // would refuse every object that does exist.
+                let any_representation = expected.trim() == "*";
                 match objects.get(key) {
                     None => return Response::error(404, "NoSuchKey", "the object does not exist"),
                     Some(existing)
-                        if normalize_etag(expected) != normalize_etag(&existing.etag) =>
+                        if !any_representation
+                            && normalize_etag(expected) != normalize_etag(&existing.etag) =>
                     {
                         return Response::error(
                             412,
@@ -582,6 +634,18 @@ impl State {
                     Some(_) => {}
                 }
             }
+        }
+
+        // Injected conflict, and deliberately *after* the preconditions: this
+        // models a write that would have been accepted losing to a concurrent
+        // one, which is what S3's 409 means for `If-Match`. Nothing is stored,
+        // so the client's retry of the same request is the one that lands.
+        if if_match.is_some() && self.take_conditional_put_conflict() {
+            return Response::error(
+                409,
+                "Conflict",
+                "a conflicting conditional write is in flight (injected)",
+            );
         }
 
         let seq = self.etag_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -615,7 +679,24 @@ impl State {
     /// The body stays in the response even for `HEAD`: it is what the
     /// `Content-Length` header has to advertise, and the writer drops the body
     /// bytes for a HEAD request.
-    fn get(&self, key: &str) -> Response {
+    ///
+    /// Conditional **reads** are refused instead of answered. A `GET` that
+    /// ignores `If-None-Match` answers `200` with the body, and that is not a
+    /// missing answer but a *wrong* one: a probe built on it would look green
+    /// for the wrong reason. `501` keeps the surface honest — the same call
+    /// the stub makes for delimiters in [`Self::list`] — and nothing in this
+    /// repository performs a conditional read today.
+    fn get(&self, key: &str, request: &Request) -> Response {
+        if let Some(name) = ["if-none-match", "if-match"]
+            .into_iter()
+            .find(|name| header(&request.headers, name).is_some())
+        {
+            return Response::error(
+                501,
+                "NotImplemented",
+                &format!("the stub does not implement conditional reads ({name} on GET/HEAD)"),
+            );
+        }
         let objects = self.objects.lock().expect("stub object lock");
         let Some(object) = objects.get(key) else {
             return Response::error(404, "NoSuchKey", &format!("no object at {key:?}"));
@@ -700,7 +781,7 @@ impl State {
         let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         body.push_str(&format!(
             "<ListBucketResult xmlns=\"{XMLNS}\"><Name>{}</Name><Prefix>{}</Prefix>\
-             <KeyCount>{}</KeyCount><MaxKeys>{page_size}</MaxKeys>\
+             <KeyCount>{}</KeyCount><MaxKeys>{requested}</MaxKeys>\
              <IsTruncated>{truncated}</IsTruncated>",
             escape_xml(&self.options.bucket),
             escape_xml(&prefix),
@@ -778,6 +859,7 @@ fn reason(status: u16) -> &'static str {
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        409 => "Conflict",
         412 => "Precondition Failed",
         501 => "Not Implemented",
         _ => "Internal Server Error",
