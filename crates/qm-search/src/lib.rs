@@ -1393,22 +1393,22 @@ pub async fn search_project_tuned(
         .collect();
     let fused = fuse_rrf_weighted(weighted, 60.0);
 
-    let manifest = project_store
-        .load(workspace_id, project_id)
+    // The authority check reads what it has to and nothing else: the whole form
+    // is one object, and the sharded form is the root plus the shards the
+    // *candidate paths* hash to. A query that matched a handful of pages
+    // therefore does not pay for every shard in the scope, which is the read
+    // amplification the sharded form exists to avoid.
+    let candidate_paths: Vec<String> = fused.iter().map(|hit| hit.path.clone()).collect();
+    let heads = project_store
+        .load_path_heads(workspace_id, project_id, &candidate_paths)
         .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .manifest;
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let before = fused.len();
     let mut fused = fused;
     tuning.apply(&mut fused);
     let mut hits: Vec<Hit> = fused
         .into_iter()
-        .filter(|hit| {
-            manifest
-                .pages
-                .get(&hit.path)
-                .is_some_and(|entry| entry.page_id.as_str() == hit.page_id)
-        })
+        .filter(|hit| heads.is_current(&hit.path, &hit.page_id))
         .collect();
     let filtered_out = before - hits.len();
     hits.truncate(limit);
