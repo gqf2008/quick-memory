@@ -331,6 +331,30 @@ pub enum Command {
     },
 }
 
+const S3_ENDPOINT_ENV_NAMES: &[&str] = &["QM_S3_ENDPOINT", "R2_ENDPOINT"];
+const S3_BUCKET_ENV_NAMES: &[&str] = &["QM_S3_BUCKET", "R2_BUCKET"];
+const S3_ACCESS_KEY_ENV_NAMES: &[&str] = &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"];
+const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"];
+
+fn env_first(names: &[&str]) -> Option<String> {
+    env_first_with(names, &mut |name| std::env::var(name).ok())
+}
+
+fn env_first_with(names: &[&str], get: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| get(name).filter(|value| !value.trim().is_empty()))
+}
+
+fn bucket_identity_from(mut get: impl FnMut(&str) -> Option<String>) -> String {
+    let endpoint = env_first_with(S3_ENDPOINT_ENV_NAMES, &mut get).unwrap_or_default();
+    let bucket = env_first_with(S3_BUCKET_ENV_NAMES, &mut get).unwrap_or_default();
+    if endpoint.is_empty() && bucket.is_empty() {
+        return String::new();
+    }
+    format!("{endpoint}\u{0}{bucket}")
+}
+
 /// Build the bucket client from the environment.
 ///
 /// `QM_S3_*` (falling back to `R2_*`) must be present: a surface that cannot
@@ -343,13 +367,6 @@ pub enum Command {
 pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
     use object_store::aws::AmazonS3Builder;
 
-    fn env_first(names: &[&str]) -> Option<String> {
-        names.iter().find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-    }
     fn require(names: &[&str], what: &str) -> Result<String> {
         env_first(names).ok_or_else(|| {
             anyhow::anyhow!(
@@ -358,16 +375,10 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
         })
     }
 
-    let endpoint = require(&["QM_S3_ENDPOINT", "R2_ENDPOINT"], "S3 endpoint")?;
-    let bucket = require(&["QM_S3_BUCKET", "R2_BUCKET"], "bucket name")?;
-    let access_key_id = require(
-        &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"],
-        "access key id",
-    )?;
-    let secret_access_key = require(
-        &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"],
-        "secret access key",
-    )?;
+    let endpoint = require(S3_ENDPOINT_ENV_NAMES, "S3 endpoint")?;
+    let bucket = require(S3_BUCKET_ENV_NAMES, "bucket name")?;
+    let access_key_id = require(S3_ACCESS_KEY_ENV_NAMES, "access key id")?;
+    let secret_access_key = require(S3_SECRET_KEY_ENV_NAMES, "secret access key")?;
     let region = env_first(&["QM_S3_REGION"]).unwrap_or_else(|| "auto".to_string());
     let force_path_style = env_first(&["QM_S3_FORCE_PATH_STYLE"])
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
@@ -395,20 +406,7 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
 /// `build_bucket_from_env` succeeded means that cannot happen.
 #[must_use]
 pub fn bucket_identity_from_env() -> String {
-    fn env_first(names: &[&str]) -> Option<String> {
-        names.iter().find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-    }
-
-    let endpoint = env_first(&["QM_S3_ENDPOINT", "R2_ENDPOINT"]).unwrap_or_default();
-    let bucket = env_first(&["QM_S3_BUCKET", "R2_BUCKET"]).unwrap_or_default();
-    if endpoint.is_empty() && bucket.is_empty() {
-        return String::new();
-    }
-    format!("{endpoint}\u{0}{bucket}")
+    bucket_identity_from(|name| std::env::var(name).ok())
 }
 
 /// Flatten every control character to a space.
@@ -427,7 +425,10 @@ fn one_line(text: &str) -> String {
 /// The sections are always all present when there is anything at all to show,
 /// because "no handoffs" and "the handoff section never rendered" are different
 /// facts and a reader should not have to guess which one they are looking at.
-fn render_digest(digest: &Digest) -> String {
+fn render_digest(digest: &Digest, limit: usize) -> String {
+    if limit == 0 {
+        return "no entries shown: --limit 0 caps every digest section".to_string();
+    }
     if digest.is_empty() {
         return "no recent activity".to_string();
     }
@@ -1856,7 +1857,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             Ok(if ctx.json {
                 serde_json::to_string(&digest)?
             } else {
-                render_digest(&digest)
+                render_digest(&digest, *limit)
             })
         }
         Command::DeletePage { path } => {
@@ -3830,6 +3831,58 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(empty, "no recent activity");
+
+        // `--limit 0` produces the same empty arrays, but it is not a claim
+        // that the window was quiet: the caller deliberately asked for no
+        // entries. Keep the two states distinguishable in human output.
+        let zero_limit = execute(
+            &cli(&["digest", "--limit", "0"]),
+            Context {
+                now_ms: 3_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            zero_limit,
+            "no entries shown: --limit 0 caps every digest section"
+        );
+        assert_ne!(zero_limit, empty);
+    }
+
+    #[test]
+    fn bucket_identity_and_client_share_the_same_environment_names() {
+        assert_eq!(S3_ENDPOINT_ENV_NAMES, &["QM_S3_ENDPOINT", "R2_ENDPOINT"]);
+        assert_eq!(S3_BUCKET_ENV_NAMES, &["QM_S3_BUCKET", "R2_BUCKET"]);
+        assert_eq!(
+            S3_ACCESS_KEY_ENV_NAMES,
+            &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"]
+        );
+        assert_eq!(
+            S3_SECRET_KEY_ENV_NAMES,
+            &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]
+        );
+
+        // Exercise the aliases through the same resolver identity uses, so a
+        // future change that only updates one table cannot silently make the
+        // watermark name a different bucket.
+        let mut values = std::collections::HashMap::from([
+            ("R2_ENDPOINT", "https://r2.example".to_string()),
+            ("R2_BUCKET", "bucket-b".to_string()),
+        ]);
+        let identity = bucket_identity_from(|name| values.remove(name));
+        assert_eq!(identity, "https://r2.example\u{0}bucket-b");
+
+        values.extend([
+            ("QM_S3_ENDPOINT", "https://s3.example".to_string()),
+            ("QM_S3_BUCKET", "bucket-a".to_string()),
+        ]);
+        assert_eq!(
+            bucket_identity_from(|name| values.remove(name)),
+            "https://s3.example\u{0}bucket-a",
+            "QM_S3_* must take precedence over R2_*"
+        );
     }
 
     /// `--since-ms` and `--hours` both narrow the window, and the default is a
