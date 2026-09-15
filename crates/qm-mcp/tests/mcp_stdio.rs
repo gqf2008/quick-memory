@@ -16,7 +16,14 @@ struct Client {
 
 impl Client {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_qm-mcp"))
+        Self::start_with(&[])
+    }
+
+    /// Same server, with extra environment. Used to configure an embedding
+    /// provider; last write wins, so an override may replace the defaults.
+    fn start_with(envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qm-mcp"));
+        command
             .arg("--synthetic-bucket")
             .env("QM_WORKSPACE", "acme")
             .env("QM_PROJECT", "ai-memory")
@@ -27,9 +34,11 @@ impl Client {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning qm-mcp");
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawning qm-mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Self {
@@ -460,5 +469,124 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
             .as_str()
             .is_some_and(|message| message.contains("portable")),
         "the error must explain the rejection: {bad}"
+    );
+}
+
+/// A local embedding endpoint that answers every batch with the same vector.
+///
+/// The point of the `no_vector` test below is to see the vector stream appear
+/// and disappear, which needs a provider that actually answers. A stub keeps
+/// that off the network; one vector for everything is enough because the test
+/// asks whether the stream ran, not what it ranked.
+fn embedding_stub() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let address = listener.local_addr().expect("stub address");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = vec![0u8; 65536];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            // One row per input: the client counts them and would reject a
+            // mismatch, so the stub derives the count from the request.
+            let rows = request
+                .split_once("\"input\"")
+                .and_then(|(_, rest)| rest.split_once('['))
+                .map_or(1, |(_, rest)| {
+                    let end = rest.find(']').unwrap_or(rest.len());
+                    (rest[..end].matches('"').count() / 2).max(1)
+                });
+            let data: Vec<serde_json::Value> = (0..rows)
+                .map(|_| serde_json::json!({"embedding": [1.0, 0.0, 0.0, 0.0]}))
+                .collect();
+            let body = serde_json::json!({ "data": data }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{address}")
+}
+
+/// `no_vector` must actually switch the stream off over the wire.
+///
+/// With no provider configured this is invisible: a dropped `no_vector` field
+/// would produce byte-identical output, so a test asserting only "the call
+/// works" cannot fail. Here a provider is configured (a local stub), which
+/// makes the difference observable: the stream shows up in `streams_active`
+/// until `no_vector` removes it.
+#[test]
+fn mcp_search_no_vector_switches_the_vector_stream_off() {
+    let base_url = embedding_stub();
+    let cache_dir = std::env::temp_dir().join(format!("qm-mcp-no-vector-{}", std::process::id()));
+    let mut client = Client::start_with(&[
+        ("QM_EMBEDDING_BASE_URL", base_url.as_str()),
+        ("QM_EMBEDDING_API_KEY", "test-key"),
+        ("QM_EMBEDDING_MODEL", "test-model"),
+        ("QM_EMBEDDING_DIM", "4"),
+        ("QM_CACHE_DIR", cache_dir.to_str().expect("cache dir")),
+    ]);
+    client.handshake();
+
+    let _ = client.call_tool(
+        1,
+        "memory_capture",
+        serde_json::json!({"session": "sess-vec", "text": "switched the index to tantivy splits"}),
+    );
+    let _ = client.call_tool(
+        2,
+        "memory_consolidate",
+        serde_json::json!({"session": "sess-vec"}),
+    );
+    // Publication embeds through the stub, so the split carries vectors.
+    let published = client.call_tool(3, "memory_publish", serde_json::json!({}));
+    assert!(
+        !tool_text(&published).contains("error"),
+        "publishing with a provider must embed: {}",
+        tool_text(&published)
+    );
+
+    let on = client.call_tool(
+        4,
+        "memory_search",
+        serde_json::json!({"query": "tantivy", "limit": 5}),
+    );
+    let on_json: serde_json::Value = serde_json::from_str(&tool_text(&on))
+        .unwrap_or_else(|error| panic!("search must be JSON: {error}: {}", tool_text(&on)));
+    let streams = |value: &serde_json::Value| -> Vec<String> {
+        value["streams_active"]
+            .as_array()
+            .expect("streams_active")
+            .iter()
+            .filter_map(|stream| stream.as_str().map(ToString::to_string))
+            .collect()
+    };
+    assert!(
+        streams(&on_json).iter().any(|stream| stream == "vector"),
+        "with a provider configured the vector stream must run: {on_json}"
+    );
+
+    let off = client.call_tool(
+        5,
+        "memory_search",
+        serde_json::json!({"query": "tantivy", "limit": 5, "no_vector": true}),
+    );
+    let off_json: serde_json::Value = serde_json::from_str(&tool_text(&off))
+        .unwrap_or_else(|error| panic!("search must be JSON: {error}: {}", tool_text(&off)));
+    assert!(
+        off_json["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.iter().any(|hit| hit["path"] == "sessions/sess-vec.md")),
+        "no_vector must not cost the keyword hits: {off_json}"
+    );
+    assert!(
+        !streams(&off_json).iter().any(|stream| stream == "vector"),
+        "no_vector must keep the vector stream out: {off_json}"
     );
 }
