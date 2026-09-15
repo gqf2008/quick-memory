@@ -336,8 +336,14 @@ const S3_BUCKET_ENV_NAMES: &[&str] = &["QM_S3_BUCKET", "R2_BUCKET"];
 const S3_ACCESS_KEY_ENV_NAMES: &[&str] = &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"];
 const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"];
 
-fn env_first(names: &[&str]) -> Option<String> {
-    env_first_with(names, &mut |name| std::env::var(name).ok())
+/// Read a value out of the process environment.
+///
+/// The single place this crate touches the environment: [`build_bucket_from`]
+/// and [`bucket_identity_from_env`] both take this as their lookup, so the
+/// client and the watermark identity cannot end up consulting different name
+/// tables.
+fn env_lookup() -> impl FnMut(&str) -> Option<String> {
+    |name: &str| std::env::var(name).ok()
 }
 
 fn env_first_with(names: &[&str], get: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
@@ -365,22 +371,41 @@ fn bucket_identity_from(mut get: impl FnMut(&str) -> Option<String>) -> String {
 /// Fails when endpoint, bucket, or credentials are missing, or the client
 /// cannot be constructed.
 pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
+    build_bucket_from(env_lookup())
+}
+
+/// Build the bucket client from an injected name -> value lookup.
+///
+/// Production reaches this only through [`build_bucket_from_env`]; the seam
+/// exists so a test can record *which* names the client is built from and
+/// compare them with [`bucket_identity_from`]'s, without touching the process
+/// environment (undefined behaviour under Rust 2024, and forbidden textually by
+/// this workspace's `unsafe_code` lint).
+///
+/// # Errors
+/// Fails when endpoint, bucket, or credentials are missing, or the client
+/// cannot be constructed.
+fn build_bucket_from(mut get: impl FnMut(&str) -> Option<String>) -> Result<Arc<dyn ObjectStore>> {
     use object_store::aws::AmazonS3Builder;
 
-    fn require(names: &[&str], what: &str) -> Result<String> {
-        env_first(names).ok_or_else(|| {
+    fn require(
+        get: &mut impl FnMut(&str) -> Option<String>,
+        names: &[&str],
+        what: &str,
+    ) -> Result<String> {
+        env_first_with(names, get).ok_or_else(|| {
             anyhow::anyhow!(
                 "missing {what}; set one of {names:?} (a command that cannot reach the bucket must fail, not guess)"
             )
         })
     }
 
-    let endpoint = require(S3_ENDPOINT_ENV_NAMES, "S3 endpoint")?;
-    let bucket = require(S3_BUCKET_ENV_NAMES, "bucket name")?;
-    let access_key_id = require(S3_ACCESS_KEY_ENV_NAMES, "access key id")?;
-    let secret_access_key = require(S3_SECRET_KEY_ENV_NAMES, "secret access key")?;
-    let region = env_first(&["QM_S3_REGION"]).unwrap_or_else(|| "auto".to_string());
-    let force_path_style = env_first(&["QM_S3_FORCE_PATH_STYLE"])
+    let endpoint = require(&mut get, S3_ENDPOINT_ENV_NAMES, "S3 endpoint")?;
+    let bucket = require(&mut get, S3_BUCKET_ENV_NAMES, "bucket name")?;
+    let access_key_id = require(&mut get, S3_ACCESS_KEY_ENV_NAMES, "access key id")?;
+    let secret_access_key = require(&mut get, S3_SECRET_KEY_ENV_NAMES, "secret access key")?;
+    let region = env_first_with(&["QM_S3_REGION"], &mut get).unwrap_or_else(|| "auto".to_string());
+    let force_path_style = env_first_with(&["QM_S3_FORCE_PATH_STYLE"], &mut get)
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(true);
 
@@ -406,7 +431,7 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
 /// `build_bucket_from_env` succeeded means that cannot happen.
 #[must_use]
 pub fn bucket_identity_from_env() -> String {
-    bucket_identity_from(|name| std::env::var(name).ok())
+    bucket_identity_from(env_lookup())
 }
 
 /// Flatten every control character to a space.
@@ -3851,6 +3876,14 @@ mod tests {
         assert_ne!(zero_limit, empty);
     }
 
+    /// The client builder and the watermark identity must read the **same**
+    /// endpoint/bucket names, or a watermark can name a bucket the client never
+    /// writes to.
+    ///
+    /// Pinning the four tables alone is not enough: that stays green if
+    /// `build_bucket_from_env` grows its own copy of the name list. So drive
+    /// both paths through the lookup seam and compare the names each one asks
+    /// for, rather than the tables they were written against.
     #[test]
     fn bucket_identity_and_client_share_the_same_environment_names() {
         assert_eq!(S3_ENDPOINT_ENV_NAMES, &["QM_S3_ENDPOINT", "R2_ENDPOINT"]);
@@ -3862,6 +3895,35 @@ mod tests {
         assert_eq!(
             S3_SECRET_KEY_ENV_NAMES,
             &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]
+        );
+
+        // Answer every name the client walks, so it gets past all four
+        // `require`s and the test sees the whole table it consults. The client
+        // is expected to reject the dummy endpoint; only the questions matter.
+        let mut client_asked: Vec<String> = Vec::new();
+        let _ = build_bucket_from(|name| {
+            client_asked.push(name.to_string());
+            Some("https://dummy.invalid".to_string())
+        });
+        assert!(
+            client_asked.len() > 2,
+            "the client must walk past its endpoint and bucket lookups: {client_asked:?}"
+        );
+
+        // The identity reads exactly two names: endpoint, then bucket.
+        let mut identity_asked: Vec<String> = Vec::new();
+        let _ = bucket_identity_from(|name| {
+            identity_asked.push(name.to_string());
+            Some("https://dummy.invalid".to_string())
+        });
+        assert_eq!(identity_asked, vec!["QM_S3_ENDPOINT", "QM_S3_BUCKET"]);
+
+        // And those are the first two names the client asks for, in that order.
+        // Point either side at a different table and the two lists diverge.
+        assert_eq!(
+            client_asked.iter().take(2).cloned().collect::<Vec<_>>(),
+            identity_asked,
+            "the client must be built from the same endpoint/bucket names the watermark identity is derived from"
         );
 
         // Exercise the aliases through the same resolver identity uses, so a
