@@ -19,7 +19,7 @@ the read path.
    lease object in the bucket plus a CAS fence — never a single node, and
    never a guarantee the operator must uphold.
 3. **One commit point per scope.** A write becomes visible when
-   `manifest.pb` CAS succeeds. Nothing is readable because it was uploaded.
+   `manifest.json` CAS succeeds. Nothing is readable because it was uploaded.
 4. **The index is derived and rebuildable.** Deleting the whole index prefix
    must be recoverable by re-running the builder over authoritative objects.
    Prove it with a test, not a comment.

@@ -155,6 +155,13 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
 - **`<MaxKeys>` 回显请求值**：客户端请求 1000、stub 每页只发 2 条时，响应里的 `<MaxKeys>` 仍是 1000
   （`object_store` 今天不读这个字段，但"看起来对、其实不忠实"的字段迟早会咬人）；另有一条按请求的 1 条截断。
 
+**一条读法陷阱（先于本层既有，不是 stub 引入的）**：把 409 注入开到超过客户端的重试预算时，
+`cas-conformance` 只报 `matching update failed: object already exists`。它**不代表桶里有重复对象**：
+HTTP `409 Conflict` 被 `object_store` 映射成 `Error::AlreadyExists`，`qm-store` 再映射成自己的
+`AlreadyExists`，于是"并发写争用、重试耗尽"被渲染成了"重复对象"的诊断。真实桶上看到这句话时先查
+并发写/同前缀争用，不要去找第二个对象。复现见下面的 stub 命令段（`--conflict-conditional-puts 100`；
+注入 1 次时探针全绿且 `409` 紧跟同一个 `If-Match` 的 `200`，说明注入本身是有效的，只有**耗尽**预算才走这条报文）。
+
 **这层仍然没有测到什么**（不要把它读成真 R2 验证）：
 
 - **条件读的语义**：`If-None-Match` 命中时本该是 `304`（并带 ETag），stub 一律回 `501`——是"我们没建模"
@@ -879,7 +886,10 @@ mTLS 之外的完整读写链路、多机协作语义。
 
 待验证（需要真 R2 凭据 / Quickwit 二进制）：
 
-1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）。
+1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）—— **协议层已验证（stub），真 R2 待验证**
+   （无凭据）：`s3-stub` 起真 socket、`object_store` 的 S3 客户端打上去，条件头（`If-None-Match: *` /
+   `If-Match`）、`404 NoSuchKey`/`412 PreconditionFailed` 错误 XML、`ListObjectsV2` 分页、409 冲突重试、
+   两条故障注入对照都已被断言；见 §5.1 与 `crates/qm-probe/tests/s3_protocol.rs`。
 2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）—— **协议层已验证（stub），真 R2 待验证**
    （无凭据）：两个独立 `search-probe` 进程在本地 S3 stub 上跑通 build → query，
    并有"第二个进程取回全部分片对象、命中全量页面"的线上（socket）证据；多机目录场景

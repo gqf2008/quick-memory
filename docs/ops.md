@@ -135,6 +135,15 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）与 **Quickwit 二进制产出的真实分片**。
 有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这两类后端差异。
 
+没有凭据时能走多远：`qm-probe` 里有一个进程内的最小 S3 stub（`s3-stub` 二进制 / `qm_probe::s3_stub`），
+探针可以**真打 socket** 走完条件写、`ListObjectsV2` 分页与跨进程检索（见 `design.md` §5.1）。
+但它只是「协议层」，不是真桶，有两条读法要记住：
+
+- 它**不建模条件读**：带 `If-Match`/`If-None-Match` 的 `GET`/`HEAD` 一律回 `501 NotImplemented`。
+  真实 S3/R2 命中时本该是 `304`（带 ETag），这层语义**没有建模，也没有被验证**——`501` 是「我们还没做」，
+  不要当成后端行为。
+- 它**不校验签名**：请求里的 `AWS4-HMAC-SHA256` 只被记录、不被验算，签名对不对只有真后端能拒。
+
 ## 完整性自检
 
 ```bash
