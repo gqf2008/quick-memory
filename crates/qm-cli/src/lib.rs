@@ -1631,11 +1631,17 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                             "{}\t{}\t{}",
                             entry.created_at_ms,
                             path.as_str(),
-                            // One page per line is the whole contract of this
-                            // output; a title carrying a newline would break
-                            // it, and titles are not validated. Search flattens
-                            // titles the same way.
-                            entry.title.replace('\n', " ")
+                            // One line per page, three tab-separated fields
+                            // per line: that is this output's whole contract,
+                            // and titles are not validated. A bare newline,
+                            // a CRLF, a tab or an escape sequence would each
+                            // break some half of it, so every control
+                            // character becomes a space.
+                            entry
+                                .title
+                                .chars()
+                                .map(|c| if c.is_control() { ' ' } else { c })
+                                .collect::<String>()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2163,15 +2169,16 @@ mod tests {
             }
         ));
 
-        // One page per line is the contract, and titles are not validated, so a
-        // title with a newline in it must not be able to break it.
+        // One line per page, three tab-separated fields per line. Titles are
+        // not validated, so the realistic CRLF (and the tab that would eat a
+        // field boundary) must not be able to break either half of it.
         execute(
             &cli(&[
                 "write-page",
                 "--path",
                 "notes/multiline.md",
                 "--title",
-                "two\nlines",
+                "two\r\nlines\there",
                 "--body",
                 "body",
             ]),
@@ -2186,7 +2193,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tricky.lines().count(), 3, "one page per line: {tricky}");
-        assert!(tricky.contains("two lines"), "{tricky}");
+        assert!(tricky.contains("two  lines here"), "{tricky}");
+        for line in tricky.lines() {
+            assert_eq!(
+                line.matches('\t').count(),
+                2,
+                "three tab-separated fields per line: {line:?}"
+            );
+        }
 
         // Asking for nothing prints nothing; it must not claim the project is
         // empty.
