@@ -89,11 +89,18 @@ qm compact          # 拿不到租约会返回 "another machine holds the compac
 
 ## 发布与缓存
 
-- `qm publish` 只发布**本机上次发布之后**变化的页面（watermark 存在 `QM_CACHE_DIR`）。
-  清掉缓存 = 下次全量重发一次，代价是冗余，不是错误。
+- `qm publish` 只发布**本机上次发布之后**变化的页面。发布 watermark 存在
+  `QM_CACHE_DIR`，并按 `(endpoint, bucket)` 分键；不同桶不会互相抑制发布。
+- **升级或换桶后的第一次 `qm publish` 会做一次全量发布**：旧版 watermark 没有桶名，
+  换桶后第一次也会从空 watermark 开始。这是安全退化——多写一个分片，
+  代价是冗余，不会漏数据。
+- **指向第二个桶请使用独立 cache dir**（例如每个桶一个 `QM_CACHE_DIR`）：
+  这样既避免旧版二进制读错 watermark，也让缓存的清理和迁移边界清晰。
+- 清掉缓存 = 下次全量重发一次，代价是冗余，不是错误。
 - 检索把分片材料化到 `QM_CACHE_DIR`（默认 `$TMPDIR/qm-cache-<writer>`），
   按分片内容哈希命名；命中缓存就不再访问桶。缓存可以随时删除。
-- 多机共用一台机器时**不要**让不同 `QM_WRITER` 共用一个缓存目录（watermark 会互相覆盖）。
+- 多机共用一台机器时，不同 `QM_WRITER` 的 watermark 本来就不会互相覆盖；仍建议按
+  `(writer, bucket)` 拆开缓存目录，便于排查、清理和迁移。
 
 ## 备份与迁移
 
