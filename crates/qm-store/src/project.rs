@@ -616,7 +616,12 @@ impl ProjectStore {
     /// List every handoff of a project, oldest first.
     ///
     /// # Errors
-    /// Propagates listing and decode failures.
+    /// Propagates listing failures, and propagates a failing read as a failure
+    /// of the whole call: a partial log is never returned. The failure reported
+    /// is the one belonging to the *smallest* key, because the listing is
+    /// sorted — so a bucket that fails several reads at once still produces the
+    /// same error every run, instead of whichever read happened to finish
+    /// first. Which read finishes first is allowed to decide nothing at all.
     pub async fn list_handoffs(
         &self,
         workspace_id: &WorkspaceId,
@@ -881,7 +886,12 @@ impl ProjectStore {
     /// List proposals, oldest first.
     ///
     /// # Errors
-    /// Propagates listing and decode failures.
+    /// Propagates listing failures, and propagates a failing read as a failure
+    /// of the whole call: a partial log is never returned. The failure reported
+    /// is the one belonging to the *smallest* key, because the listing is
+    /// sorted — so a bucket that fails several reads at once still produces the
+    /// same error every run, instead of whichever read happened to finish
+    /// first. Which read finishes first is allowed to decide nothing at all.
     pub async fn list_proposals(
         &self,
         workspace_id: &WorkspaceId,
@@ -1845,7 +1855,12 @@ impl ProjectStore {
     /// the sort below, never from the order the reads finish in.
     ///
     /// # Errors
-    /// Propagates listing and decode failures.
+    /// Propagates listing failures, and propagates a failing read as a failure
+    /// of the whole call: a partial log is never returned. The failure reported
+    /// is the one belonging to the *smallest* key, because the listing is
+    /// sorted — so a bucket that fails several reads at once still produces the
+    /// same error every run, instead of whichever read happened to finish
+    /// first. Which read finishes first is allowed to decide nothing at all.
     pub async fn read_commit_log(
         &self,
         workspace_id: &WorkspaceId,
@@ -1863,14 +1878,34 @@ impl ProjectStore {
         // from the order the reads happen to finish in. Only the number of
         // requests in flight is bounded.
         let mut records = Vec::with_capacity(keys.len());
+        let mut failures: Vec<(String, StoreError)> = Vec::new();
         let mut reads = futures::stream::iter(keys)
             .map(|key| async move {
-                let (bytes, _) = self.cas.read(&key).await?;
-                decode::<CommitRecord>(&bytes, &key)
+                let outcome = async {
+                    let (bytes, _) = self.cas.read(&key).await?;
+                    decode::<CommitRecord>(&bytes, &key)
+                }
+                .await;
+                (key, outcome)
             })
             .buffer_unordered(COMMIT_LOG_READ_CONCURRENCY);
-        while let Some(record) = reads.next().await {
-            records.push(record?);
+        // A failing read is collected rather than returned on the spot: the
+        // failure to report is the smallest failing key below, not whichever
+        // failure the bucket happened to hand back first. That keeps the rest of
+        // the log being read after a failure — a few hundred bytes per record,
+        // still overlapped up to the bound above — and it is what makes the
+        // error the same on every run.
+        while let Some((key, outcome)) = reads.next().await {
+            match outcome {
+                Ok(record) => records.push(record),
+                Err(error) => failures.push((key, error)),
+            }
+        }
+        if let Some((_, error)) = failures
+            .into_iter()
+            .min_by(|left, right| left.0.cmp(&right.0))
+        {
+            return Err(error);
         }
         records.sort_by_key(|record| std::cmp::Reverse(record.seq));
         records.truncate(limit);
