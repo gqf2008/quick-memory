@@ -53,6 +53,29 @@ qm compact          # 拿不到租约会返回 "another machine holds the compac
 压缩完成时只新增一个分片并 CAS 换 `head.json`；旧分片仍被更早的 catalog 引用，
 直到 GC 把它们回收（读者通常只钉住 catalog 几秒，所以默认宽限期足够）。
 
+## 嵌入向量与换模型
+
+向量是**派生的**，跟着分片走：桶里只要存在带向量的分片，读方就会用
+`QM_EMBEDDING_DIM` 去解释它们——**宽度不符是硬失败，不是静默跳过**。
+
+- 症状：换了不同维度的 `QM_EMBEDDING_MODEL`（或改了 `QM_EMBEDDING_DIM`）却没有重新嵌入，
+  **每一次搜索都会 fail-closed 报错**（`cosine` 拒绝比较不同宽度的向量）。
+  这是刻意的：拿两种模型的距离做比较，会给出看起来正常、实则无意义的排序。
+- 换模型 = 换向量。必须**重新 `publish`/`compact`**，把既有页面重新嵌入，
+  让桶里的分片与新的查询向量同宽、同模型。
+
+建议顺序（多机时**每台机器都按同样顺序做**，否则新旧向量混用）：
+
+1. 先设好新的 `QM_EMBEDDING_MODEL` 与 `QM_EMBEDDING_DIM`（二者必须一致）。
+2. 应急绕过：查询加 `--no-vector`（MCP: `memory_search { no_vector: true }`）即可维持可用，
+   它只关掉向量流，正文/实体/链接不受影响。
+3. 重新发布：`qm publish`。若本机水位已经推进、没有可发布的页面，
+   执行 `qm compact` 触发整库重嵌入（compact 从权威页面重建，会带上新向量）。
+4. 确认桶里只剩新世代向量后，再去掉 `--no-vector`。
+
+`QM_EMBEDDING_DIM` 默认 1536（按 OpenAI `text-embedding-3-small` 取），
+这只是一个**假设**；换服务商时必须显式设置，不要依赖默认值。
+
 ## 发布与缓存
 
 - `qm publish` 只发布**本机上次发布之后**变化的页面（watermark 存在 `QM_CACHE_DIR`）。
