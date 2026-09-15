@@ -371,11 +371,14 @@ fn a_reader_that_receives_truncated_objects_refuses_the_index() {
     let served = broken.requests();
     let reader_phase = &served[after_build..];
     let fetches = object_gets(reader_phase);
-    assert_eq!(
-        fetches.len(),
-        published.len(),
-        "the fault shortens bodies, it does not hide objects: {reader_phase:#?}"
-    );
+    // Per key, like the positive leg: a count alone is satisfied by a reader
+    // that fetched one object twice and never asked for another.
+    for key in &published {
+        assert!(
+            fetches.iter().any(|request| &request.key == key),
+            "the fault shortens bodies, it does not hide objects: {key} was never fetched: {reader_phase:#?}"
+        );
+    }
     assert!(
         fetches.iter().all(|request| request.status == 200),
         "every truncated transfer still reports success: {reader_phase:#?}"
