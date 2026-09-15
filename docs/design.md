@@ -121,7 +121,14 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   否则这层只会被单页覆盖）。
 - **HEAD 元数据**：`Content-Length`、RFC2822 `Last-Modified`（解析回的时间就是写入时刻）、ETag 都能被客户端解出。
 - **签名代码路径**：请求确实带 `AWS4-HMAC-SHA256` 的 `Authorization` 头（`SignedHeaders` 里能看见
-  `if-match`/`if-none-match`），因此走的不是 `skip_signature` 捷径。
+  `if-match`/`if-none-match`），因此走的不是 `skip_signature` 捷径；这一条现在有回归守着——
+  测试解析每条请求的 `SignedHeaders`，断言凡是带条件头的请求都把它签进了签名头列表，
+  并断言这样的条件写恰好 5 次（两次 create + 陈旧/匹配/已消费三次 update），免得断言在空集合上空转。
+- **409 冲突与重试**：stub 可注入「前 N 次**通过前置条件**的条件写回 `409 Conflict`」——真实 S3 在并发
+  `If-Match` 写重叠时就是这么答的，而 `object_store` 只对这类写打开 `retry_on_conflict`。注入 1 次时探针
+  必须仍然全绿，且测试断言线上真的是「同一个 `If-Match` 的 409 紧跟一个 200」，不是因为恰好没注入；
+  把注入次数调到超过客户端的重试预算时，探针必须以重试耗尽的错误失败。两条合起来才说明"探针在冲突下
+  通过"不是因为 409 被吞掉了。
 - **R2 的 PUT-only version 形状**：stub 打开该形状后，测试同时断言 PUT **有** `x-amz-version-id`、
   随后的 GET **没有**，探针仍全绿——§5.1 的"按构造免疫"于是在真实 HTTP 形状下被观测到，
   而不再只是类型层面构造出来的。
@@ -139,8 +146,19 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   stub 把每个 `GET` 的 body 截成 1 字节、`content-length` 仍然诚实（`--fault truncate-read-body`）→
   传输全部 200 成功，读者仍必须在打开索引时报 `Data corrupted`。前者证明"搜到全量"不是因为列表恰好够短，
   后者证明损坏的内容不会被静默当成有效索引。
+- **条件读是拒绝，不是错答**：stub 不建模 `GET`/`HEAD` 上的 `If-Match`/`If-None-Match`（今天仓里没有任何
+  调用点），带条件的读回 `501 NotImplemented` + S3 错误 XML，而不是按"无条件 200 + 正文"回答——**错答比缺答更坏**，
+  一个建立在错答上的探针会为错误的理由变绿。这与 `delimiter` 的处置是同一条规则。`HEAD` 只回头且
+  `content-length` 与同一请求的 `GET` 一致（声明它拒绝发送的那份正文）。
+- **`If-Match: *`**：按 HTTP 的"存在即通过"处理（对不存在的对象回 `404 NoSuchKey`，与其它 `If-Match` 一致），
+  而不是把它当 ETag 去比——那样会拒绝每一个**存在**的对象。
+- **`<MaxKeys>` 回显请求值**：客户端请求 1000、stub 每页只发 2 条时，响应里的 `<MaxKeys>` 仍是 1000
+  （`object_store` 今天不读这个字段，但"看起来对、其实不忠实"的字段迟早会咬人）；另有一条按请求的 1 条截断。
 
 **这层仍然没有测到什么**（不要把它读成真 R2 验证）：
+
+- **条件读的语义**：`If-None-Match` 命中时本该是 `304`（并带 ETag），stub 一律回 `501`——是"我们没建模"
+  的诚实表达，不是"304 已被验证"。
 
 - **真 R2/S3 账号**：没有凭据，仍然没有在真桶上跑过 `cas-conformance`；stub 是我们写的服务，
   它证明的是"客户端在真实 HTTP 往返下的行为"，不是"R2 真的这样回答"。
@@ -164,6 +182,12 @@ cargo build -p qm-probe --bins
 QM_S3_ENDPOINT="http://127.0.0.1:$(cat /tmp/s3-stub-port)" QM_S3_BUCKET=stub-bucket \
 QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_PATH_STYLE=true \
 ./target/debug/cas-conformance
+# 对照：注入一次 409（客户端重试，探针仍全绿）；次数超过重试预算则必须失败
+./target/debug/s3-stub --conflict-conditional-puts 1 --port-file /tmp/s3-stub-conflict-port &
+QM_S3_ENDPOINT="http://127.0.0.1:$(cat /tmp/s3-stub-conflict-port)" QM_S3_BUCKET=stub-bucket \
+QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_PATH_STYLE=true \
+./target/debug/cas-conformance
+
 # 对照：同一个探针必须失败
 ./target/debug/s3-stub --fault ignore-if-match --port-file /tmp/s3-stub-fault-port &
 QM_S3_ENDPOINT="http://127.0.0.1:$(cat /tmp/s3-stub-fault-port)" QM_S3_BUCKET=stub-bucket \
@@ -841,6 +865,9 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 模拟"上传后崩溃"：重试复用同一页面对象，不报错、不产生重复版本。
 - 同 key 已存在但内容不同 → `Corrupt` 失败关闭。
 - 多机场景探针 `manifest-probe`（先做 CAS 预检，再跑场景并全量复核）；local 后端在预检阶段被明确拒绝。
+  WAL 那一项按**覆盖**判：每个已提交版本都必须能在 WAL 里找到（按 page id 做集合包含），
+  **不是**条数相等——`read_wal` 返回的是桶里有的集合，丢失 CAS 的尝试会留下 manifest 从不指向的记录
+  （见 `docs/ops.md`），所以"多一条"是预期形状、"少一条已提交版本"才是失败。
 
 已确认的事实（影响选型）：
 
