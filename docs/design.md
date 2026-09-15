@@ -431,6 +431,30 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 替换：SQLite（→ CAS 对象 + 派生索引）、git 工作树（→ 不可变版本 + manifest 链）、fs watcher（→ 发布/重建作业）、
 单写者事务（→ 每 scope 一个提交点 + at-least-once 索引 + ack 游标）。
 
+## 10.5 真 S3 协议验证（2026-09-15）
+
+同一套代码在**真实 S3 实现**（MinIO 2026版，本地 127.0.0.1:9100，非内存后端）上跑过一遍，全部通过：
+
+| 验证 | 原始结果 |
+|---|---|
+| `cas-conformance`（条件写契约） | 7/7 PASS：create 返回 ETag、重复 create 被拒、ETag 跨读稳定、陈旧 ETag 被拒、匹配 ETag 被接受且 ETag 改变、已消费 ETag 被拒、最终内容正确 |
+| `manifest-probe --machines 3 --writes 5` | `commits=15 attempts=21 pages=3 wal=15 all checks passed`（21 次尝试 = **6 次真实 CAS 冲突**被正确重试，15 次提交全部落地） |
+| `search-probe project` | `splits=3 hits=1 filtered_out=1 all checks passed`（过期副本被权威过滤） |
+| `session-probe` | `observations=3 segments=2 splits=1 hits=1 all checks passed` |
+| CLI 端到端（quickstart 路径） | capture → consolidate → publish → search 命中 → write-page → history（含提交时间）→ log → **`verify --strict`：no problems** → `gc`：scanned 19 / live 19 / collectable 0 |
+| 跨机器 | B（新 writer + 新缓存）读到 A 的页面与正文；B 写入并 publish 后 A 能搜到；handoff 由 B 认领后 A 再认领被拒（`is not open (state: Claimed)`） |
+| export / import | 导出 3 页 + 1 会话 → 导入到同桶另一项目 → 再导入 `0 page(s) (3 unchanged)` → publish → search 命中 → `verify --strict` 通过 |
+
+**这次验证覆盖了什么**：真实 HTTP + S3 协议路径（签名、endpoint、path-style、条件头、412 语义、列目录）、真实网络下的 CAS 冲突与重试、
+mTLS 之外的完整读写链路、多机协作语义。
+
+**这次没有覆盖什么**（保持诚实）：
+
+- **R2 特有行为**：MinIO 的 PUT 不返回 `x-amz-version-id`（探针输出 `version=None`），
+  所以"PUT 带 version、GET 不带"那条 R2 教训没有被这次运行触发。CAS 层按 ETag 判定并拒绝无 ETag 的后端，
+  逻辑上已经对这种情况免疫，但仍建议在真 R2 上再跑一次 `cas-conformance`。
+- **Quickwit 二进制**：仍是格式级验证（解析器 + `INDEX_FORMAT_VERSION = 7` 一致性），没有用真分片跑过字节级往返。
+
 ## 11. 实证结论（截至本次提交）
 
 已在本仓库验证（离线，`cargo test`）：

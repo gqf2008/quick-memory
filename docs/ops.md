@@ -72,6 +72,15 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 
 导出不含历史链与 commit log —— 它给的是内容，不是考古现场。要完整的历史请依赖桶的持久性与版本控制。
 
+## 验证状态
+
+代码已在**真实 S3 实现**（本地 MinIO）上验证过完整链路：条件写契约、多机并发提交（含真实 CAS 冲突重试）、
+多机检索与过期过滤、采集→编译→检索、跨机器读写与 handoff、export/import、`verify --strict`。
+细节与原始数字见 `design.md` §10.5。
+
+仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）与 **Quickwit 二进制产出的真实分片**。
+有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这两类后端差异。
+
 ## 完整性自检
 
 ```bash
