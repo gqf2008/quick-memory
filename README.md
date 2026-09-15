@@ -40,6 +40,10 @@ cargo run -p qm-cli --bin qm -- consolidate --session sess-1
 cargo run -p qm-cli --bin qm -- publish
 cargo run -p qm-cli --bin qm -- search "suite" --json
 cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
+
+# 自动采集：把 harness 的 lifecycle hook 指向它，事件 JSON 走 stdin
+echo "rolled back the index change" | cargo run -p qm-cli --bin qm -- hook --session sess-1
+cargo run -p qm-cli --bin qm -- hook-drain    # 桶恢复后重投本地 spool
 ```
 
 作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，

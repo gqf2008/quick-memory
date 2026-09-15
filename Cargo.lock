@@ -1410,6 +1410,7 @@ dependencies = [
  "qm-core",
  "qm-search",
  "qm-store",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

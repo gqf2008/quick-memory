@@ -216,6 +216,26 @@ qm sessions
 - 该测试用 `--synthetic-bucket`（进程内、非持久、**不是后端**，启动时向 stderr 打警告）。
   真后端仍由三个探针在带凭据时验证。
 
+## 6.9 自动采集（hook）与 fire-and-forget 契约
+
+记忆不应该依赖 agent"记得去记"。`qm hook` 从 stdin 读一个事件并落进会话链：
+
+```bash
+# harness 的 lifecycle hook 直接指向它，事件 JSON 走 stdin
+qm hook --event PostToolUse --session "$SESSION_ID" --actor codex < payload.json
+# 也可以用管道喂纯文本
+echo "rolled back the index change" | qm hook --session sess-1
+```
+
+- **永不阻塞、永不失败**：`--timeout-ms`（默认 200ms）内拿到桶就写入，否则**落本地 spool**并返回成功。
+  只有"连本地 spool 都写不了"才会报错。这条契约是针对 agent 生命周期钩子的：记忆不可用不能拖垮 agent。
+- **载荷容错**：JSON 里认 `session_id/session/conversation_id`、`hook_event_name/event/kind`、
+  `text/message/prompt/summary/tool_response/tool_input`；认不出来就整段当文本。会话 id 会被规范化成合法 key
+  （非法字符转 `-`，空则 `unattributed`），不让奇怪的 harness id 把事件丢掉。
+- **输入有界**：stdin 最多读 256 KiB（解析前的 DoS 闸门），随后仍要过入口的 16 KiB + 脱敏。
+- `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
+- 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
+
 ## 6.8 回收与保留（S5 已实现）
 
 对象都是不可变的，所以"删除"实际是"不再引用"，回收唯一安全的做法是**可达性分析**：
@@ -282,7 +302,9 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
 
-**S5（agent 可用面与回收，进行中）**
+**S5（agent 可用面、自动采集与回收，进行中）**
+
+- 自动采集：`qm hook` + `qm hook-drain`，fire-and-forget 契约（超时即 spool，永不阻塞 agent）。
 
 - 回收：可达性分析 + 宽限期 + dry-run 默认；live 页面、历史链、会话链在回收后仍可读。
 - 鉴权/凭据方案仍未定（Worker 网关 vs 每机全桶 token），是**决策项**而非实现项。

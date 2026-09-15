@@ -18,6 +18,7 @@ clap = { workspace = true }
 qm-core = { workspace = true }
 qm-search = { workspace = true }
 qm-store = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

@@ -89,6 +89,27 @@ pub enum Command {
     Compact,
     /// Show what the project currently contains.
     Status,
+    /// Capture an event from stdin, the way an agent lifecycle hook does.
+    Hook {
+        /// Event kind; overrides the kind found in the payload.
+        #[arg(long)]
+        event: Option<String>,
+        /// Session id; overrides the payload and `QM_SESSION`.
+        #[arg(long)]
+        session: Option<String>,
+        /// Actor recorded on the observation.
+        #[arg(long)]
+        actor: Option<String>,
+        /// How long to wait for the bucket before spooling instead.
+        #[arg(long, default_value_t = 200)]
+        timeout_ms: u64,
+    },
+    /// Replay events that were spooled because the bucket was unreachable.
+    HookDrain {
+        /// Maximum number of spooled events to attempt.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Reclaim unreachable objects (dry run unless `--apply`).
     Gc {
         /// Actually delete instead of reporting.
@@ -193,6 +214,8 @@ pub struct Context {
     pub writer: WriterId,
     /// Cache directory for materialised splits.
     pub cache_dir: PathBuf,
+    /// Where hook events are spooled when the bucket cannot be reached.
+    pub spool_dir: PathBuf,
     /// Timestamp recorded on this command's writes.
     pub now_ms: i64,
     /// Whether to render JSON.
@@ -213,9 +236,13 @@ impl Context {
         now_ms: i64,
         json: bool,
     ) -> Result<Self> {
+        let spool_dir = std::env::var("QM_SPOOL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("qm-spool"));
         Ok(Self {
             project: ProjectStore::new(Arc::clone(&bucket), "v1"),
             bucket,
+            spool_dir,
             workspace: WorkspaceId::new(workspace)?,
             project_id: ProjectId::new(project)?,
             writer: WriterId::new(writer)?,
@@ -520,6 +547,27 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 )
             })
         }
+        Command::Hook {
+            event,
+            session,
+            actor,
+            timeout_ms,
+        } => {
+            let raw = read_stdin_bounded(MAX_HOOK_INPUT_BYTES)?;
+            capture_hook_event(
+                &ctx,
+                session.as_deref(),
+                event.as_deref(),
+                actor.as_deref(),
+                &raw,
+                *timeout_ms,
+            )
+            .await
+        }
+        Command::HookDrain { limit } => {
+            let (drained, kept) = drain_spool(&ctx, *limit).await?;
+            Ok(format!("drained {drained} spooled event(s), kept {kept}"))
+        }
         Command::Gc { apply, grace_ms } => {
             let outcome = ctx
                 .project
@@ -635,6 +683,246 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
     }
+}
+
+/// Hard cap on hook input, applied before any parsing.
+pub const MAX_HOOK_INPUT_BYTES: usize = 256 * 1024;
+
+/// Read stdin, refusing to buffer more than `limit` bytes.
+fn read_stdin_bounded(limit: usize) -> Result<String> {
+    use std::io::Read as _;
+
+    let mut buffer = Vec::new();
+    std::io::stdin()
+        .take(limit as u64)
+        .read_to_end(&mut buffer)
+        .context("reading stdin")?;
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Map an arbitrary harness session id onto a valid key segment.
+///
+/// Hook payloads carry session ids in every shape imaginable (UUIDs, paths,
+/// `<harness>:<uuid>`). Rather than reject the event, normalise it: anything
+/// outside the safe alphabet becomes `-`, and an empty result falls back to
+/// `unattributed` so the event is still captured somewhere findable.
+#[must_use]
+pub fn normalize_session(raw: &str) -> String {
+    let mut out: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(128);
+    if out.is_empty() || out == "." || out == ".." {
+        out = "unattributed".to_string();
+    }
+    out
+}
+
+/// Extract `(session, kind, text)` from a hook payload.
+///
+/// Understands a JSON object with any of the common key spellings and falls
+/// back to treating the whole input as the event text. The scrubber still runs
+/// later, so nothing here decides what is safe to store.
+#[must_use]
+pub fn extract_hook_event(input: &str, default_session: Option<&str>) -> (String, String, String) {
+    let fallback_session = || default_session.unwrap_or("unattributed").to_string();
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(input)
+    else {
+        let text = input.trim().to_string();
+        return (fallback_session(), "message".to_string(), text);
+    };
+    let string_at = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| map.get(*key))
+            .and_then(|value| match value {
+                serde_json::Value::String(text) => Some(text.clone()),
+                serde_json::Value::Number(number) => Some(number.to_string()),
+                serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            })
+    };
+    let session = string_at(&["session_id", "session", "conversation_id"])
+        .or_else(|| default_session.map(ToString::to_string))
+        .unwrap_or_else(|| "unattributed".to_string());
+    let kind = string_at(&["kind", "event", "hook_event_name"])
+        .unwrap_or_else(|| "observation".to_string());
+    let text = string_at(&[
+        "text",
+        "message",
+        "prompt",
+        "summary",
+        "tool_response",
+        "tool_input",
+    ])
+    .unwrap_or_else(|| input.trim().to_string());
+    (session, kind, text)
+}
+
+/// Capture one hook event, spooling instead of failing.
+///
+/// This is the fire-and-forget contract in code: the event goes to the bucket
+/// when the bucket answers inside `timeout_ms`, and to the local spool
+/// otherwise. Either way the caller gets `Ok`, because an agent lifecycle hook
+/// must never be blocked or failed by memory being unreachable.
+///
+/// # Errors
+/// Only fails when the event cannot be recorded *anywhere* (invalid scope, or
+/// an unwritable spool directory).
+pub async fn capture_hook_event(
+    ctx: &Context,
+    session: Option<&str>,
+    kind: Option<&str>,
+    actor: Option<&str>,
+    raw: &str,
+    timeout_ms: u64,
+) -> Result<String> {
+    let default_session = session.map(ToString::to_string).or_else(|| {
+        std::env::var("QM_SESSION")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let (session_id, payload_kind, text) = extract_hook_event(raw, default_session.as_deref());
+    let session_id = SessionId::new(normalize_session(&session_id))?;
+    let kind = kind.unwrap_or(&payload_kind).to_string();
+    let actor = actor.unwrap_or("hook").to_string();
+    let observation = Observation {
+        schema: MANIFEST_SCHEMA,
+        observation_id: qm_core::derive_observation_id(
+            &session_id,
+            &actor,
+            &kind,
+            &text,
+            ctx.now_ms,
+        ),
+        session_id: session_id.clone(),
+        actor,
+        kind,
+        text,
+        created_at_ms: ctx.now_ms,
+    };
+    let request = IngestObservationsRequest {
+        workspace_id: ctx.workspace.clone(),
+        project_id: ctx.project_id.clone(),
+        session_id,
+        writer_id: ctx.writer.clone(),
+        observations: vec![observation.clone()],
+        now_ms: ctx.now_ms,
+    };
+    let attempt = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        ctx.project.ingest_observations(request),
+    )
+    .await;
+    match attempt {
+        Ok(Ok(outcome)) if !outcome.already_present => Ok(format!(
+            "captured {} observation(s), {} total",
+            outcome.accepted, outcome.count
+        )),
+        Ok(Ok(_)) => Ok("already captured".to_string()),
+        outcome => {
+            let spooled = spool_observation(ctx, &observation)?;
+            let reason = match outcome {
+                Ok(Err(error)) => error.to_string(),
+                _ => "timed out".to_string(),
+            };
+            Ok(format!("spooled ({reason}): {}", spooled.display()))
+        }
+    }
+}
+
+/// One spooled hook event, scoped so a drain never writes into the wrong project.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SpoolEntry {
+    workspace: String,
+    project: String,
+    observation: Observation,
+}
+
+/// Persist an event locally so a failed capture is retried later.
+fn spool_observation(ctx: &Context, observation: &Observation) -> Result<PathBuf> {
+    std::fs::create_dir_all(&ctx.spool_dir)
+        .with_context(|| format!("creating spool dir {}", ctx.spool_dir.display()))?;
+    let entry = SpoolEntry {
+        workspace: ctx.workspace.to_string(),
+        project: ctx.project_id.to_string(),
+        observation: observation.clone(),
+    };
+    let name = format!(
+        "{}-{}-{}.json",
+        ctx.now_ms,
+        std::process::id(),
+        observation
+            .observation_id
+            .chars()
+            .take(16)
+            .collect::<String>()
+    );
+    let target = ctx.spool_dir.join(name);
+    let tmp = ctx.spool_dir.join(format!(
+        ".tmp-{}",
+        target.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, serde_json::to_vec(&entry)?).context("writing spool file")?;
+    std::fs::rename(&tmp, &target).context("publishing spool file")?;
+    Ok(target)
+}
+
+/// Replay spooled events, deleting each one only after it is stored.
+async fn drain_spool(ctx: &Context, limit: usize) -> Result<(usize, usize)> {
+    let Ok(entries) = std::fs::read_dir(&ctx.spool_dir) else {
+        return Ok((0, 0));
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+
+    let mut drained = 0usize;
+    let mut kept = 0usize;
+    for path in files.into_iter().take(limit) {
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let entry: SpoolEntry = match serde_json::from_slice(&bytes) {
+            Ok(entry) => entry,
+            Err(_) => {
+                // An unreadable spool file must not block the queue forever.
+                kept += 1;
+                continue;
+            }
+        };
+        if entry.workspace != ctx.workspace.to_string()
+            || entry.project != ctx.project_id.to_string()
+        {
+            kept += 1;
+            continue;
+        }
+        let request = IngestObservationsRequest {
+            workspace_id: ctx.workspace.clone(),
+            project_id: ctx.project_id.clone(),
+            session_id: entry.observation.session_id.clone(),
+            writer_id: ctx.writer.clone(),
+            observations: vec![entry.observation.clone()],
+            now_ms: ctx.now_ms,
+        };
+        match ctx.project.ingest_observations(request).await {
+            Ok(_) => {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                drained += 1;
+            }
+            Err(_) => kept += 1,
+        }
+    }
+    Ok((drained, kept))
 }
 
 fn read_stdin() -> Result<String> {
@@ -829,6 +1117,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page, "leader election");
+    }
+
+    #[test]
+    fn hook_payloads_are_extracted_and_session_ids_normalized() {
+        let payload = r#"{"session_id":"codex:01J/2","hook_event_name":"PostToolUse","tool_response":"cargo t passed"}"#;
+        let (session, kind, text) = extract_hook_event(payload, None);
+        assert_eq!(session, "codex:01J/2");
+        assert_eq!(kind, "PostToolUse");
+        assert_eq!(text, "cargo t passed");
+
+        // Plain text is the whole event, and the default session applies.
+        let (session, kind, text) = extract_hook_event("ran the suite", Some("sess-9"));
+        assert_eq!(session, "sess-9");
+        assert_eq!(kind, "message");
+        assert_eq!(text, "ran the suite");
+
+        // Unknown JSON shape still gets captured somewhere findable.
+        let (session, kind, _) = extract_hook_event(r#"{"unexpected":true}"#, None);
+        assert_eq!(session, "unattributed");
+        assert_eq!(kind, "observation");
+        assert_eq!(normalize_session("codex:01J/2"), "codex-01J-2");
+        assert_eq!(normalize_session("  "), "unattributed");
+        assert_eq!(normalize_session(".."), "unattributed");
+    }
+
+    #[tokio::test]
+    async fn a_hook_spools_when_the_bucket_is_unreachable_and_drains_later() {
+        // A store pointed at a closed port: every write fails, quickly.
+        let unreachable: Arc<dyn ObjectStore> = Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_bucket_name("unreachable")
+                .with_region("auto")
+                .with_endpoint("http://127.0.0.1:1")
+                .with_allow_http(true)
+                .with_access_key_id("test")
+                .with_secret_access_key("test")
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 0,
+                    ..Default::default()
+                })
+                .build()
+                .unwrap(),
+        );
+        let spool = TempDir::new().unwrap();
+        let mut ctx = context(unreachable, &TempDir::new().unwrap());
+        ctx.spool_dir = spool.path().to_path_buf();
+
+        let outcome = capture_hook_event(
+            &ctx,
+            Some("sess-hook"),
+            None,
+            Some("codex"),
+            r#"{"session_id":"sess-hook","hook_event_name":"PostToolUse","tool_response":"cargo t passed"}"#,
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.starts_with("spooled"), "{outcome}");
+        assert_eq!(
+            std::fs::read_dir(spool.path()).unwrap().count(),
+            1,
+            "the event must be persisted locally"
+        );
+
+        // The same machine, now able to reach a working bucket, drains it.
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut live = context(Arc::clone(&bucket), &TempDir::new().unwrap());
+        live.spool_dir = spool.path().to_path_buf();
+        let outcome = execute(&cli(&["hook-drain"]), live).await.unwrap();
+        assert!(outcome.contains("drained 1"), "{outcome}");
+        assert_eq!(
+            std::fs::read_dir(spool.path()).unwrap().count(),
+            0,
+            "a drained event must leave the spool"
+        );
+
+        let session = SessionId::new("sess-hook").unwrap();
+        let observed = {
+            let ctx = context(Arc::clone(&bucket), &TempDir::new().unwrap());
+            ctx.project
+                .read_session_observations(&ctx.workspace, &ctx.project_id, &session)
+                .await
+                .unwrap()
+        };
+        assert_eq!(observed.len(), 1);
+        assert!(observed[0].text.contains("cargo t passed"));
+        assert_eq!(observed[0].actor, "codex");
     }
 
     #[test]
