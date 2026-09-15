@@ -3374,6 +3374,89 @@ mod tests {
                 .any(|hit| hit.path == PARAPHRASE.0 && hit.streams.contains(&"vector".to_string())),
             "the rebuilt split must still carry embeddings: {outcome:?}"
         );
+
+        // Compaction is a write path like publish, and it must state the
+        // provenance of the vectors it just rebuilt — otherwise a split could
+        // carry vectors whose origin nothing records, which is the hole this
+        // feature closes. Premise first: the rebuild really did replace the
+        // catalog with one split.
+        assert_eq!(splits_in_catalog(&bucket, &workspace, &project_id).await, 1);
+        let prefix = reader(&bucket)
+            .load_catalog(&workspace, &project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits[0]
+            .prefix
+            .clone();
+        let materialised = TempDir::new().unwrap();
+        materialize(&bucket, &prefix, materialised.path())
+            .await
+            .unwrap();
+        let recorded = read_split_identity(materialised.path())
+            .unwrap()
+            .expect("a compacted split records the embedder that rebuilt it");
+        assert_eq!(recorded.provider, "fake");
+        assert_eq!(recorded.model, "fake-model");
+        assert_eq!(recorded.dim, 4);
+    }
+
+    /// Without a provider there is nothing to state: no vectors, no record,
+    /// and nothing for the read path to judge — the keyword streams carry the
+    /// corpus exactly as before this feature.
+    #[tokio::test]
+    async fn a_split_built_without_a_provider_carries_no_record() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let build_root = TempDir::new().unwrap();
+        publish_pages(
+            &bucket,
+            &workspace,
+            &project_id,
+            build_root.path(),
+            &corpus(),
+            None,
+        )
+        .await;
+
+        // Premise: the split was published and holds no vector column, so it
+        // has no provenance to record.
+        assert_eq!(splits_in_catalog(&bucket, &workspace, &project_id).await, 1);
+        let prefix = reader(&bucket)
+            .load_catalog(&workspace, &project_id)
+            .await
+            .unwrap()
+            .catalog
+            .splits[0]
+            .prefix
+            .clone();
+        let materialised = TempDir::new().unwrap();
+        materialize(&bucket, &prefix, materialised.path())
+            .await
+            .unwrap();
+        assert!(
+            !materialised.path().join(SPLIT_IDENTITY_FILE).exists(),
+            "a split with no vectors must not claim an embedder"
+        );
+
+        // Conclusion: a machine that *does* have a provider still searches the
+        // corpus. There is nothing to compare, so nothing is refused, and the
+        // keyword streams answer on their own.
+        let late = FakeEmbedder::new(4, orthogonal())
+            .model("model-a")
+            .answer(QUERY, vec![query_vector()]);
+        let outcome =
+            search_with_embedder(&bucket, &workspace, &project_id, QUERY, Some(&late)).await;
+        assert_eq!(
+            outcome.stream_candidates.get("vector"),
+            None,
+            "a split with no vector column contributes nothing: {outcome:?}"
+        );
+        assert!(
+            outcome.hits.iter().any(|hit| hit.path == KEYWORD.0),
+            "the keyword stream must still answer: {outcome:?}"
+        );
     }
 
     /// The published split states which embedder built its vectors, and a
