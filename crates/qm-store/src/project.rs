@@ -6426,6 +6426,129 @@ mod tests {
         assert_eq!(outcome.manifest_seq, paths as u64 + 1);
     }
 
+    /// A root that points at the wrong bytes must be refused, not believed.
+    ///
+    /// The shard key *is* its content hash, so this is the one way a root can
+    /// name a state that does not exist: leave the layout alone and replace the
+    /// object behind it. The replacement is deliberately *layout-legal* — the
+    /// same path, so it hashes to the same shard, and only its `seq` moves —
+    /// because that leaves the byte check as the only guard that can notice. A
+    /// tamper that also broke the layout would be caught by `materialize`, and
+    /// then this test would pass without the hash check being there.
+    #[tokio::test]
+    async fn a_shard_that_is_not_what_the_root_names_is_refused() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = shard_machine(&bucket);
+        store
+            .commit_page(request("mbp-a", "notes/a.md", "v1", 1_000))
+            .await
+            .unwrap();
+        let root = store
+            .load(&ws(), &proj())
+            .await
+            .unwrap()
+            .root
+            .clone()
+            .expect("the premise: the scope is sharded");
+        let reference = root.shards[0].clone();
+
+        let before = store.load(&ws(), &proj()).await.unwrap();
+        let (path, entry) = before
+            .manifest
+            .pages
+            .iter()
+            .next()
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .expect("the premise: the scope has a page");
+        assert_eq!(
+            manifest_shard_index(&path),
+            reference.shard,
+            "the premise: the page's own shard is the one being replaced"
+        );
+        let mut tampered = ManifestShard::empty(ws(), proj(), reference.shard);
+        tampered.pages.insert(
+            path,
+            PageEntry {
+                seq: entry.seq + 1_000,
+                ..entry
+            },
+        );
+        bucket
+            .put(
+                &Path::from(reference.key.clone()),
+                Bytes::from(serde_json::to_vec(&tampered).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+
+        let error = store.load(&ws(), &proj()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("hashes to"),
+            "the reader has to notice the object is not the one the root named: {error}"
+        );
+
+        // The whole-form reader refuses the same bucket for the same reason,
+        // and `verify` reports it rather than passing the scope as healthy.
+        let report = machine(&bucket)
+            .verify_project(&ws(), &proj())
+            .await
+            .unwrap();
+        assert!(
+            !report.ok(),
+            "a root pointing at replaced bytes is not a healthy scope"
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.detail.contains("hashes to")),
+            "{:?}",
+            report.problems
+        );
+    }
+
+    /// A root that advertises a recovery point which is gone is reported.
+    #[tokio::test]
+    async fn a_migration_whose_archive_is_gone_is_reported() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        seed_whole(&store, 3).await;
+        let migration = store
+            .migrate_manifest_to_sharded(&ws(), &proj())
+            .await
+            .unwrap();
+        let archive = migration.archive.clone().unwrap();
+        assert!(
+            store.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "the premise: a fresh migration verifies"
+        );
+
+        bucket.delete(&Path::from(archive.clone())).await.unwrap();
+        let report = store.verify_project(&ws(), &proj()).await.unwrap();
+        let problem = report
+            .problems
+            .iter()
+            .find(|problem| problem.kind == "manifest_predecessor")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the missing archive must be reported: {:?}",
+                    report.problems
+                )
+            });
+        assert!(problem.detail.contains("cannot be read"), "{problem:?}");
+        assert_eq!(problem.subject, archive);
+        // Reading still works: the archive is a recovery point, not part of the
+        // state a reader needs.
+        assert_eq!(
+            store
+                .recent_pages(&ws(), &proj(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
     /// Seed `count` committed paths into a whole-form scope.
     async fn seed_whole(store: &ProjectStore, count: usize) {
         for index in 0..count {
