@@ -3369,6 +3369,32 @@ mod tests {
         refused_put: Mutex<Option<String>>,
         /// Puts this bucket accepted, in order, since the last [`Self::reset`].
         written: Mutex<Vec<String>>,
+        /// Whether reads stagger before they reach the bucket.
+        ///
+        /// The stagger is what makes read overlap observable and what decides
+        /// the order completions come back in, and its length is the read's
+        /// position in the stream of reads — so it costs more the longer a
+        /// test runs. A contended run of thousands of reads wants the overlap
+        /// and not the ordering, and pays for that with one suspension per
+        /// operation ([`Self::interleave_operations`]) instead.
+        stagger_reads: AtomicBool,
+        /// Whether every object-store operation suspends once before it
+        /// reaches the bucket.
+        ///
+        /// A real bucket suspends on the round trip and interleaves writers for
+        /// free; `InMemory` does not, so a test that wants writers to meet at
+        /// the commit point has to ask for the suspension. It is a yield, not a
+        /// wait: it moves nothing in time and it makes no clock part of the
+        /// assertion, it only lets the other writers on the same runtime run.
+        interleave: AtomicBool,
+        /// Puts offered to the commit point, counted whether or not the bucket
+        /// accepted them. A commit retries by offering another one, so this is
+        /// the attempts number the retry cost is measured in.
+        manifest_puts: AtomicUsize,
+        /// Commit-point puts the bucket turned down because the version they
+        /// carried was no longer current — one per retry, since nothing else
+        /// makes a writer come back.
+        manifest_rejections: AtomicUsize,
         order: CompletionOrder,
     }
 
@@ -3416,6 +3442,10 @@ mod tests {
                 observations: Mutex::new(Vec::new()),
                 refused_put: Mutex::new(None),
                 written: Mutex::new(Vec::new()),
+                interleave: AtomicBool::new(false),
+                stagger_reads: AtomicBool::new(true),
+                manifest_puts: AtomicUsize::new(0),
+                manifest_rejections: AtomicUsize::new(0),
                 order,
             })
         }
@@ -3479,6 +3509,26 @@ mod tests {
             self.written.lock().unwrap().clone()
         }
 
+        /// Make every operation suspend once before it reaches the bucket, so
+        /// that writers sharing one runtime interleave at the commit point, and
+        /// drop the per-read stagger that would otherwise cost more with every
+        /// read the run makes.
+        fn interleave_operations(&self) {
+            self.interleave.store(true, AtomicOrdering::SeqCst);
+            self.stagger_reads.store(false, AtomicOrdering::SeqCst);
+        }
+
+        /// Puts offered to the commit point since the last [`Self::reset`].
+        fn manifest_puts(&self) -> usize {
+            self.manifest_puts.load(AtomicOrdering::SeqCst)
+        }
+
+        /// Commit-point puts the bucket turned down since the last
+        /// [`Self::reset`].
+        fn manifest_rejections(&self) -> usize {
+            self.manifest_rejections.load(AtomicOrdering::SeqCst)
+        }
+
         /// Reads issued since the last [`Self::reset`].
         fn reads(&self) -> usize {
             self.reads.load(AtomicOrdering::SeqCst)
@@ -3508,15 +3558,17 @@ mod tests {
         /// neither re-enter this instrumentation nor disturb the counters of
         /// the call they are attached to.
         async fn after_manifest_put(&self, committed: bool) {
-            let probe = {
+            // The observer is only built when a test armed it. It reads the
+            // whole scope, which a contended run pays once per commit-point
+            // put; charging that to a test that never looks at it would make
+            // the observation fixture the most expensive thing in the suite.
+            if self.watch_manifest_puts.load(AtomicOrdering::SeqCst) {
                 let other: Arc<dyn ObjectStore> = Arc::clone(&self.inner) as Arc<dyn ObjectStore>;
-                machine(&other)
+                let probe = machine(&other)
                     .recent_pages(&ws(), &proj(), usize::MAX)
                     .await
                     .map(|pages| pages.len())
-                    .map_err(|error| error.to_string())
-            };
-            if self.watch_manifest_puts.load(AtomicOrdering::SeqCst) {
+                    .map_err(|error| error.to_string());
                 self.observations.lock().unwrap().push(probe);
             }
             // Only a put that landed can have moved the commit point, so a
@@ -3546,6 +3598,8 @@ mod tests {
             self.watch_manifest_puts
                 .store(false, AtomicOrdering::SeqCst);
             self.observations.lock().unwrap().clear();
+            self.manifest_puts.store(0, AtomicOrdering::SeqCst);
+            self.manifest_rejections.store(0, AtomicOrdering::SeqCst);
         }
     }
 
@@ -3682,8 +3736,29 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(location.as_ref().to_string());
+                let is_manifest = location.as_ref().ends_with("/manifest.json");
+                if is_manifest {
+                    self.manifest_puts.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                if self.interleave.load(AtomicOrdering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
                 let result = self.inner.put_opts(location, payload, opts).await;
-                if location.as_ref().ends_with("/manifest.json") {
+                if is_manifest {
+                    // The three shapes a conditional write comes back in when
+                    // the version it carried is not the current one. The store
+                    // retries on the first two; counting all three here is what
+                    // makes "one retry, one rejected put" a statement about the
+                    // bucket rather than about the store's own bookkeeping.
+                    if matches!(
+                        &result,
+                        Err(object_store::Error::Precondition { .. }
+                            | object_store::Error::AlreadyExists { .. }
+                            | object_store::Error::NotFound { .. })
+                    ) {
+                        self.manifest_rejections
+                            .fetch_add(1, AtomicOrdering::SeqCst);
+                    }
                     self.after_manifest_put(result.is_ok()).await;
                 }
                 result
@@ -3720,6 +3795,9 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move {
+                if self.interleave.load(AtomicOrdering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
                 let now = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
                 self.max_in_flight.fetch_max(now, AtomicOrdering::SeqCst);
                 self.reads.fetch_add(1, AtomicOrdering::SeqCst);
@@ -3734,14 +3812,18 @@ mod tests {
                 // overlap observable at all: without a suspension each future
                 // runs to completion inside the poll that starts it, and even a
                 // genuinely concurrent reader would never show two in flight.
-                let booking = self.bookings.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                let position = commit_seq_in(location.as_ref()).unwrap_or(booking);
-                let stagger = match self.order {
-                    CompletionOrder::OldestFirst => position,
-                    CompletionOrder::NewestFirst => REVERSED_STAGGER_SPAN.saturating_sub(position),
-                };
-                for _ in 0..stagger {
-                    tokio::task::yield_now().await;
+                if self.stagger_reads.load(AtomicOrdering::SeqCst) {
+                    let booking = self.bookings.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    let position = commit_seq_in(location.as_ref()).unwrap_or(booking);
+                    let stagger = match self.order {
+                        CompletionOrder::OldestFirst => position,
+                        CompletionOrder::NewestFirst => {
+                            REVERSED_STAGGER_SPAN.saturating_sub(position)
+                        }
+                    };
+                    for _ in 0..stagger {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 if self.vanished.lock().unwrap().remove(location.as_ref()) {
                     // The listing named this object a moment ago; it is gone by
@@ -8336,6 +8418,345 @@ mod tests {
         assert!(
             first.len() + second.len() > MANIFEST_MAX_BYTES,
             "the premise: the two shards really do add up past one object"
+        );
+    }
+    /// The conversion, and what the run looked like from inside it.
+    #[derive(Debug, Clone)]
+    struct Conversion {
+        /// What the conversion reported.
+        outcome: MigrateOutcome,
+        /// Commits confirmed when the actor woke up, i.e. when the conversion
+        /// started moving.
+        started_at: usize,
+        /// Commits confirmed when the conversion committed. Everything between
+        /// the two landed while it was running, which is the pressure it has to
+        /// survive: each of those commits invalidates an offering it had
+        /// already read from.
+        finished_at: usize,
+    }
+
+    /// What one writer did over the whole run.
+    #[derive(Debug, Clone)]
+    struct WriterRun {
+        /// Rounds it had to hand to the switched client because the whole-form
+        /// store was refused — a client that has not been switched over is
+        /// refused once the commit point is a root.
+        switched: usize,
+        /// Attempts its successful commits consumed, retries included, as the
+        /// commits themselves report them.
+        attempts: u32,
+        /// The most attempts any one of its commits needed.
+        max_attempts: u32,
+        /// The conversion, for the one actor that runs it.
+        conversion: Option<Conversion>,
+    }
+
+    /// A commit that returned success, kept so the run can be checked against
+    /// what it was told rather than against what happens to be readable.
+    type Confirmed = (String, String, u64, PageId);
+
+    /// Sustained contention: every writer keeps committing to one scope, and
+    /// the whole-to-sharded conversion lands in the middle of the run.
+    ///
+    /// The race tests above pick a timing each. This one picks nothing: the
+    /// writers run to their own finish lines, the bucket suspends on every
+    /// operation so they really do meet at the commit point, and the conflict
+    /// count is whatever that interleaving produces. What the assertions hold
+    /// fixed is what has to stay true however the schedule falls — no write
+    /// that returned success is missing, the sequence numbers are exactly
+    /// `1..=wins`, the commit point names exactly what the writers were told
+    /// they won, and the scope is intact in the form the conversion left it.
+    ///
+    /// Nothing waits. `yield_now` moves no clock, and the single-threaded
+    /// runtime makes the schedule reproducible instead of hoped for. The
+    /// counts at the end are properties of that schedule rather than of the
+    /// store's own bookkeeping, so they are asserted as the exact numbers they
+    /// are: a run that stops contending, or a conversion that stops losing
+    /// races, is a change in the subject of the measurement rather than
+    /// something to discover later from a report.
+    ///
+    /// The shape those numbers have is worth reading carefully, because it is a
+    /// property of a fair single-threaded schedule and not of object storage.
+    /// The conversion writes every shard before it can offer its commit point,
+    /// so under eight writers it never gets the window: it loses the offering,
+    /// reads again, writes the shards again — and commits only once the writers
+    /// have stopped. On a bucket the two sides' shard writes overlap, which is
+    /// a different race than the one this schedule can express; see the
+    /// pressure note in `docs/ops.md`.
+    #[tokio::test]
+    async fn sustained_contention_keeps_every_commit_and_every_sequence() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 50;
+        const WINS: usize = WRITERS * ROUNDS;
+
+        let bucket = CountingStore::new();
+        bucket.interleave_operations();
+        let other = as_store(&bucket);
+        let confirmed: Arc<Mutex<Vec<Confirmed>>> = Arc::new(Mutex::new(Vec::new()));
+        // Commits that have returned success so far, which is what the
+        // conversion actor waits on and how much pressure it was under.
+        let done: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        // The conversion is its own actor, waiting for the run to be half done.
+        // It has to be its own actor: a writer only reaches the top of its loop
+        // between rounds, and a single round is allowed to spend hundreds of
+        // attempts, so a writer-triggered conversion waits for a gap that a
+        // contended run may not have until it is over.
+        let converter = {
+            let other = Arc::clone(&other);
+            let confirmed = Arc::clone(&confirmed);
+            let done = Arc::clone(&done);
+            async move {
+                let mut waited = 0usize;
+                while done.load(AtomicOrdering::SeqCst) < WINS / 2 {
+                    waited += 1;
+                    assert!(
+                        waited < 10_000_000,
+                        "the writers stopped making progress: {} committed",
+                        done.load(AtomicOrdering::SeqCst)
+                    );
+                    tokio::task::yield_now().await;
+                }
+                let started_at = done.load(AtomicOrdering::SeqCst);
+                let whole = machine(&other);
+                let outcome = whole
+                    .migrate_manifest_to_sharded(&ws(), &proj())
+                    .await
+                    .expect("the conversion has to commit");
+                let finished_at = done.load(AtomicOrdering::SeqCst);
+
+                // Everything confirmed as of the instant the flip returned is
+                // still readable. A conversion that cost a caller a write it
+                // had been told was durable would be the one failure this form
+                // change may not have.
+                let settled = confirmed.lock().unwrap().clone();
+                for (path, body, _, _) in &settled {
+                    let page = whole
+                        .read_page(&ws(), &proj(), &PagePath::new(path).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("the conversion lost {path}"));
+                    assert_eq!(&page.body, body, "the conversion lost {path}'s body");
+                }
+                WriterRun {
+                    switched: 0,
+                    attempts: 0,
+                    max_attempts: 0,
+                    conversion: Some(Conversion {
+                        outcome,
+                        started_at,
+                        finished_at,
+                    }),
+                }
+            }
+        };
+
+        let mut actors: Vec<Pin<Box<dyn Future<Output = WriterRun>>>> = Vec::new();
+        for writer in 0..WRITERS {
+            let other = Arc::clone(&other);
+            let confirmed = Arc::clone(&confirmed);
+            let done = Arc::clone(&done);
+            actors.push(Box::pin(async move {
+                // The client as deployed before the conversion, and the one it
+                // is switched to afterwards. Both point at the same bucket.
+                let whole = machine(&other);
+                let sharded = machine_with_format(&other, qm_core::MANIFEST_FORMAT_SHARDED);
+                let mut run = WriterRun {
+                    switched: 0,
+                    attempts: 0,
+                    max_attempts: 0,
+                    conversion: None,
+                };
+
+                for round in 0..ROUNDS {
+                    let path = format!("notes/w{writer:02}-r{round:03}.md");
+                    let body = format!("body w{writer} r{round}");
+                    let write = request(
+                        &format!("mbp-{writer:02}"),
+                        &path,
+                        &body,
+                        5_000 + round as i64,
+                    );
+                    let outcome = match whole.commit_page(write.clone()).await {
+                        Ok(outcome) => outcome,
+                        // A client that has not been switched over yet is
+                        // refused, loudly, before it writes anything and
+                        // without consuming a sequence. The switched client is
+                        // what carries the round from there.
+                        Err(StoreError::ManifestFormMismatch { .. }) => {
+                            run.switched += 1;
+                            sharded
+                                .commit_page(write)
+                                .await
+                                .expect("the switched client has to be able to append")
+                        }
+                        Err(error) => panic!("writer {writer} round {round} failed: {error}"),
+                    };
+                    run.attempts += outcome.attempts;
+                    run.max_attempts = run.max_attempts.max(outcome.attempts);
+                    confirmed.lock().unwrap().push((
+                        path,
+                        body,
+                        outcome.manifest_seq,
+                        outcome.page_id,
+                    ));
+                    done.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                run
+            }));
+        }
+        actors.push(Box::pin(converter));
+        let runs: Vec<WriterRun> = futures::future::join_all(actors).await;
+
+        let confirmed = confirmed.lock().unwrap().clone();
+        assert_eq!(
+            confirmed.len(),
+            WINS,
+            "every round of every writer has to have committed"
+        );
+
+        // No lost write: each commit that returned success is readable, and it
+        // is the version that was committed, not a later one wearing its path.
+        for (path, body, _, page_id) in &confirmed {
+            let page = machine(&other)
+                .read_page(&ws(), &proj(), &PagePath::new(path).unwrap())
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{path} was confirmed and is not there"));
+            assert_eq!(&page.body, body, "{path} came back with another body");
+            assert_eq!(
+                &page.page_id, page_id,
+                "{path} came back as another version"
+            );
+        }
+
+        // The sequences are a permutation of 1..=WINS, and the commit point
+        // names exactly the paths that were confirmed, with exactly the
+        // sequences they were given: no hole, no repeat, nothing extra.
+        let reader = machine(&other);
+        let loaded = reader.load(&ws(), &proj()).await.unwrap();
+        let mut seqs: Vec<u64> = loaded
+            .manifest
+            .pages
+            .values()
+            .map(|entry| entry.seq)
+            .collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (1..=WINS as u64).collect::<Vec<u64>>(),
+            "the sequences are not 1..={WINS} exactly once each"
+        );
+        let mut committed: Vec<(String, u64)> = loaded
+            .manifest
+            .pages
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.seq))
+            .collect();
+        committed.sort();
+        let mut won: Vec<(String, u64)> = confirmed
+            .iter()
+            .map(|(path, _, seq, _)| (path.clone(), *seq))
+            .collect();
+        won.sort();
+        assert_eq!(
+            committed, won,
+            "the commit point is not the set the writers were told they won"
+        );
+
+        // The conversion ran once, converted, and archived what it converted.
+        let conversions: Vec<&Conversion> = runs
+            .iter()
+            .filter_map(|run| run.conversion.as_ref())
+            .collect();
+        assert_eq!(conversions.len(), 1, "exactly one actor converts");
+        let conversion = conversions[0];
+        let migration = &conversion.outcome;
+        assert_eq!(migration.from, qm_core::MANIFEST_FORMAT_WHOLE);
+        assert_eq!(migration.to, qm_core::MANIFEST_FORMAT_SHARDED);
+        assert!(!migration.already_there, "the conversion has work to do");
+        assert!(migration.archive.is_some(), "the whole body is archived");
+
+        let root = loaded.root.clone().expect("the scope is sharded at rest");
+        assert_eq!(
+            root.shards
+                .iter()
+                .map(|reference| reference.path_count)
+                .sum::<usize>(),
+            WINS,
+            "every confirmed path is named by exactly one shard"
+        );
+        assert!(
+            reader.verify_project(&ws(), &proj()).await.unwrap().ok(),
+            "the scope the pressure left behind is intact, not merely readable"
+        );
+
+        // Retry cost, measured at the bucket rather than taken from the store's
+        // own bookkeeping: the bucket counts every offering and every refusal,
+        // so what it saw has to be one accepted offering per winning commit
+        // plus one for the conversion, and the rest are retries. A store that
+        // quietly skipped a refused offering would still report a plausible
+        // `attempts` per commit; this count would not agree with the commit
+        // point's own history.
+        let puts = bucket.manifest_puts();
+        let rejections = bucket.manifest_rejections();
+        let reported: u32 = runs.iter().map(|run| run.attempts).sum::<u32>() + migration.attempts;
+        let switched: usize = runs.iter().map(|run| run.switched).sum();
+        let max_attempts = runs
+            .iter()
+            .map(|run| run.max_attempts)
+            .max()
+            .unwrap_or(0)
+            .max(migration.attempts);
+
+        println!(
+            "stress writers={WRITERS} rounds={ROUNDS} wins={WINS} \
+             manifest_puts={puts} rejections={rejections} reported_attempts={reported} \
+             mean_puts_per_win={:.3} max_attempts={max_attempts} switched={switched} \
+             migration_attempts={} migration_seq={} conversion_started_at={} \
+             conversion_finished_at={}",
+            f64::from(u32::try_from(puts).unwrap_or(u32::MAX)) / WINS as f64,
+            migration.attempts,
+            migration.manifest_seq,
+            conversion.started_at,
+            conversion.finished_at,
+        );
+
+        assert_eq!(
+            puts - rejections,
+            WINS + 1,
+            "the commit point accepted one offering per win plus the conversion's"
+        );
+        assert_eq!(
+            rejections, 1180,
+            "the run has to contend as much as it did: {rejections} refusals"
+        );
+        assert_eq!(
+            puts, 1581,
+            "the offering count is what the contention cost: {puts}"
+        );
+        // The conversion is starved by sustained writers rather than merely
+        // slowed: it has to write every shard before it can offer its commit
+        // point, and a writer lands inside that window every time. What must
+        // hold is that the writers kept landing while it ran — the other half
+        // of the run — and that it converged on the state it actually found.
+        assert_eq!(
+            conversion.started_at,
+            WINS / 2,
+            "the conversion starts when half the run is in"
+        );
+        assert_eq!(
+            conversion.finished_at, WINS,
+            "on this schedule the conversion commits only after the run's last \
+             commit: it keeps losing the commit point to the writers"
+        );
+        assert_eq!(
+            migration.attempts, 5,
+            "the conversion lost four offerings to the writers"
+        );
+        assert_eq!(
+            migration.manifest_seq as usize, WINS,
+            "the conversion committed the sequence the run ended on"
         );
     }
 }
