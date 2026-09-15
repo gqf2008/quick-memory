@@ -3862,6 +3862,15 @@ mod tests {
     /// test harness's own output.
     const CHILD_MARKER: &str = "VECTOR_E2E_REPORT:";
 
+    /// How long the stub waits for a client to finish sending one request.
+    ///
+    /// A client that connects and then stalls is the only way this
+    /// single-threaded accept loop could block forever, and the parent waits on
+    /// the child with no deadline of its own. The deadline turns that stall into
+    /// a short request, which [`answer`] turns into a 400 the child fails on.
+    /// Generous next to a loopback round trip, so a healthy run cannot reach it.
+    const STUB_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// One request, as it arrived.
     #[derive(Debug, Clone)]
     struct SeenRequest {
@@ -3911,6 +3920,10 @@ mod tests {
                             break;
                         }
                         let Ok(mut stream) = stream else { break };
+                        // Bound the read: a client that connects and stops
+                        // talking would otherwise pin this loop, and the parent
+                        // has no deadline of its own to fall back on.
+                        let _ = stream.set_read_timeout(Some(STUB_READ_TIMEOUT));
                         let (record, response) = answer(&read_request(&mut stream));
                         seen.lock().expect("the stub's request log").push(record);
                         // Answer before anything else can go wrong here: a
@@ -4131,17 +4144,18 @@ mod tests {
     /// it proves is that a configured process, a real HTTP provider and the
     /// split record fit together.
     ///
-    /// Nothing here is timed: the wait for the child is a plain `output()`,
+    /// The wait for the child is a plain `output()` with no deadline of its own,
     /// because every step the child takes is either local or answered by a stub
-    /// that always responds — including when it refuses a request. A stub that
-    /// died mid-request closes the connection and the child fails on it, so a
-    /// missing answer is an error rather than a wait.
+    /// that always responds — including when it refuses a request. Two things
+    /// keep that true: a stub that died mid-request closes the connection, and
+    /// the stub reads with a deadline ([`STUB_READ_TIMEOUT`]), so a client that
+    /// connects and stalls becomes a 400 instead of pinning the accept loop.
+    /// Either way a missing answer is an error rather than a wait.
     #[test]
     fn a_configured_process_runs_the_whole_vector_chain_over_real_http() {
         let stub = StubModel::start();
         let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
             .args([
-                "--ignored",
                 "child_runs_the_configured_vector_chain",
                 "--nocapture",
                 "--test-threads=1",
@@ -4160,15 +4174,21 @@ mod tests {
         // Premises: the child really ran, and it ran exactly the one test it was
         // asked for and reached the end of the chain.
         assert!(child.status.success(), "the child chain failed:\n{stderr}");
+        // One test ran, and it ran rather than being ignored. A name that
+        // matched nothing would report `0 passed`; a chain that quietly stopped
+        // walking would still say `1 passed`, which is why the report below has
+        // to be present and the step receipt complete.
         assert!(
-            stdout.contains("1 passed"),
-            "the child must run exactly `child_runs_the_configured_vector_chain`:\n{stdout}"
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "the child must run exactly `child_runs_the_configured_vector_chain`, and run it:\n{stdout}"
         );
         // The harness prints the test's name and then, under `--nocapture`, the
         // captured output on the same line, so the marker is found rather than
         // anchored — and the report ends where that line does.
         let report: serde_json::Value = {
-            let start = stdout.find(CHILD_MARKER).expect("the child's report") + CHILD_MARKER.len();
+            let start = stdout.find(CHILD_MARKER).unwrap_or_else(|| {
+                panic!("the child never wrote its report, so it did not walk the chain:\n{stdout}\n{stderr}")
+            }) + CHILD_MARKER.len();
             let rest = &stdout[start..];
             let line = rest.split('\n').next().unwrap_or(rest);
             serde_json::from_str(line).expect("the child's report must be JSON")
@@ -4262,21 +4282,27 @@ mod tests {
     /// the environment at spawn time.
     ///
     /// Not runnable on its own — it needs `QM_EMBEDDING_*` pointing at a stub
-    /// that only the parent process runs. `#[ignore]` keeps it out of the
-    /// ordinary suite, and `QM_E2E_CHILD`, which only the parent sets, is the
-    /// first thing checked, so `cargo test -- --ignored` fails loudly here
-    /// rather than reaching out to whatever endpoint a developer's shell
-    /// happens to export.
+    /// that only the parent process runs. `QM_E2E_CHILD`, which only the parent
+    /// sets, is the first thing checked, and without it this says so on stderr
+    /// and returns rather than reaching out to whatever endpoint a developer's
+    /// shell happens to export.
+    ///
+    /// It is deliberately *not* `#[ignore]`d. The ordinary suite runs it too,
+    /// where the missing-premises branch reports that it was skipped, and
+    /// the parent drives it by name in a child process where the premises are
+    /// real. An `#[ignore]` would hide the skip in a file-level attribute
+    /// instead, and would let a green `cargo test` mean nothing.
     #[tokio::test]
-    #[ignore = "driven by a_configured_process_runs_the_whole_vector_chain_over_real_http, which supplies QM_EMBEDDING_* and its stub endpoint"]
     async fn child_runs_the_configured_vector_chain() {
-        assert_eq!(
-            std::env::var("QM_E2E_CHILD").as_deref(),
-            Ok("1"),
-            "this test is driven by \
-             a_configured_process_runs_the_whole_vector_chain_over_real_http, which supplies \
-             QM_EMBEDDING_* and a stub endpoint; it cannot run on its own"
-        );
+        if std::env::var("QM_E2E_CHILD").as_deref() != Ok("1") {
+            eprintln!(
+                "not running child_runs_the_configured_vector_chain: it is driven by \
+                 a_configured_process_runs_the_whole_vector_chain_over_real_http, which supplies \
+                 QM_EMBEDDING_* and a stub endpoint; on its own it would reach out to whatever \
+                 endpoint this shell exports, so it is skipped here and run by that parent"
+            );
+            return;
+        }
         let configured_model =
             std::env::var("QM_EMBEDDING_MODEL").expect("the parent sets QM_EMBEDDING_MODEL");
         let configured_key =
