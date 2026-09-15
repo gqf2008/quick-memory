@@ -57,6 +57,17 @@ pub enum Fault {
     IgnoreIfMatch,
     /// Answer `GET`/`HEAD` with an ETag that no accepted write ever returned.
     StaleReadEtag,
+    /// Answer the *first* page of a listing as if it were the whole listing:
+    /// `IsTruncated` says false and no continuation token is offered. A client
+    /// that trusts the answer sees a smaller bucket, so a reader that
+    /// materialises an index from it gets a partial directory.
+    TruncateListing,
+    /// Answer `GET` with only the first byte of the object. The
+    /// `Content-Length` still describes what was actually sent, so the
+    /// transfer succeeds and the caller has to notice the bytes are wrong on
+    /// its own — the failure a replica that hands back a damaged object
+    /// produces.
+    TruncateReadBody,
 }
 
 /// Configuration for the stub bucket.
@@ -614,6 +625,14 @@ impl State {
         } else {
             object.etag.clone()
         };
+        // The fault shortens the body, not the header: a caller that only
+        // checks that the transfer completed still sees a success, so the
+        // damage has to be caught by whatever parses the object.
+        let body = if self.faulted(Fault::TruncateReadBody) {
+            object.bytes[..object.bytes.len().min(1)].to_vec()
+        } else {
+            object.bytes.clone()
+        };
         Response {
             status: 200,
             headers: vec![
@@ -624,7 +643,7 @@ impl State {
                     "application/octet-stream".to_string(),
                 ),
             ],
-            body: object.bytes.clone(),
+            body,
         }
     }
 
@@ -673,7 +692,9 @@ impl State {
         if let Some(after) = &start_after {
             keys.retain(|(key, _)| key.as_str() > after.as_str());
         }
-        let truncated = keys.len() > page_size;
+        // The fault claims the first page answers the whole listing, which is
+        // the shape a reader cannot tell apart from a small bucket.
+        let truncated = keys.len() > page_size && !self.faulted(Fault::TruncateListing);
         let page = &keys[..page_size.min(keys.len())];
 
         let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");

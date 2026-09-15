@@ -25,6 +25,10 @@ enum FaultArg {
     IgnoreIfMatch,
     /// Answer GET/HEAD with an ETag no write ever returned.
     StaleReadEtag,
+    /// Answer the first page of a listing as if it were the whole listing.
+    TruncateListing,
+    /// Answer GET with a truncated body and an honest content-length.
+    TruncateReadBody,
 }
 
 impl From<FaultArg> for Fault {
@@ -32,6 +36,8 @@ impl From<FaultArg> for Fault {
         match value {
             FaultArg::IgnoreIfMatch => Self::IgnoreIfMatch,
             FaultArg::StaleReadEtag => Self::StaleReadEtag,
+            FaultArg::TruncateListing => Self::TruncateListing,
+            FaultArg::TruncateReadBody => Self::TruncateReadBody,
         }
     }
 }
