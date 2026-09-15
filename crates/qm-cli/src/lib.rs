@@ -115,6 +115,61 @@ pub enum Command {
     },
 }
 
+/// Build the bucket client from the environment.
+///
+/// `QM_S3_*` (falling back to `R2_*`) must be present: a surface that cannot
+/// reach the bucket fails loudly rather than degrading to a local store, which
+/// would silently lose the CAS semantics every write depends on.
+///
+/// # Errors
+/// Fails when endpoint, bucket, or credentials are missing, or the client
+/// cannot be constructed.
+pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
+    use object_store::aws::AmazonS3Builder;
+
+    fn env_first(names: &[&str]) -> Option<String> {
+        names.iter().find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+    fn require(names: &[&str], what: &str) -> Result<String> {
+        env_first(names).ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing {what}; set one of {names:?} (a command that cannot reach the bucket must fail, not guess)"
+            )
+        })
+    }
+
+    let endpoint = require(&["QM_S3_ENDPOINT", "R2_ENDPOINT"], "S3 endpoint")?;
+    let bucket = require(&["QM_S3_BUCKET", "R2_BUCKET"], "bucket name")?;
+    let access_key_id = require(
+        &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"],
+        "access key id",
+    )?;
+    let secret_access_key = require(
+        &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"],
+        "secret access key",
+    )?;
+    let region = env_first(&["QM_S3_REGION"]).unwrap_or_else(|| "auto".to_string());
+    let force_path_style = env_first(&["QM_S3_FORCE_PATH_STYLE"])
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+        .unwrap_or(true);
+
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(&bucket)
+        .with_region(&region)
+        .with_virtual_hosted_style_request(!force_path_style)
+        .with_access_key_id(&access_key_id)
+        .with_secret_access_key(&secret_access_key)
+        .with_endpoint(&endpoint);
+    if endpoint.starts_with("http://") {
+        builder = builder.with_allow_http(true);
+    }
+    Ok(Arc::new(builder.build().context("building S3 client")?))
+}
+
 /// Everything a command needs, already resolved.
 pub struct Context {
     /// The object store backing the bucket.
@@ -347,7 +402,12 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 bail!("nothing to publish: the project has no live pages");
             }
             let seq = loaded.manifest.seq + 1;
-            let build_dir = ctx.cache_dir.join(format!("build-{seq}"));
+            // One directory per invocation: a leftover build directory from an
+            // earlier run (same seq, different process) must never be reused,
+            // because building an index into a non-empty directory fails.
+            let build_dir =
+                ctx.cache_dir
+                    .join(format!("build-{seq}-{}-{}", std::process::id(), ctx.now_ms));
             let outcome = publish_split_index(
                 ctx.bucket.as_ref(),
                 &ctx.project,
@@ -378,7 +438,9 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
             })
         }
         Command::Compact => {
-            let build_dir = ctx.cache_dir.join("compact");
+            let build_dir =
+                ctx.cache_dir
+                    .join(format!("compact-{}-{}", std::process::id(), ctx.now_ms));
             let outcome = compact_project(
                 ctx.bucket.as_ref(),
                 &ctx.project,

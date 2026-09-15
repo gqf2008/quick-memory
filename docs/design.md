@@ -202,6 +202,17 @@ qm sessions
 - 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
   页面的写/读/删、status/sessions、作用域解析。
 
+**MCP 服务器**（`qm-mcp`，stdio）：
+
+- 10 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
+  publish / compact / sessions / status`，沿用 ai-memory 的命名习惯，让 agent 的既有习惯可直接迁移。
+- **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
+- 协议层有真实回环测试：拉起 `qm-mcp` 二进制，走 `initialize → tools/list → tools/call`，
+  断言工具齐全且都有描述与 inputSchema，跑通 capture → consolidate → publish → search，
+  并确认非法路径返回**错误而不是伪成功**。
+- 该测试用 `--synthetic-bucket`（进程内、非持久、**不是后端**，启动时向 stderr 打警告）。
+  真后端仍由三个探针在带凭据时验证。
+
 ## 7. 删除与压缩（S3 已实现）
 
 - **不用 Quickwit delete-tasks**。那是集群形态的产物（只对 mature split 生效、需要协调者与可见性探针）。
@@ -257,7 +268,7 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 **S5（agent 可用面，进行中）**
 
 - `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
-- MCP stdio 服务器尚未实现（下一步），届时暴露同一组能力。
+- MCP stdio 服务器已实现并通过协议级回环测试（10 个工具，与 CLI 同一分发）。
 
 **S4（采集与编译）**
 

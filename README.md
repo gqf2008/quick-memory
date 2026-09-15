@@ -26,6 +26,7 @@ crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
 crates/qm-cli     `qm` 命令行（agent 入口）
+crates/qm-mcp     `qm-mcp` MCP stdio 服务器（10 个 memory_* 工具）
 ```
 
 ## 命令行
@@ -42,6 +43,33 @@ cargo run -p qm-cli --bin qm -- search "suite" --json
 
 作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，
 不会退回本地存储。
+
+## MCP 接入
+
+```json
+{
+  "mcpServers": {
+    "quick-memory": {
+      "command": "qm-mcp",
+      "env": {
+        "QM_S3_ENDPOINT": "https://<account>.r2.cloudflarestorage.com",
+        "QM_S3_BUCKET": "<bucket>",
+        "QM_S3_ACCESS_KEY_ID": "...",
+        "QM_S3_SECRET_ACCESS_KEY": "...",
+        "QM_WORKSPACE": "acme",
+        "QM_PROJECT": "my-project",
+        "QM_WRITER": "mbp-1"
+      }
+    }
+  }
+}
+```
+
+工具：`memory_capture` / `memory_consolidate` / `memory_search` / `memory_write_page` /
+`memory_read_page` / `memory_delete_page` / `memory_publish` / `memory_compact` /
+`memory_sessions` / `memory_status`。它们与 `qm` 命令共用同一份实现。
+
+本地试协议用 `qm-mcp --synthetic-bucket`（内存、非持久，仅用于冒烟）。
 
 ## 跑测试
 
