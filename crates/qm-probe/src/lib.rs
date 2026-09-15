@@ -256,6 +256,40 @@ pub async fn run_manifest_scenario(
             params.machines
         ));
     }
+    // Read the WAL before walking the chains, and not by count. `read_wal`
+    // returns the records the bucket *holds*, and a commit that lost its CAS
+    // race leaves one the manifest never names, so a healthy scope with a
+    // retry in it has more records than it has versions; what must hold is the
+    // other direction. It also goes first on purpose: a chain is walked
+    // *through* WAL records, so a missing one would otherwise surface as a bare
+    // "object not found" instead of naming the versions that are not covered.
+    let wal = reader.read_wal(&workspace, &project).await?;
+    let committed: Vec<qm_core::PageId> = chains
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().cloned())
+        .collect();
+    let missing = versions_missing_from_the_wal(&committed, &wal);
+    if !missing.is_empty() {
+        failures.push(format!(
+            "WAL is missing records for {} of {} committed versions (first missing: {})",
+            missing.len(),
+            committed.len(),
+            missing[0]
+        ));
+        // Every check below walks a supersession chain *through* WAL records,
+        // so a version with no record fails there with a bare "object not
+        // found". Stop here instead, and name what the bucket is missing.
+        return Ok(ManifestScenarioReport {
+            workspace: workspace.to_string(),
+            project: project.to_string(),
+            commits: manifest.seq,
+            attempts,
+            pages: manifest.pages.len(),
+            wal_records: wal.len(),
+            failures,
+        });
+    }
+
     for (path, ids) in &chains {
         let history = reader.page_history(&workspace, &project, path).await?;
         if history.len() != params.writes {
@@ -290,26 +324,6 @@ pub async fn run_manifest_scenario(
             None => failures.push(format!("{}: head not readable", path.as_str())),
         }
     }
-    let wal = reader.read_wal(&workspace, &project).await?;
-    // Not a count. `read_wal` returns the records the bucket *holds*, and a
-    // commit that lost its CAS race leaves one the manifest never names, so a
-    // healthy scope with a retry in it has more records than committed
-    // versions. What must hold is the other direction: every committed version
-    // has its record, or the WAL cannot be replayed for this scope.
-    let committed: Vec<qm_core::PageId> = chains
-        .iter()
-        .flat_map(|(_, ids)| ids.iter().cloned())
-        .collect();
-    let missing = versions_missing_from_the_wal(&committed, &wal);
-    if !missing.is_empty() {
-        failures.push(format!(
-            "WAL is missing records for {} of {} committed versions (first missing: {})",
-            missing.len(),
-            committed.len(),
-            missing[0]
-        ));
-    }
-
     Ok(ManifestScenarioReport {
         workspace: workspace.to_string(),
         project: project.to_string(),
