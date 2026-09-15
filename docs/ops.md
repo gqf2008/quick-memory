@@ -39,6 +39,7 @@ already_up_to_date / skipped_locked / skipped_empty / failed / failures / publis
 published_pages / publish_already_present / publish_error / manifest_seq /
 generation / splits`。`spool_kept` 是所有未成功处理的剩余条目总数（其他 scope、当前
 scope 超过 limit 的条目和坏条目）；`published` 只表示本次是否真的新增了 split。
+`publish_error` 非空时 `published` 必须为 `false`，即使失败发生在 catalog 提交前的分片上传阶段。
 即使存在会话失败或 publish 失败，完整报告仍写入 stdout，
 进程以非零状态退出，便于调度器报警。
 

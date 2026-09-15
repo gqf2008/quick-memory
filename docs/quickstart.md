@@ -64,6 +64,7 @@ already_up_to_date / skipped_locked / skipped_empty / failed / published / manif
 splits`；`spool_kept` 统计所有未成功处理的剩余条目（其他 scope、超过
 `--drain-limit` 的当前 scope 条目以及坏条目），而 limit 只约束当前 scope。
 真实租约冲突只计入 `skipped_locked`，空 session 计入 `skipped_empty`。
+`published` 只在本次确实新增 split 且 `publish_error` 为空时为 `true`。
 某个会话坏掉时会继续处理其他会话，但仍以非零状态结束。
 
 定时执行示例（把环境文件保存为 `~/.config/quick-memory/env`）：

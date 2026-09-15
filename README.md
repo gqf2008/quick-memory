@@ -73,6 +73,7 @@ qm digest --hours 24                     # 最近变化摘要：提交（含删�
 
 `qm maintain` 的 `--drain-limit` 只约束当前 scope；`spool_kept` 是所有未成功处理的剩余
 条目总数。真实租约冲突计入 `skipped_locked`，空 session 计入 `skipped_empty`，两者都不算失败。
+`published` 仅在本次新增 split 且 `publish_error` 为空时为 `true`。
 
 更完整的用法：
 

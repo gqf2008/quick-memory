@@ -726,6 +726,8 @@ fn compiler_choice_from_name(name: &str) -> Result<CompilerChoice> {
 /// What one publish attempt did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PublishReport {
+    /// True only when this attempt committed a new split.
+    committed: bool,
     reason: Option<String>,
     already_present: bool,
     pages: usize,
@@ -738,7 +740,7 @@ struct PublishReport {
 
 impl PublishReport {
     fn published(&self) -> bool {
-        self.reason.is_none() && !self.already_present
+        self.committed
     }
 
     fn render(&self, json: bool) -> String {
@@ -833,6 +835,7 @@ async fn publish_project(ctx: &Context) -> Result<PublishReport> {
             )
         };
         return Ok(PublishReport {
+            committed: false,
             reason: Some(reason),
             already_present: false,
             pages: 0,
@@ -870,6 +873,7 @@ async fn publish_project(ctx: &Context) -> Result<PublishReport> {
     // can make it conservative, but it cannot make the publish look failed.
     let splits = catalog.catalog.splits.len() + usize::from(!outcome.already_present);
     Ok(PublishReport {
+        committed: !outcome.already_present,
         reason: None,
         already_present: outcome.already_present,
         pages: docs.len(),
@@ -912,7 +916,7 @@ pub struct MaintainReport {
     pub failed: usize,
     /// Details for each failed session.
     pub failures: Vec<MaintainSessionFailure>,
-    /// Whether this pass created a new split.
+    /// Whether this pass created a new split and the publish step did not fail.
     pub published: bool,
     /// Number of pages in the split considered by the publish step.
     pub published_pages: usize,
@@ -1052,6 +1056,7 @@ async fn maintain(
             let state = current_publish_state(ctx).await;
             (
                 PublishReport {
+                    committed: false,
                     reason: None,
                     already_present: false,
                     pages: 0,
@@ -1076,7 +1081,7 @@ async fn maintain(
         skipped_empty,
         failed: failures.len(),
         failures,
-        published: publish.published(),
+        published: publish_error.is_none() && publish.published(),
         published_pages: publish.pages,
         publish_already_present: publish.already_present,
         publish_error,
@@ -2821,24 +2826,34 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
     }
 
-    /// A store that refuses reads after the catalog head has been committed.
+    /// A store with deterministic publish-stage faults.
     ///
-    /// This is the regression seam for the publish report: a successful
-    /// publish must not turn into an error merely because a subsequent status
-    /// read fails.
+    /// It can either refuse object reads after the catalog head commits (to
+    /// prove a successful publish does not add a status-read failure point) or
+    /// refuse the catalog-head commit itself (to exercise maintain's publish
+    /// failure report).
     #[derive(Debug)]
-    struct FailReadsAfterCatalogHead {
+    struct PublishFaultStore {
         inner: Arc<dyn ObjectStore>,
         fail_reads: Arc<std::sync::atomic::AtomicBool>,
         post_publish_reads: Arc<std::sync::atomic::AtomicUsize>,
+        fail_catalog_head_put: bool,
     }
 
-    impl FailReadsAfterCatalogHead {
+    impl PublishFaultStore {
         fn new(inner: Arc<dyn ObjectStore>) -> Self {
             Self {
                 inner,
                 fail_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 post_publish_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_catalog_head_put: false,
+            }
+        }
+
+        fn failing_catalog_head_put(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                fail_catalog_head_put: true,
+                ..Self::new(inner)
             }
         }
 
@@ -2857,16 +2872,23 @@ mod tests {
                 source: Box::new(std::io::Error::other("post-publish read refused")),
             }
         }
+
+        fn refused_catalog_put() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "fail-catalog-put-test",
+                source: Box::new(std::io::Error::other("catalog head put refused")),
+            }
+        }
     }
 
-    impl std::fmt::Display for FailReadsAfterCatalogHead {
+    impl std::fmt::Display for PublishFaultStore {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("FailReadsAfterCatalogHead")
+            formatter.write_str("PublishFaultStore")
         }
     }
 
     #[async_trait::async_trait]
-    impl ObjectStore for FailReadsAfterCatalogHead {
+    impl ObjectStore for PublishFaultStore {
         async fn put_opts(
             &self,
             location: &object_store::path::Path,
@@ -2874,6 +2896,9 @@ mod tests {
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
             let is_catalog_head = location.as_ref().ends_with("/index/head.json");
+            if is_catalog_head && self.fail_catalog_head_put {
+                return Err(Self::refused_catalog_put());
+            }
             let result = self.inner.put_opts(location, payload, options).await;
             if is_catalog_head && result.is_ok() {
                 self.fail_reads
@@ -4100,7 +4125,7 @@ mod tests {
     #[tokio::test]
     async fn publish_success_does_not_read_back_after_committing_the_catalog_head() {
         let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let fault = Arc::new(FailReadsAfterCatalogHead::new(Arc::clone(&raw)));
+        let fault = Arc::new(PublishFaultStore::new(Arc::clone(&raw)));
         let bucket: Arc<dyn ObjectStore> = fault.clone();
         let cache = TempDir::new().unwrap();
 
@@ -4141,6 +4166,44 @@ mod tests {
             0,
             "a successful publish must not add a post-commit status read"
         );
+    }
+
+    #[tokio::test]
+    async fn maintain_never_reports_published_when_the_publish_stage_fails() {
+        let raw: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(PublishFaultStore::failing_catalog_head_put(Arc::clone(
+            &raw,
+        )));
+        let bucket: Arc<dyn ObjectStore> = fault.clone();
+        let cache = TempDir::new().unwrap();
+        execute(
+            &cli(&[
+                "capture",
+                "--session",
+                "sess-publish-fail",
+                "--text",
+                "cannot publish",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 2_000;
+        let report = match run_maintain(ctx).await {
+            TestMaintainResult::Success(report) => {
+                panic!("a failed publish must make maintain non-zero: {report:?}")
+            }
+            TestMaintainResult::Failure(report) => report,
+        };
+        assert!(report.publish_error.is_some(), "{report:?}");
+        assert!(
+            !report.published,
+            "a failed publish cannot be reported as published: {report:?}"
+        );
+        assert_eq!(report.failed, 0, "no session itself failed: {report:?}");
+        assert!(report.needs_nonzero_exit());
     }
 
     /// The watermark records what *this machine* published into *one bucket*.
@@ -5035,7 +5098,13 @@ mod tests {
             .await
             .unwrap();
         let first_splits = first_catalog.catalog.splits.len();
-        let split_prefix = first_catalog.catalog.splits[0].prefix.clone();
+        let split_prefix = format!(
+            "{}/index/splits",
+            state
+                .project
+                .layout()
+                .scope_prefix(&state.workspace, &state.project_id)
+        );
         let split_objects_before = qm_store::CasStore::new(Arc::clone(&bucket), "")
             .list(&split_prefix)
             .await

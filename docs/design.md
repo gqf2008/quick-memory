@@ -596,7 +596,7 @@ qm sessions
   汇总后非零退出，租约冲突按 `skipped_locked`、空 session 按 `skipped_empty` 计数。
   `--drain-limit` 先按当前 scope 过滤再应用；其他 scope 不消耗预算。`spool_kept` 是其他
   scope、超过 limit 的当前 scope 条目、坏条目和重放失败的总数；`published` 只表示本次真的
-  新增 split。连续运行是幂等的，不重复版本或分片。
+  新增 split，且 `publish_error` 必须为空。连续运行是幂等的，不重复版本或分片。
 - 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
   页面的写/读/删、status/sessions、作用域解析。
 
