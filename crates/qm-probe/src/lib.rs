@@ -366,9 +366,13 @@ pub struct SearchScenarioReport {
     pub filtered_out: usize,
     /// Verification failures; empty means the run proved the invariants.
     pub failures: Vec<String>,
+    /// Splits before compaction.
+    pub splits_before: usize,
+    /// Splits after compaction.
+    pub splits_after: usize,
 }
 
-/// Run the S2 acceptance scenario against `bucket` and verify it.
+/// Run the S2/S3 acceptance scenario against `bucket` and verify it.
 ///
 /// Three machines publish splits; one of them supersedes a page another had
 /// published and then never participates again. A fresh reader must return the
@@ -544,6 +548,88 @@ pub async fn run_search_scenario(
         failures.push("the offline machine's content is not searchable".to_string());
     }
 
+    // S3: delete a page, then compact, and prove nothing changed for readers
+    // while the split set shrank.
+    let deleted_path = PagePath::new("notes/quickwit.md")?;
+    project_store
+        .delete_page(
+            &workspace,
+            &project,
+            &deleted_path,
+            &WriterId::new("probe-c")?,
+            40,
+        )
+        .await?;
+    let after_delete = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        cache.path(),
+        "tantivy",
+        10,
+    )
+    .await?;
+    if !after_delete.hits.is_empty() {
+        failures.push(format!(
+            "a deleted page still answered with {} hit(s)",
+            after_delete.hits.len()
+        ));
+    }
+
+    let splits_before = reader
+        .load_catalog(&workspace, &project)
+        .await?
+        .catalog
+        .splits
+        .len();
+    let compact = qm_search::compact_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        &WriterId::new("probe-compactor")?,
+        &build_root.path().join("compact"),
+        50,
+        60_000,
+    )
+    .await?;
+    if compact.skipped {
+        failures.push("compaction unexpectedly found the lease held".to_string());
+    }
+    if compact.splits_after >= splits_before {
+        failures.push(format!(
+            "compaction did not shrink the catalog: {} -> {}",
+            splits_before, compact.splits_after
+        ));
+    }
+    let after_compact = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        tempfile::TempDir::new().context("cache")?.path(),
+        "election",
+        10,
+    )
+    .await?;
+    if after_compact.hits != both.hits {
+        failures.push("compaction changed the search results".to_string());
+    }
+    let resurrected = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        tempfile::TempDir::new().context("cache")?.path(),
+        "tantivy",
+        10,
+    )
+    .await?;
+    if !resurrected.hits.is_empty() {
+        failures.push("compaction resurrected a deleted page".to_string());
+    }
+
     Ok(SearchScenarioReport {
         workspace: workspace.to_string(),
         project: project.to_string(),
@@ -551,5 +637,7 @@ pub async fn run_search_scenario(
         hits: both.hits.len(),
         filtered_out: both.filtered_out,
         failures,
+        splits_before,
+        splits_after: compact.splits_after,
     })
 }

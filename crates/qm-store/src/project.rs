@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use qm_core::{
-    CatalogHead, IndexCatalog, KeyLayout, MANIFEST_SCHEMA, Manifest, PageEntry, PagePath,
-    PageVersion, ProjectId, SplitEntry, WalEntry, WorkspaceId, WriterId, content_hash,
+    CatalogHead, IndexCatalog, KeyLayout, Lease, MANIFEST_SCHEMA, Manifest, PageEntry, PagePath,
+    PageVersion, ProjectId, SplitEntry, Tombstone, WalEntry, WorkspaceId, WriterId, content_hash,
     derive_page_id,
 };
 
@@ -60,6 +60,93 @@ pub struct LoadedCatalog {
     pub catalog_key: Option<String>,
     /// Head version to pass to a CAS, or `None` when the head does not exist.
     pub head_version: Option<ObjectVersion>,
+}
+
+/// What a deletion did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Commit sequence after the deletion (unchanged when already deleted).
+    pub manifest_seq: u64,
+    /// Version that was current when it was deleted.
+    pub removed: Option<qm_core::PageId>,
+    /// True when the path was already tombstoned; the call was a no-op.
+    pub already_deleted: bool,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
+}
+
+/// What a catalog replacement did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceCatalogOutcome {
+    /// Generation of the replacement catalog.
+    pub generation: u64,
+    /// Key of the replacement catalog.
+    pub catalog_key: String,
+    /// Splits in the replacement catalog.
+    pub splits: usize,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
+}
+
+/// A held lease, with the version needed to renew or release it.
+#[derive(Debug, Clone)]
+pub struct LeaseGuard {
+    /// Object key of the lease.
+    pub key: String,
+    /// Current lease contents.
+    pub lease: Lease,
+    /// Version the lease was last read/written at.
+    pub version: ObjectVersion,
+}
+
+impl LeaseGuard {
+    /// Extend the lease. Returns false when the lease moved on (we lost it).
+    ///
+    /// # Errors
+    /// Propagates backend failures.
+    pub async fn renew(
+        &mut self,
+        store: &ProjectStore,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let mut next = self.lease.clone();
+        next.acquired_at_ms = now_ms;
+        next.expires_at_ms = now_ms + ttl_ms;
+        match store
+            .cas
+            .update(&self.key, encode(&next)?, &self.version)
+            .await
+        {
+            Ok(version) => {
+                self.lease = next;
+                self.version = version;
+                Ok(true)
+            }
+            Err(StoreError::Precondition | StoreError::NotFound | StoreError::AlreadyExists) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Mark the lease free. Best effort: an unreleased lease simply expires.
+    ///
+    /// # Errors
+    /// Propagates backend failures.
+    pub async fn release(mut self, store: &ProjectStore, now_ms: i64) -> Result<(), StoreError> {
+        self.lease.expires_at_ms = now_ms;
+        match store
+            .cas
+            .update(&self.key, encode(&self.lease)?, &self.version)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Losing the release race is not an error: the lease still expires.
+            Err(StoreError::Precondition | StoreError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// What a split publication did.
@@ -260,6 +347,210 @@ impl ProjectStore {
         }
     }
 
+    /// Delete a page by tombstoning it.
+    ///
+    /// Deletion is a commit like any other: the tombstone enters the manifest
+    /// by CAS, and old splits keep their copies forever without ever being
+    /// able to answer from them. Already-deleted paths are a no-op.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race.
+    pub async fn delete_page(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        writer_id: &WriterId,
+        now_ms: i64,
+    ) -> Result<DeleteOutcome, StoreError> {
+        let manifest_key = self.layout.manifest(workspace_id, project_id);
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let loaded = self.load(workspace_id, project_id).await?;
+            if loaded.manifest.is_tombstoned(path) {
+                return Ok(DeleteOutcome {
+                    manifest_seq: loaded.manifest.seq,
+                    removed: None,
+                    already_deleted: true,
+                    attempts: attempt,
+                });
+            }
+
+            let removed = loaded.manifest.head_page_id(path);
+            let seq = loaded.manifest.next_seq();
+            let mut manifest = loaded.manifest;
+            manifest.tombstone(
+                path,
+                Tombstone {
+                    seq,
+                    deleted_at_ms: now_ms,
+                    writer_id: writer_id.clone(),
+                    last_page_id: removed.clone(),
+                },
+            );
+            let bytes = encode(&manifest)?;
+            let committed = match loaded.version {
+                Some(version) => self.cas.update(&manifest_key, bytes, &version).await,
+                None => self.cas.create(&manifest_key, bytes).await,
+            };
+
+            match committed {
+                Ok(_) => {
+                    return Ok(DeleteOutcome {
+                        manifest_seq: seq,
+                        removed,
+                        already_deleted: false,
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Replace the whole catalog with `splits`.
+    ///
+    /// Used by compaction: the replacement drops superseded and tombstoned
+    /// content from the index, while the objects themselves stay in the bucket
+    /// for garbage collection.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race.
+    pub async fn replace_catalog(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        splits: Vec<SplitEntry>,
+        now_ms: i64,
+    ) -> Result<ReplaceCatalogOutcome, StoreError> {
+        let head_key = self.layout.catalog_head(workspace_id, project_id);
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let loaded = self.load_catalog(workspace_id, project_id).await?;
+            let catalog = IndexCatalog {
+                schema: MANIFEST_SCHEMA,
+                generation: loaded.catalog.generation + 1,
+                splits: splits.clone(),
+                covered_until_ms: loaded.catalog.covered_until_ms.max(now_ms),
+            };
+            let bytes = encode(&catalog)?;
+            let catalog_key =
+                self.layout
+                    .catalog_version(workspace_id, project_id, &content_hash(&bytes));
+            self.create_or_verify(&catalog_key, &catalog).await?;
+
+            let head = CatalogHead {
+                schema: MANIFEST_SCHEMA,
+                generation: catalog.generation,
+                catalog_key: catalog_key.clone(),
+                updated_at_ms: now_ms,
+            };
+            let bytes = encode(&head)?;
+            let swapped = match loaded.head_version {
+                Some(version) => self.cas.update(&head_key, bytes, &version).await,
+                None => self.cas.create(&head_key, bytes).await,
+            };
+
+            match swapped {
+                Ok(_) => {
+                    return Ok(ReplaceCatalogOutcome {
+                        generation: catalog.generation,
+                        catalog_key,
+                        splits: catalog.splits.len(),
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Take a lease, or return `None` when another machine holds it.
+    ///
+    /// # Errors
+    /// Propagates backend failures (a lost CAS race is not an error; it is
+    /// another attempt).
+    pub async fn acquire_lease(
+        &self,
+        scope: &str,
+        owner: &WriterId,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<Option<LeaseGuard>, StoreError> {
+        let key = self.layout.lease(scope);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let current = match self.cas.read(&key).await {
+                Ok((bytes, version)) => {
+                    let lease: Lease = decode(&bytes, &key)?;
+                    if !lease.is_expired(now_ms) {
+                        return Ok(None);
+                    }
+                    Some((lease, version))
+                }
+                Err(StoreError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+
+            let next = Lease {
+                schema: MANIFEST_SCHEMA,
+                owner: owner.clone(),
+                epoch: current.as_ref().map_or(1, |(lease, _)| lease.epoch + 1),
+                acquired_at_ms: now_ms,
+                expires_at_ms: now_ms + ttl_ms,
+            };
+            let bytes = encode(&next)?;
+            let taken = match &current {
+                Some((_, version)) => self.cas.update(&key, bytes, version).await,
+                None => self.cas.create(&key, bytes).await,
+            };
+            match taken {
+                Ok(version) => {
+                    // Re-check after the CAS: if the deadline already passed
+                    // (a suspended holder), the next acquisition takes over.
+                    return Ok(Some(LeaseGuard {
+                        key,
+                        lease: next,
+                        version,
+                    }));
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Ok(None);
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Load the index catalog, treating "absent" as an empty index.
     ///
     /// # Errors
@@ -397,6 +688,34 @@ impl ProjectStore {
             )));
         }
         Ok(Some(page))
+    }
+
+    /// Read a specific page version without consulting the manifest.
+    ///
+    /// Used by compaction, which already holds a consistent manifest snapshot
+    /// and must not pay a manifest read per page.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the version object is missing.
+    pub async fn read_page_version(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        path: &PagePath,
+        page_id: &qm_core::PageId,
+    ) -> Result<PageVersion, StoreError> {
+        let key = self
+            .layout
+            .page_version(workspace_id, project_id, path, page_id);
+        let (bytes, _) = self.cas.read(&key).await?;
+        let page: PageVersion = decode(&bytes, &key)?;
+        if page.page_id != *page_id {
+            return Err(StoreError::Corrupt(format!(
+                "{key} holds {} but {page_id} was requested",
+                page.page_id
+            )));
+        }
+        Ok(page)
     }
 
     /// Walk a page's supersession chain, oldest first.
@@ -695,6 +1014,119 @@ mod tests {
             attempts > 8,
             "expected at least one head CAS conflict, saw {attempts} attempts"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_page_is_idempotent_and_refuses_to_resurrect_it() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let path = PagePath::new("notes/raft.md").unwrap();
+        let writer = WriterId::new("mbp-1").unwrap();
+
+        let committed = store
+            .commit_page(request("mbp-1", "notes/raft.md", "body", 1))
+            .await
+            .unwrap();
+        let deleted = store
+            .delete_page(&ws(), &proj(), &path, &writer, 2)
+            .await
+            .unwrap();
+        assert!(!deleted.already_deleted);
+        assert_eq!(deleted.removed.as_ref(), Some(&committed.page_id));
+        assert_eq!(deleted.manifest_seq, 2);
+
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(loaded.manifest.pages.is_empty());
+        assert!(loaded.manifest.is_tombstoned(&path));
+        assert_eq!(
+            loaded
+                .manifest
+                .tombstones
+                .get(path.as_str())
+                .map(|t| t.last_page_id.clone()),
+            Some(Some(committed.page_id.clone()))
+        );
+        assert!(
+            store
+                .read_page(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Deleting again changes nothing.
+        let again = store
+            .delete_page(&ws(), &proj(), &path, &writer, 3)
+            .await
+            .unwrap();
+        assert!(again.already_deleted);
+        assert_eq!(again.manifest_seq, 2, "a no-op must not consume a sequence");
+
+        // Writing the path again is the newer truth and clears the tombstone.
+        let rewritten = store
+            .commit_page(request("mbp-1", "notes/raft.md", "body v2", 4))
+            .await
+            .unwrap();
+        assert_eq!(rewritten.manifest_seq, 3);
+        let loaded = store.load(&ws(), &proj()).await.unwrap();
+        assert!(!loaded.manifest.is_tombstoned(&path));
+        assert!(
+            loaded
+                .manifest
+                .is_current(path.as_str(), rewritten.page_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn only_one_machine_holds_a_lease_at_a_time() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = machine(&bucket);
+        let second = machine(&bucket);
+        let owner_a = WriterId::new("mbp-a").unwrap();
+        let owner_b = WriterId::new("mbp-b").unwrap();
+        let scope = "compact/acme/ai-memory";
+
+        let mut held = first
+            .acquire_lease(scope, &owner_a, 1_000, 60_000)
+            .await
+            .unwrap()
+            .expect("first acquisition wins");
+        assert_eq!(held.lease.epoch, 1);
+        assert_eq!(held.lease.owner, owner_a);
+
+        // Still inside the TTL: the second machine must back off.
+        assert!(
+            second
+                .acquire_lease(scope, &owner_b, 2_000, 60_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "a live lease must not be taken over"
+        );
+
+        // The holder is gone past its deadline: takeover bumps the epoch.
+        let taken = second
+            .acquire_lease(scope, &owner_b, 100_000, 60_000)
+            .await
+            .unwrap()
+            .expect("an expired lease is free");
+        assert_eq!(taken.lease.epoch, 2);
+        assert_eq!(taken.lease.owner, owner_b);
+
+        // The old holder's renewal must fail: its version is stale.
+        assert!(
+            !held.renew(&first, 100_001, 60_000).await.unwrap(),
+            "the previous holder must not be able to renew"
+        );
+
+        // Releasing hands the lease over immediately.
+        taken.release(&second, 100_002).await.unwrap();
+        let reacquired = first
+            .acquire_lease(scope, &owner_a, 100_003, 60_000)
+            .await
+            .unwrap()
+            .expect("a released lease is free");
+        assert_eq!(reacquired.lease.epoch, 3);
     }
 
     #[tokio::test]

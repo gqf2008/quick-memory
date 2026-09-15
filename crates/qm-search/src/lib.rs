@@ -196,6 +196,12 @@ pub async fn materialize(store: &dyn ObjectStore, prefix: &str, dest: &Path) -> 
             .bytes()
             .await?;
         std::fs::write(&target, &bytes).with_context(|| format!("writing {}", target.display()))?;
+        // A Quickwit indexer publishes one `.split` container instead of a
+        // tantivy directory; unpack it in place so both shapes search the same.
+        if rel.ends_with(".split") {
+            crate::quickwit_split::extract_split(&bytes, dest)
+                .with_context(|| format!("extracting split {rel}"))?;
+        }
         count += 1;
     }
     if count == 0 {
@@ -378,6 +384,123 @@ pub struct SearchOutcome {
     pub filtered_out: usize,
 }
 
+/// What a compaction did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactOutcome {
+    /// True when another machine held the lease and nothing was done.
+    pub skipped: bool,
+    /// Page versions rebuilt into the new index.
+    pub pages: usize,
+    /// Splits in the catalog before the rebuild.
+    pub splits_before: usize,
+    /// Splits in the catalog after the rebuild.
+    pub splits_after: usize,
+    /// Catalog generation after the rebuild.
+    pub generation: u64,
+}
+
+/// Rebuild a project's index from its authoritative pages.
+///
+/// Compaction is optional and abandonable: it holds a lease, reads the
+/// manifest, rebuilds one split from the pages the manifest still names, and
+/// swaps the catalog pointer in a single CAS. Nothing about a search requires
+/// it to have run — it exists to shrink the split set and to drop superseded
+/// and tombstoned content from the index.
+///
+/// # Errors
+/// Propagates build, upload, and catalog failures. A lost lease is not an
+/// error; it is reported as `skipped`.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_project(
+    store: &dyn ObjectStore,
+    project_store: &ProjectStore,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    compactor: &WriterId,
+    build_dir: &Path,
+    now_ms: i64,
+    lease_ttl_ms: i64,
+) -> Result<CompactOutcome> {
+    let scope = format!("compact/{workspace_id}/{project_id}");
+    let Some(lease) = project_store
+        .acquire_lease(&scope, compactor, now_ms, lease_ttl_ms)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    else {
+        let catalog = project_store
+            .load_catalog(workspace_id, project_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        return Ok(CompactOutcome {
+            skipped: true,
+            pages: 0,
+            splits_before: catalog.catalog.splits.len(),
+            splits_after: catalog.catalog.splits.len(),
+            generation: catalog.catalog.generation,
+        });
+    };
+
+    let loaded = project_store
+        .load(workspace_id, project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let splits_before = project_store
+        .load_catalog(workspace_id, project_id)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .catalog
+        .splits
+        .len();
+
+    // Rebuild from what the manifest still names: superseded versions and
+    // tombstoned paths are dropped by construction, not by filtering.
+    let mut docs = Vec::with_capacity(loaded.manifest.pages.len());
+    for (path, entry) in &loaded.manifest.pages {
+        let page_path = qm_core::PagePath::new(path)?;
+        let page = project_store
+            .read_page_version(workspace_id, project_id, &page_path, &entry.page_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        docs.push(PageDoc::from_version(
+            workspace_id,
+            project_id,
+            &page,
+            entry.created_at_ms,
+        ));
+    }
+
+    let seq = loaded.manifest.seq + 1;
+    let prefix = project_store
+        .layout()
+        .split_prefix(workspace_id, project_id, compactor, seq);
+    build_index(build_dir, &docs)?;
+    upload_dir(store, &prefix, build_dir).await?;
+    let split = SplitEntry {
+        writer_id: compactor.clone(),
+        seq,
+        prefix,
+        doc_count: docs.len() as u64,
+        content_hash: hash_dir(build_dir)?,
+    };
+
+    let replaced = project_store
+        .replace_catalog(workspace_id, project_id, vec![split], now_ms)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    lease
+        .release(project_store, now_ms)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    Ok(CompactOutcome {
+        skipped: false,
+        pages: docs.len(),
+        splits_before,
+        splits_after: replaced.splits,
+        generation: replaced.generation,
+    })
+}
+
 /// Search a project across every published split, then check the authority.
 ///
 /// The index only proposes candidates: a hit survives only when the manifest
@@ -450,6 +573,8 @@ pub async fn search_project(
         filtered_out,
     })
 }
+
+pub mod quickwit_split;
 
 #[cfg(test)]
 mod tests {
@@ -710,6 +835,195 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.hits, second.hits);
+    }
+
+    /// S3 acceptance: compaction shrinks the split set without changing what
+    /// a search returns, and a tombstoned page never comes back.
+    #[tokio::test]
+    async fn compaction_shrinks_the_index_without_changing_results() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer_store = reader(&bucket);
+        let build_root = TempDir::new().unwrap();
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let machine = Machine {
+            project: &writer_store,
+            bucket: &bucket,
+            build_root: build_root.path(),
+            workspace: &workspace,
+            project_id: &project_id,
+        };
+
+        machine
+            .write_and_publish(
+                "mbp-a",
+                1,
+                "shared/raft.md",
+                "leader election and consensus",
+                10,
+            )
+            .await;
+        machine
+            .write_and_publish(
+                "mbp-b",
+                1,
+                "notes/quickwit.md",
+                "tantivy splits in object storage",
+                20,
+            )
+            .await;
+        machine
+            .write_and_publish(
+                "mbp-c",
+                1,
+                "shared/raft.md",
+                "leader election and snapshots",
+                30,
+            )
+            .await;
+
+        // One page is deleted before compaction: it must not survive the rebuild.
+        let deleted_path = PagePath::new("notes/quickwit.md").unwrap();
+        writer_store
+            .delete_page(
+                &workspace,
+                &project_id,
+                &deleted_path,
+                &WriterId::new("mbp-c").unwrap(),
+                40,
+            )
+            .await
+            .unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let before = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            cache.path(),
+            "election",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.splits_searched, 3);
+        assert_eq!(before.hits.len(), 1);
+
+        let compactor = WriterId::new("mbp-a").unwrap();
+        let outcome = compact_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            &compactor,
+            &build_root.path().join("compact-1"),
+            50,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.skipped);
+        assert_eq!(outcome.splits_before, 3);
+        assert_eq!(
+            outcome.splits_after, 1,
+            "compaction must shrink the catalog"
+        );
+        assert_eq!(outcome.pages, 1, "only the live page is rebuilt");
+
+        let after = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "election",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.splits_searched, 1);
+        assert_eq!(after.hits, before.hits, "results must not change");
+
+        // The tombstoned page was not resurrected by the rebuild.
+        let deleted = search_project(
+            bucket.as_ref(),
+            &reader(&bucket),
+            &workspace,
+            &project_id,
+            TempDir::new().unwrap().path(),
+            "tantivy",
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(deleted.hits.is_empty(), "{:?}", deleted.hits);
+    }
+
+    /// Compaction is abandonable work: a machine that cannot get the lease
+    /// must walk away, and the system must be unaffected.
+    #[tokio::test]
+    async fn compaction_defers_to_an_existing_lease() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let holder = WriterId::new("holder").unwrap();
+        let scope = format!("compact/{workspace}/{project_id}");
+        let lease = store
+            .acquire_lease(&scope, &holder, 1_000, 60_000)
+            .await
+            .unwrap()
+            .expect("lease acquired");
+
+        let build_root = TempDir::new().unwrap();
+        let outcome = compact_project(
+            bucket.as_ref(),
+            &store,
+            &workspace,
+            &project_id,
+            &WriterId::new("other").unwrap(),
+            build_root.path(),
+            2_000,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.skipped, "a held lease must defer the work");
+        assert_eq!(outcome.splits_after, outcome.splits_before);
+        lease.release(&store, 3_000).await.unwrap();
+    }
+
+    /// The same round trip as above, but the publisher wrote one `.split`
+    /// container (the shape a Quickwit indexer produces) instead of a
+    /// directory of files.
+    #[tokio::test]
+    async fn a_published_split_container_is_searchable_by_another_machine() {
+        let builder = TempDir::new().unwrap();
+        build_index(builder.path(), &docs()).unwrap();
+        let split_bytes = {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(builder.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    (name, std::fs::read(entry.path()).unwrap())
+                })
+                .filter(|(name, _)| !name.ends_with(".lock"))
+                .collect();
+            files.sort();
+            crate::quickwit_split::tests_support::bundle_index(&files)
+        };
+        let store = InMemory::new();
+        let prefix = "v1/ws/acme/proj/ai-memory/index/splits/writer-2/0000000001";
+        let key = object_store::path::Path::parse(format!("{prefix}/0000000001.split")).unwrap();
+        store.put(&key, split_bytes.into()).await.unwrap();
+
+        let cache = TempDir::new().unwrap();
+        materialize(&store, prefix, cache.path()).await.unwrap();
+        let hits = search(cache.path(), "tantivy", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].path, "notes/quickwit.md");
     }
 
     #[tokio::test]

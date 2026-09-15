@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 mod model;
 
 pub use model::{
-    CatalogHead, IndexCatalog, MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion, SplitEntry,
-    WalEntry, content_hash, derive_page_id,
+    CatalogHead, IndexCatalog, Lease, MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion,
+    SplitEntry, Tombstone, WalEntry, content_hash, derive_page_id,
 };
 
 /// Version prefix of the object layout. Bumping it is a breaking change.

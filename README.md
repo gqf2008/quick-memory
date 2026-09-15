@@ -12,6 +12,8 @@ S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**�
 - "另一台机器只有桶访问权也能搜全量"的端到端往返（`qm-search`）
 - 多机并发提交：无覆盖、supersession 链完整、WAL 完整、崩溃重试幂等（`qm-store`）
 - 多机分片发布 + 跨分片 RRF 检索 + 权威可见性过滤：过期副本永不答出、离线机器的内容仍可搜（`qm-store`/`qm-search`）
+- 删除（tombstone）+ 压缩（租约保护、结果不变、分片下降）+ 租约抢占语义（`qm-store`/`qm-search`）
+- Quickwit `.split` 容器解包：读方无需 Quickwit 集群即可检索该格式的分片（`qm-search::quickwit_split`）
 
 真 R2 与 Quickwit 的验证需要凭据与二进制，见下。
 

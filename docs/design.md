@@ -101,6 +101,32 @@ CAS 层把两者都归一为"条件未满足"，但**不接受**泛化的后端�
 **read-your-writes**：本机刚写入但尚未发布分片的内容，由本地尾部（权威对象 + 本地索引）覆盖；
 跨机可见性允许有界滞后，但必须在结果里给出 `covered_until`。
 
+## 6.4 与 Quickwit 的格式兼容（S3 实证）
+
+Quickwit 的 split 容器格式是**公开且可解析**的（上游 `docs/internals/split-format.md`）：
+
+```
+[ 所有文件首尾相接 ][ FileMetadata ][ metadata 长度 u64 LE ][ hotcache ][ hotcache 长度 u64 LE ]
+FileMetadata = 8 字节版本头（magic = 403881646，version = 1）+ JSON {"files": {name: {start, end}}}
+```
+
+因此读方**不需要 Quickwit 集群**就能打开一个 `.split`：解析 footer、把文件切出来、用 tantivy 打开
+（`qm-search::quickwit_split`）。`materialize` 会自动识别前缀下的 `.split` 并就地解包，于是
+"Quickwit 构建器产出的分片"与"tantivy 构建器产出的目录"在读方是同一种东西。
+
+已实现的边界：footer 的所有长度都按**不可信输入**做 checked 运算（损坏/恶意 split 必须报错，不得 panic 或越界），
+元数据里的文件名拒绝路径穿越，越界偏移一律拒绝。
+
+**未决风险（必须用真实二进制验证）**：Quickwit v0.9.0 依赖的是 **tantivy 的 fork**
+（`git rev 057458b`），不是 crates.io 的 tantivy 0.26。所以"Quickwit 写出的索引文件能否被我们的 tantivy 打开"
+仍要看实际字节。两种结局都已铺好路：
+
+- 兼容 → Quickwit 直接当构建器，读方保持纯 tantivy；
+- 不兼容 → 要么把整个工作区的 tantivy 换成同一个 fork（构建器与读方统一），
+  要么让 Quickwit 只做服务化加速层、构建器用 tantivy。
+
+无论哪种结局，"任何一台机器独立搜全量"都不受影响：它由我们自己的 split 目录与上面的解包路径保证。
+
 ## 6.5 提交协议（S1 已实现）
 
 一次页面写入：
@@ -125,12 +151,17 @@ CAS 层把两者都归一为"条件未满足"，但**不接受**泛化的后端�
 - **本机文件系统不是可用后端**：`object_store` 的 local 后端不支持条件写，探针会在预检阶段直接拒绝
   （这正是"本地文件不能当对象存储语义模型"的可执行证据）。
 
-## 7. 删除与压缩
+## 7. 删除与压缩（S3 已实现）
 
 - **不用 Quickwit delete-tasks**。那是集群形态的产物（只对 mature split 生效、需要协调者与可见性探针）。
-- 删除 = 权威 manifest 里写 tombstone → 查询期过滤 → 物理清除发生在压缩时。
-- 压缩 = 从权威页面重建分片；任何机器拿到租约就能做，做完只**新增**分片并 CAS 换 `head.pb`。
-- **没有机器跑压缩时系统不降级**，只是分片变多。
+- 删除 = 权威 manifest 里写 tombstone（`delete_page`，走与写入同一条 CAS 提交路径）→ 查询期过滤
+  （`Manifest::is_current` 是唯一的可见性规则）→ 物理清除发生在压缩时。
+- 删除是幂等的：重复删除不消耗 `seq`；对同一路径再写一次即为"更新的真相"，会清掉 tombstone。
+- 压缩 = 从权威页面重建分片（被 supersede 的旧版本与被删除的页面**由构造天然消失**，不靠过滤）；
+  任何机器拿到租约就能做，做完用一次 CAS 换 `head.json`，旧分片仍被更早的 catalog 引用。
+- 租约：`v1/leases/<scope>.json`，含 owner + 单调 epoch + 到期时间；释放 = CAS 写成"立即过期"（不做条件删除），
+  接管 = 对过期租约的 CAS；原持有者的续租因版本过期而失败。
+- **没有机器跑压缩时系统不降级**，只是分片变多：压缩是可放弃作业。
 
 ## 8. 故障模型
 
@@ -172,6 +203,14 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
 
+**S3（删除与压缩）**
+
+- 删除后：页面从 manifest 移除、tombstone 就位；重复删除不推进 `seq`；再写入会清掉 tombstone。
+- 压缩：3 个分片 → 1 个分片，**检索结果逐条不变**，且被删除的页面没有复活（它的词条查不到）。
+- 压缩期间租约被占：第二个压缩者返回 `skipped`，不做任何写入（可放弃作业必须能放弃）。
+- 租约语义：TTL 内不可抢占；过期后可接管且 epoch 递增；原持有者续租失败；释放后立即可被接管。
+- `.split` 容器：可从原文解包成 tantivy 目录并被检索（跨进程往返测试），损坏/恶意 footer 不 panic。
+
 **S2（分片发布与检索）**
 
 - 目录追加：8 个并发发布全部保留（generation=8），且测试断言本轮确实发生过 head CAS 冲突；重复发布同一 `content_hash` 不推进 generation。
@@ -199,6 +238,7 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 
 1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）。
 2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）。
-3. Quickwit 产出的 `.split` 能否解包成 tantivy 目录被进程内直读——决定"Quickwit 当构建器"是否可行；
-   若不可行，则由 tantivy 直接承担构建器角色，Quickwit 退化为可选的服务化加速层；
+3. ~~Quickwit 产出的 `.split` 能否解包成 tantivy 目录被进程内直读~~ —— **格式已实现并测试**（见 §6.4）；
+   剩下的是**格式版本兼容性**：用真实 Quickwit v0.9.0 产出一个 split，看我们的 tantivy 0.26 能否打开它
+   （Quickwit 用的是 tantivy fork `057458b`）；
 4. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`。

@@ -16,6 +16,7 @@ object_store = { workspace = true }
 qm-core = { workspace = true }
 qm-store = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tantivy = { workspace = true }
 walkdir = { workspace = true }
 

@@ -125,6 +125,26 @@ impl WalEntry {
     }
 }
 
+/// A deleted path: the tombstone that keeps it deleted.
+///
+/// Deletion never removes objects from the bucket — old splits and page
+/// versions survive by design. What makes a delete authoritative is this
+/// record, plus the search path refusing any candidate the manifest no longer
+/// names. The record also carries the sequence that deleted the page, so a
+/// rebuild can tell "this write happened before the delete, do not resurrect
+/// it" without trusting clocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    /// Commit sequence that recorded the deletion.
+    pub seq: u64,
+    /// Deletion timestamp in milliseconds.
+    pub deleted_at_ms: i64,
+    /// Machine that performed the deletion.
+    pub writer_id: WriterId,
+    /// Version that was current when the page was deleted, if any.
+    pub last_page_id: Option<PageId>,
+}
+
 /// Per-project commit point.
 ///
 /// Invariant: `seq` increases by exactly one per successful CAS, so it counts
@@ -141,6 +161,8 @@ pub struct Manifest {
     pub seq: u64,
     /// Current version per page path.
     pub pages: BTreeMap<String, PageEntry>,
+    /// Deleted paths, kept so a rebuild cannot resurrect them.
+    pub tombstones: BTreeMap<String, Tombstone>,
     /// Timestamp of the last commit, in milliseconds.
     pub updated_at_ms: i64,
 }
@@ -155,6 +177,7 @@ impl Manifest {
             project_id,
             seq: 0,
             pages: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
             updated_at_ms: 0,
         }
     }
@@ -178,10 +201,37 @@ impl Manifest {
     }
 
     /// Record a committed page version.
+    ///
+    /// Writing a path clears its tombstone: the newer commit is the truth.
     pub fn record(&mut self, path: &PagePath, entry: PageEntry) {
         self.seq = entry.seq;
         self.updated_at_ms = self.updated_at_ms.max(entry.created_at_ms);
+        self.tombstones.remove(path.as_str());
         self.pages.insert(path.as_str().to_string(), entry);
+    }
+
+    /// Record a deletion: the path leaves `pages` and gains a tombstone.
+    pub fn tombstone(&mut self, path: &PagePath, tombstone: Tombstone) {
+        self.seq = tombstone.seq;
+        self.updated_at_ms = self.updated_at_ms.max(tombstone.deleted_at_ms);
+        self.pages.remove(path.as_str());
+        self.tombstones.insert(path.as_str().to_string(), tombstone);
+    }
+
+    /// Whether the path is currently deleted.
+    #[must_use]
+    pub fn is_tombstoned(&self, path: &PagePath) -> bool {
+        self.tombstones.contains_key(path.as_str())
+    }
+
+    /// Whether the manifest still names this exact page version as current.
+    ///
+    /// This is the only visibility rule the search path may use.
+    #[must_use]
+    pub fn is_current(&self, path: &str, page_id: &str) -> bool {
+        self.pages
+            .get(path)
+            .is_some_and(|entry| entry.page_id.as_str() == page_id)
     }
 }
 
@@ -239,6 +289,34 @@ impl IndexCatalog {
         self.generation += 1;
         self.covered_until_ms = self.covered_until_ms.max(now_ms);
         self.splits.push(split);
+    }
+}
+
+/// A lease on an optional, abandonable job (compaction, garbage collection).
+///
+/// Leases exist so that "only one machine at a time" is expressible without a
+/// server. Every field is in the object, so a machine that finds an expired
+/// lease can take over simply by winning the CAS; nothing has to be released
+/// cleanly for the system to make progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Machine currently holding the lease.
+    pub owner: WriterId,
+    /// Monotonic takeover counter; bumped on every acquisition.
+    pub epoch: u64,
+    /// When the holder acquired it, in milliseconds.
+    pub acquired_at_ms: i64,
+    /// When the lease stops being valid, in milliseconds.
+    pub expires_at_ms: i64,
+}
+
+impl Lease {
+    /// Whether a takeover is allowed at `now_ms`.
+    #[must_use]
+    pub fn is_expired(&self, now_ms: i64) -> bool {
+        now_ms >= self.expires_at_ms
     }
 }
 
@@ -302,6 +380,57 @@ mod tests {
         assert_eq!(catalog.generation, 1);
         assert!(catalog.contains_hash("h1"));
         assert_eq!(catalog.covered_until_ms, 10);
+    }
+
+    #[test]
+    fn tombstoning_removes_the_page_and_refuses_to_resurrect_it() {
+        let path = path();
+        let mut manifest = Manifest::empty(
+            WorkspaceId::new("acme").unwrap(),
+            ProjectId::new("ai-memory").unwrap(),
+        );
+        let page_id = derive_page_id(&path, "Raft", "body", None);
+        manifest.record(
+            &path,
+            PageEntry {
+                page_id: page_id.clone(),
+                seq: 1,
+                created_at_ms: 10,
+                writer_id: WriterId::new("mbp-1").unwrap(),
+                title: "Raft".into(),
+                supersedes: None,
+            },
+        );
+        assert!(manifest.is_current(path.as_str(), page_id.as_str()));
+
+        manifest.tombstone(
+            &path,
+            Tombstone {
+                seq: 2,
+                deleted_at_ms: 20,
+                writer_id: WriterId::new("mbp-1").unwrap(),
+                last_page_id: Some(page_id.clone()),
+            },
+        );
+        assert!(manifest.is_tombstoned(&path));
+        assert!(!manifest.is_current(path.as_str(), page_id.as_str()));
+        assert!(manifest.head(&path).is_none());
+
+        // Writing the path again clears the tombstone: newer wins.
+        let second = derive_page_id(&path, "Raft", "body v2", None);
+        manifest.record(
+            &path,
+            PageEntry {
+                page_id: second.clone(),
+                seq: 3,
+                created_at_ms: 30,
+                writer_id: WriterId::new("mbp-2").unwrap(),
+                title: "Raft".into(),
+                supersedes: None,
+            },
+        );
+        assert!(!manifest.is_tombstoned(&path));
+        assert!(manifest.is_current(path.as_str(), second.as_str()));
     }
 
     #[test]
