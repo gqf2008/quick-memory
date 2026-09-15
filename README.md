@@ -177,8 +177,9 @@ cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 query
 探针会在预检阶段拒绝它。
 
 `QM_S3_PREFIX` 目前只被 `cas-conformance` 的对象 key 与 `search-probe build/query` 的分片前缀采用；
-其它探针路径不能把它当全局隔离。真桶验收仍应使用专用 bucket 或专用 prefix，并显式传入唯一 scope；
-`digest-probe` 不自动清理，`seed` 在写入前发现目标 scope 非空就会拒绝。
+其它探针路径不能把它当全局隔离。真桶验收仍应使用专用 bucket 或专用 prefix，并显式传入唯一 scope。
+`digest-probe seed/read` 的 `--workspace` / `--project` 是必填参数；`seed` 的 listing 预检为防复用的
+best-effort，不是并发锁。`digest-probe` 不自动清理，发现目标 scope 非空就会拒绝。
 
 `docs.jsonl` 每行一个 `PageDoc`：
 

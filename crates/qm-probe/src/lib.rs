@@ -27,7 +27,8 @@ pub struct S3Config {
     pub secret_access_key: String,
     /// Path-style requests. R2 needs `true`.
     pub force_path_style: bool,
-    /// Key prefix every probe object lives under.
+    /// Key prefix applied by probes that explicitly adopt it; this is not a
+    /// global namespace boundary for every probe.
     pub prefix: String,
 }
 

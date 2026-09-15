@@ -148,11 +148,11 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   `streams_active` 都只有 `vector`，且无 provider 时命令硬失败、同宽换模型在查询向量生成前被身份守卫拒绝；
   它不是产品 CLI，而是探针的协议层证据。见 `crates/qm-probe/tests/search_probe_stub.rs`。
 - **digest 也有一条跨进程证据**：`digest-probe seed` 与 `digest-probe read` 是**两个独立进程**打同一个
-  stub——第一个提交两页、删掉其中一页、提交两个会话 head，并留下三根交接棒（一根开→认领→**收尾**、
+  stub；两个命令都必须显式传 `--workspace` / `--project`，不能裸跑。第一个提交两页、删掉其中一页、提交两个会话 head，并留下三根交接棒（一根开→认领→**收尾**、
   一根只开不认领、一根全部阶段都在窗口之前），第二个只有桶坐标，
   必须自己把 pages（含删除）/ sessions / handoffs 重组出来，并报告 manifest 仍认账的 live pages
   （所以「manifest 已不再返回那条 path、digest 仍报这条删除」是被断言的）。测试对两个进程显式传入同一组
-  唯一 scope；`seed` 写入前会拒绝非空目标 scope，`read` 只读，当前 probe 不自动清理。故障对照：stub 把 listing
+  唯一 scope；`seed` 写入前会用 listing 预检拒绝非空目标 scope（best-effort，不是并发锁），`read` 只读，当前 probe 不自动清理。故障对照：stub 把 listing
   第一页当成整份答案 → 同一个正向谓词（三段内容、`at_ms` 时钟序、per-section 窗口与 `limit`）变红。
   见 §6.22 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
 - **两个检索侧的故障注入对照**：stub 把 listing 的第一页当成完整答案（`--fault truncate-listing`）→
@@ -721,14 +721,15 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
   三段，整窗无活动时输出一句话而不是三个空标题。
 - MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
   而不是按 server 启动时钟——否则长驻 server 的回看窗口会冻在启动那一刻。
-- **S3 协议层的跨进程证据**：`digest-probe` 的 `seed` / `read` 是两个独立进程，并接收显式的
-  `--workspace` / `--project`；桩测试用唯一 scope 证明参数确实进入键布局。`seed` 通过真实
+- **S3 协议层的跨进程证据**：`digest-probe` 的 `seed` / `read` 是两个独立进程，`--workspace` /
+  `--project` 都是必填项；桩测试用唯一 scope 证明参数确实进入键布局，并证明裸命令会被 Clap 拒绝。`seed` 通过真实
   `object_store` S3 客户端提交两页、删掉其中一页、提交两个会话 head，并留下三根交接棒：一根
   **开 → 认领 → 收尾**（400/900/3200ms，即开与认领都在 2000ms 窗口之外、**收尾**在窗口之内）、
   一根只开不认领（2800ms）、一根全部阶段都在窗口之前（300ms）。`read` 只有桶坐标，必须把三段重新
   组装出来，并同时报告 manifest 仍认账的 live pages——所以「删除还在 digest 里、而 manifest 已经不返回
   那条 path」是被断言的事实，不是对代码的转述。
-  `seed` 写入前先列出目标 scope，只要已有任何对象就 fail-loud，不覆盖也不自动清理；测试另行证明
+  `seed` 写入前先列出目标 scope，只要已有任何对象就 fail-loud，不覆盖也不自动清理；这是 best-effort
+  预检，不是并发锁。测试另行证明
   非空 scope 的第二次 seed 被拒绝且对象集合逐字不变、不同 scope 的 read 互相不可见。
   `crates/qm-probe/tests/digest_probe_stub.rs` 还钉住：`at_ms` 时钟序与 commit log 的 `seq` 序
   **故意不一致**（只按日志顺序返回就会红）、交接棒的窗口与排序都取 created/claimed/finished 的**最新阶段**
@@ -1256,7 +1257,7 @@ Quickwit 官方 `quickwit/quickwit:0.9.0` 产出的真分片已于 2026-09-15 �
 4. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
    `search-probe vector-query`，并把无 provider / 同宽换模型两条 fail-closed 对照一起跑一遍——
    **协议层（stub）已验证，真 R2 待验证**（无凭据）。见 §5.1 与 §6.20。
-5. 真 R2 上跑 `qm-probe digest-probe seed` 然后 `read`（跨进程恢复最近变化摘要；两个进程传同一组唯一 `--workspace`/`--project`）—— **协议层已验证（stub），真 R2 待验证**
+5. 真 R2 上跑 `qm-probe digest-probe seed --workspace <unique> --project <unique>`，再用同一组参数跑 `read`（跨进程恢复最近变化摘要）—— **协议层已验证（stub），真 R2 待验证**
    （无凭据）：两个独立 `digest-probe` 进程在本地 S3 stub 上跑通 seed → read，
    删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，交接棒的开/认领/**收尾**三个阶段
    都跨进程往返（窗口与排序按最新阶段判定），并有一条 listing 截断的故障对照使同一个正向谓词变红。

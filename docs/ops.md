@@ -170,7 +170,7 @@ qm import --from ./backup-2026-09-15    # 迁到另一个桶/项目；内容相�
 
 Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `design.md` §6.4/§10.5），这不是真 R2 证据。
 仍未验证的是 **R2 特有行为**（PUT 返回 version、GET 不返回）、**向量检索链在真 R2 上的行为**，
-以及**在真 R2 上跑一遍跨进程 digest**（`digest-probe seed` 然后 `read`；两者必须显式传同一组唯一 `--workspace` / `--project`）。
+以及**在真 R2 上跑一遍跨进程 digest**（`digest-probe seed` 然后 `read`；`--workspace` / `--project` 必填，两者必须传同一组唯一值）。
 有 R2 凭据时先跑 `cargo run -p qm-probe --bin cas-conformance`，它专门盯这组后端差异；
 向量链另有 `search-probe vector-publish` / `vector-query` 的真桶验收点，digest 另有 `digest-probe` 的跨进程闭环。
 
@@ -192,7 +192,8 @@ embedding stub 发布向量、独立进程 B 只靠 `vector` 流召回”的闭�
 created/claimed/finished 里最新的那个」是被断言的，不是靠一根只开不认领的棒凑出来的。`read` 同时报告
 manifest 仍认账的 live pages，所以「manifest 已不再返回那条 path、digest 仍然报这条删除」也是被断言的
 事实，而不是对代码的转述（见 `design.md` §6.22、`crates/qm-probe/tests/digest_probe_stub.rs`）。
-`seed` 的 scope 参数会进入键布局，写入前会拒绝非空目标 scope；`read` 只读。当前 probe 不自动清理，
+`seed` 的 scope 参数是必填项，会进入键布局；写入前的 listing 预检会拒绝非空目标 scope，但它是
+防复用的 best-effort 检查，不是并发锁。`read` 只读。当前 probe 不自动清理，
 所以真桶应使用专用 bucket/prefix，并为每次运行显式传唯一 scope。`QM_S3_PREFIX` 只被
 `cas-conformance` 与 `search-probe build/query` 采用，不是所有 probe 的全局隔离。
 它与其他 stub 证据一样，**只在协议层验证过，真 R2 仍未验证**。

@@ -27,14 +27,6 @@ use qm_core::{
 use qm_probe::{S3Config, init_tracing};
 use qm_store::{CasStore, CommitPageRequest, IngestObservationsRequest, ProjectStore};
 
-/// Compatibility defaults for callers that still omit the scope flags.
-///
-/// Every stub carries its own fresh bucket, so these constants stay hermetic
-/// there. A real bucket must pass an explicit unique scope to both processes;
-/// `seed` refuses to reuse any non-empty scope.
-const DEFAULT_WORKSPACE: &str = "probe-digest-ws";
-const DEFAULT_PROJECT: &str = "probe-digest-proj";
-
 /// The scenario timeline.
 ///
 /// The commits are deliberately written in the *opposite* order to their
@@ -72,11 +64,11 @@ struct Args {
 
 #[derive(Debug, clap::Args)]
 struct ScopeArgs {
-    /// Workspace ID to write/read. Use one unique value for both processes.
-    #[arg(long, default_value = DEFAULT_WORKSPACE)]
+    /// Workspace ID to write/read. Required; use the same unique value in both processes.
+    #[arg(long)]
     workspace: String,
-    /// Project ID to write/read. Use one unique value for both processes.
-    #[arg(long, default_value = DEFAULT_PROJECT)]
+    /// Project ID to write/read. Required; use the same unique value in both processes.
+    #[arg(long)]
     project: String,
 }
 

@@ -323,6 +323,38 @@ fn paging_stub() -> S3Stub {
 }
 
 #[test]
+fn seed_and_read_require_explicit_scope_arguments() {
+    let stub = paging_stub();
+    let _ = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
+    let before = stub.objects();
+    assert!(
+        !before.is_empty(),
+        "the guard must be checked against a populated bucket"
+    );
+
+    for command in ["seed", "read"] {
+        let output = probe(&stub, &[command]);
+        assert!(
+            !output.status.success(),
+            "`{command}` without scope flags must fail:\n{}",
+            combined(&output)
+        );
+        let text = combined(&output);
+        assert!(
+            text.contains("--workspace") && text.contains("--project"),
+            "`{command}` must name both required scope arguments:\n{text}"
+        );
+        assert_eq!(
+            stub.objects(),
+            before,
+            "a rejected `{command}` invocation must not touch the bucket"
+        );
+    }
+
+    stub.shutdown();
+}
+
+#[test]
 fn a_second_process_reads_the_whole_digest_from_the_bucket() {
     let stub = paging_stub();
     let seed = seed(&stub, SCOPE_A_WORKSPACE, SCOPE_A_PROJECT);
