@@ -123,7 +123,10 @@ impl From<OsError> for StoreError {
 
 mod project;
 
-pub use project::{CommitOutcome, CommitPageRequest, LoadedManifest, ProjectStore, RetryPolicy};
+pub use project::{
+    CommitOutcome, CommitPageRequest, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome,
+    RetryPolicy,
+};
 
 /// Serialize a value for an object body.
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Bytes, StoreError> {

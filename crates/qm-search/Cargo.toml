@@ -13,6 +13,8 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
+qm-core = { workspace = true }
+qm-store = { workspace = true }
 serde = { workspace = true }
 tantivy = { workspace = true }
 walkdir = { workspace = true }

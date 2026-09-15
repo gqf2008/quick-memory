@@ -1390,6 +1390,8 @@ dependencies = [
  "bytes",
  "futures",
  "object_store",
+ "qm-core",
+ "qm-store",
  "serde",
  "tantivy",
  "tempfile",

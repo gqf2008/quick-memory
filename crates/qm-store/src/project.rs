@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use qm_core::{
-    KeyLayout, MANIFEST_SCHEMA, Manifest, PageEntry, PagePath, PageVersion, ProjectId, WalEntry,
-    WorkspaceId, WriterId, derive_page_id,
+    CatalogHead, IndexCatalog, KeyLayout, MANIFEST_SCHEMA, Manifest, PageEntry, PagePath,
+    PageVersion, ProjectId, SplitEntry, WalEntry, WorkspaceId, WriterId, content_hash,
+    derive_page_id,
 };
 
 use crate::{CasStore, ObjectVersion, StoreError, decode, encode};
@@ -48,6 +49,30 @@ pub struct LoadedManifest {
     pub manifest: Manifest,
     /// Version to pass to a CAS, or `None` when the manifest does not exist yet.
     pub version: Option<ObjectVersion>,
+}
+
+/// A catalog plus the head version it was read at.
+#[derive(Debug, Clone)]
+pub struct LoadedCatalog {
+    /// Current catalog (empty when nothing has been published).
+    pub catalog: IndexCatalog,
+    /// Full object key of the pinned catalog, if any.
+    pub catalog_key: Option<String>,
+    /// Head version to pass to a CAS, or `None` when the head does not exist.
+    pub head_version: Option<ObjectVersion>,
+}
+
+/// What a split publication did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishOutcome {
+    /// Catalog generation after the publish.
+    pub generation: u64,
+    /// Key of the catalog version describing that generation.
+    pub catalog_key: String,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
+    /// True when this split was already published (publication is idempotent).
+    pub already_present: bool,
 }
 
 /// One page write to commit.
@@ -219,6 +244,116 @@ impl ProjectStore {
                         supersedes,
                         attempts: attempt,
                         page_object_created,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Load the index catalog, treating "absent" as an empty index.
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] when the head and the catalog disagree.
+    pub async fn load_catalog(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+    ) -> Result<LoadedCatalog, StoreError> {
+        let head_key = self.layout.catalog_head(workspace_id, project_id);
+        let (head, head_version) = match self.cas.read(&head_key).await {
+            Ok((bytes, version)) => (decode::<CatalogHead>(&bytes, &head_key)?, Some(version)),
+            Err(StoreError::NotFound) => {
+                return Ok(LoadedCatalog {
+                    catalog: IndexCatalog::empty(),
+                    catalog_key: None,
+                    head_version: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let (bytes, _) = self.cas.read(&head.catalog_key).await?;
+        let catalog: IndexCatalog = decode(&bytes, &head.catalog_key)?;
+        if catalog.generation != head.generation {
+            return Err(StoreError::Corrupt(format!(
+                "head generation {} but catalog {} says {}",
+                head.generation, head.catalog_key, catalog.generation
+            )));
+        }
+        Ok(LoadedCatalog {
+            catalog,
+            catalog_key: Some(head.catalog_key),
+            head_version,
+        })
+    }
+
+    /// Publish a split into the project catalog.
+    ///
+    /// The split's files are expected to be uploaded already: an unpublished
+    /// split is invisible, so uploading first is always safe. Publishing the
+    /// same `content_hash` twice is a no-op, which makes the whole step
+    /// replay-safe.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race.
+    pub async fn publish_split(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        split: SplitEntry,
+        now_ms: i64,
+    ) -> Result<PublishOutcome, StoreError> {
+        let head_key = self.layout.catalog_head(workspace_id, project_id);
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let loaded = self.load_catalog(workspace_id, project_id).await?;
+            if loaded.catalog.contains_hash(&split.content_hash) {
+                return Ok(PublishOutcome {
+                    generation: loaded.catalog.generation,
+                    catalog_key: loaded.catalog_key.unwrap_or_default(),
+                    attempts: attempt,
+                    already_present: true,
+                });
+            }
+
+            let mut catalog = loaded.catalog;
+            catalog.push_split(split.clone(), now_ms);
+            let bytes = encode(&catalog)?;
+            let catalog_key =
+                self.layout
+                    .catalog_version(workspace_id, project_id, &content_hash(&bytes));
+            self.create_or_verify(&catalog_key, &catalog).await?;
+
+            let head = CatalogHead {
+                schema: MANIFEST_SCHEMA,
+                generation: catalog.generation,
+                catalog_key: catalog_key.clone(),
+                updated_at_ms: now_ms,
+            };
+            let bytes = encode(&head)?;
+            let swapped = match loaded.head_version {
+                Some(version) => self.cas.update(&head_key, bytes, &version).await,
+                None => self.cas.create(&head_key, bytes).await,
+            };
+
+            match swapped {
+                Ok(_) => {
+                    return Ok(PublishOutcome {
+                        generation: catalog.generation,
+                        catalog_key,
+                        attempts: attempt,
+                        already_present: false,
                     });
                 }
                 Err(StoreError::Precondition | StoreError::AlreadyExists) => {
@@ -486,6 +621,80 @@ mod tests {
         let head_seqs: Vec<u64> = manifest.pages.values().map(|e| e.seq).collect();
         let max_seq = head_seqs.iter().copied().max().unwrap();
         assert_eq!(max_seq, 80, "the last commit is the 80th sequence");
+    }
+
+    fn split(writer: &str, seq: u64, hash: &str) -> SplitEntry {
+        SplitEntry {
+            writer_id: WriterId::new(writer).unwrap(),
+            seq,
+            prefix: format!("v1/ws/acme/proj/ai-memory/index/splits/{writer}/{seq:010}"),
+            doc_count: 1,
+            content_hash: hash.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publishing_the_same_split_twice_is_a_no_op() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let first = store
+            .publish_split(&ws(), &proj(), split("mbp-1", 1, "h1"), 10)
+            .await
+            .unwrap();
+        assert_eq!(first.generation, 1);
+        assert!(!first.already_present);
+
+        let again = store
+            .publish_split(&ws(), &proj(), split("mbp-1", 1, "h1"), 20)
+            .await
+            .unwrap();
+        assert!(again.already_present, "republishing must not advance");
+        assert_eq!(again.generation, 1);
+        assert_eq!(again.catalog_key, first.catalog_key);
+
+        let loaded = store.load_catalog(&ws(), &proj()).await.unwrap();
+        assert_eq!(loaded.catalog.splits.len(), 1);
+        assert_eq!(loaded.catalog.generation, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_keep_every_split() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut tasks = Vec::new();
+        for index in 0..8u64 {
+            let store = machine(&bucket);
+            tasks.push(tokio::spawn(async move {
+                store
+                    .publish_split(
+                        &ws(),
+                        &proj(),
+                        split("mbp-1", index + 1, &format!("h{index}")),
+                        index as i64,
+                    )
+                    .await
+                    .expect("publish")
+            }));
+        }
+        let mut attempts = 0u32;
+        for task in tasks {
+            attempts += task.await.unwrap().attempts;
+        }
+
+        let store = machine(&bucket);
+        let loaded = store.load_catalog(&ws(), &proj()).await.unwrap();
+        assert_eq!(loaded.catalog.splits.len(), 8, "a publish was lost");
+        assert_eq!(loaded.catalog.generation, 8);
+        let hashes: BTreeSet<&str> = loaded
+            .catalog
+            .splits
+            .iter()
+            .map(|s| s.content_hash.as_str())
+            .collect();
+        assert_eq!(hashes.len(), 8);
+        assert!(
+            attempts > 8,
+            "expected at least one head CAS conflict, saw {attempts} attempts"
+        );
     }
 
     #[tokio::test]

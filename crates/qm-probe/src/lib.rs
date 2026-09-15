@@ -312,6 +312,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn search_scenario_detects_stale_copies_and_offline_machines() {
+        let bucket: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let report = run_search_scenario(&bucket, Some("unit-search".to_string()))
+            .await
+            .unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.splits, 3);
+        assert_eq!(report.hits, 1);
+        assert!(report.filtered_out >= 1);
+    }
+
+    #[tokio::test]
     async fn scenario_verifies_a_backend_with_working_cas() {
         let bucket: std::sync::Arc<dyn ObjectStore> =
             std::sync::Arc::new(object_store::memory::InMemory::new());
@@ -336,4 +349,207 @@ mod tests {
             12 + 12 + 1
         );
     }
+}
+
+/// What the search scenario observed, after verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchScenarioReport {
+    /// Workspace id the run used.
+    pub workspace: String,
+    /// Project id the run used.
+    pub project: String,
+    /// Splits published into the catalog.
+    pub splits: usize,
+    /// Hits for the query that matches both a stale and a current version.
+    pub hits: usize,
+    /// Candidates the manifest rejected as stale.
+    pub filtered_out: usize,
+    /// Verification failures; empty means the run proved the invariants.
+    pub failures: Vec<String>,
+}
+
+/// Run the S2 acceptance scenario against `bucket` and verify it.
+///
+/// Three machines publish splits; one of them supersedes a page another had
+/// published and then never participates again. A fresh reader must return the
+/// current version exactly once, refuse the superseded copy, and still find
+/// the content of the machine that went away.
+///
+/// # Errors
+/// Fails on backend, build, or search errors; verification results are
+/// reported in [`SearchScenarioReport::failures`].
+pub async fn run_search_scenario(
+    bucket: &std::sync::Arc<dyn ObjectStore>,
+    scope_suffix: Option<String>,
+) -> Result<SearchScenarioReport> {
+    use std::path::Path;
+
+    use qm_core::{PagePath, ProjectId, WorkspaceId, WriterId};
+    use qm_search::{PageDoc, publish_split_index, search_project};
+    use qm_store::{CommitPageRequest, ProjectStore, RetryPolicy};
+
+    let run = scope_suffix.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    });
+    let workspace = WorkspaceId::new(format!("probe-ws-{run}"))?;
+    let project = ProjectId::new(format!("probe-proj-{run}"))?;
+    let project_store =
+        ProjectStore::new(std::sync::Arc::clone(bucket), "v1").with_retry(RetryPolicy {
+            max_attempts: 32,
+            base_delay: std::time::Duration::from_millis(10),
+        });
+    let build_root = tempfile::TempDir::new().context("creating build dir")?;
+
+    struct Ctx<'a> {
+        bucket: &'a std::sync::Arc<dyn ObjectStore>,
+        store: &'a ProjectStore,
+        workspace: &'a WorkspaceId,
+        project: &'a ProjectId,
+        build_root: &'a Path,
+    }
+
+    impl Ctx<'_> {
+        async fn write_and_publish(
+            &self,
+            writer: &str,
+            path: &str,
+            body: &str,
+            now_ms: i64,
+        ) -> Result<qm_core::PageVersion> {
+            let writer_id = WriterId::new(writer)?;
+            let page_path = PagePath::new(path)?;
+            self.store
+                .commit_page(CommitPageRequest {
+                    workspace_id: self.workspace.clone(),
+                    project_id: self.project.clone(),
+                    path: page_path.clone(),
+                    title: path.to_string(),
+                    body: body.to_string(),
+                    writer_id: writer_id.clone(),
+                    now_ms,
+                })
+                .await?;
+            let page = self
+                .store
+                .read_page(self.workspace, self.project, &page_path)
+                .await?
+                .context("committed page not readable")?;
+            let doc = PageDoc::from_version(self.workspace, self.project, &page, now_ms);
+            let build_dir = self.build_root.join(writer);
+            publish_split_index(
+                self.bucket.as_ref(),
+                self.store,
+                self.workspace,
+                self.project,
+                &writer_id,
+                1,
+                &[doc],
+                &build_dir,
+                now_ms,
+            )
+            .await?;
+            Ok(page)
+        }
+    }
+
+    let ctx = Ctx {
+        bucket,
+        store: &project_store,
+        workspace: &workspace,
+        project: &project,
+        build_root: build_root.path(),
+    };
+
+    ctx.write_and_publish(
+        "probe-a",
+        "shared/raft.md",
+        "leader election and joint consensus",
+        10,
+    )
+    .await?;
+    // This machine publishes and is never heard from again.
+    ctx.write_and_publish(
+        "probe-b",
+        "notes/quickwit.md",
+        "tantivy splits in object storage",
+        20,
+    )
+    .await?;
+    let latest = ctx
+        .write_and_publish(
+            "probe-c",
+            "shared/raft.md",
+            "leader election and snapshots",
+            30,
+        )
+        .await?;
+
+    let reader = ProjectStore::new(std::sync::Arc::clone(bucket), "v1");
+    let cache = tempfile::TempDir::new().context("creating cache dir")?;
+    let mut failures = Vec::new();
+
+    let both = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        cache.path(),
+        "election",
+        10,
+    )
+    .await?;
+    if both.hits.len() != 1 {
+        failures.push(format!(
+            "expected exactly one live hit, got {}",
+            both.hits.len()
+        ));
+    } else if both.hits[0].page_id != latest.page_id.as_str() {
+        failures.push("the hit is not the current version".to_string());
+    }
+    if both.filtered_out == 0 {
+        failures.push("the superseded copy was not filtered".to_string());
+    }
+
+    let stale_only = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        cache.path(),
+        "consensus",
+        10,
+    )
+    .await?;
+    if !stale_only.hits.is_empty() {
+        failures.push(format!(
+            "a superseded body still answered with {} hit(s)",
+            stale_only.hits.len()
+        ));
+    }
+
+    let offline = search_project(
+        bucket.as_ref(),
+        &reader,
+        &workspace,
+        &project,
+        cache.path(),
+        "tantivy",
+        10,
+    )
+    .await?;
+    if offline.hits.len() != 1 || offline.hits[0].path != "notes/quickwit.md" {
+        failures.push("the offline machine's content is not searchable".to_string());
+    }
+
+    Ok(SearchScenarioReport {
+        workspace: workspace.to_string(),
+        project: project.to_string(),
+        splits: both.splits_searched,
+        hits: both.hits.len(),
+        filtered_out: both.filtered_out,
+        failures,
+    })
 }

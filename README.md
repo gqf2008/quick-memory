@@ -11,6 +11,7 @@ S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**�
 - ETag CAS 契约 + 一致性探针（`qm-store`）
 - "另一台机器只有桶访问权也能搜全量"的端到端往返（`qm-search`）
 - 多机并发提交：无覆盖、supersession 链完整、WAL 完整、崩溃重试幂等（`qm-store`）
+- 多机分片发布 + 跨分片 RRF 检索 + 权威可见性过滤：过期副本永不答出、离线机器的内容仍可搜（`qm-store`/`qm-search`）
 
 真 R2 与 Quickwit 的验证需要凭据与二进制，见下。
 
@@ -47,7 +48,10 @@ cargo run -p qm-probe --bin cas-conformance
 # 2) 多机并发提交（先做 CAS 预检，再跑场景并复核）
 cargo run -p qm-probe --bin manifest-probe -- --machines 3 --writes 5
 
-# 3) 跨机器检索：A 构建并上传分片
+# 3) 多机发布 + 检索（含过期副本过滤与离线机器）
+cargo run -p qm-probe --bin search-probe -- project
+
+# 4) 跨机器检索（单分片）：A 构建并上传分片
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 build docs.jsonl
 #    B（另一台机器/另一次运行）只靠桶材料化并查询
 cargo run -p qm-probe --bin search-probe -- --split-prefix demo/0000000001 query "consensus"

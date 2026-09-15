@@ -1,22 +1,25 @@
-//! Build an index into object storage, or search one published by someone else.
+//! Publish or query an index held in object storage.
 //!
-//! This is the S0 proof for "any machine can search the full corpus": the
-//! `query` side shares nothing with the `build` side except the bucket.
+//! `build`/`query` prove the S0 question (another machine can search a
+//! published split). `project` proves the S2 one: splits published by several
+//! machines are searched together, and every hit is checked against the
+//! authoritative manifest before it is returned.
 
 use std::io::BufRead;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use qm_probe::{S3Config, init_tracing};
+use qm_probe::{S3Config, delete_scope, init_tracing, run_search_scenario};
 use qm_search::{PageDoc, build_index, materialize, search, upload_dir};
 
 #[derive(Debug, Parser)]
 #[command(about = "Publish or query a tantivy index held in object storage")]
 struct Args {
     /// Where the index files live, relative to the configured prefix.
+    /// Required for `build` and `query`.
     #[arg(long)]
-    split_prefix: String,
+    split_prefix: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -36,6 +39,12 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Run the multi-machine publish-and-search scenario against the backend.
+    Project {
+        /// Leave the probe scope in the bucket instead of deleting it.
+        #[arg(long, default_value_t = false)]
+        keep: bool,
+    },
 }
 
 #[tokio::main]
@@ -44,14 +53,15 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = S3Config::from_env()?;
     let store = config.build_store()?;
-    let prefix = format!(
-        "{}/{}",
-        config.prefix.trim_matches('/'),
-        args.split_prefix.trim_matches('/')
-    );
+    // Resolve the split prefix before the command is moved out of `args`.
+    let prefix = match &args.command {
+        Command::Build { .. } | Command::Query { .. } => Some(split_prefix(&args, &config)?),
+        Command::Project { .. } => None,
+    };
 
     match args.command {
         Command::Build { docs } => {
+            let prefix = prefix.expect("resolved above");
             let file = std::fs::File::open(&docs)
                 .with_context(|| format!("opening {}", docs.display()))?;
             let mut pages = Vec::new();
@@ -77,6 +87,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Query { query, limit } => {
+            let prefix = prefix.expect("resolved above");
             let cache = tempfile::TempDir::new().context("creating cache dir")?;
             let files = materialize(store.as_ref(), &prefix, cache.path()).await?;
             let hits = search(cache.path(), &query, limit)?;
@@ -90,6 +101,39 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
+        Command::Project { keep } => {
+            let report = run_search_scenario(&store, None).await?;
+            for failure in &report.failures {
+                eprintln!("FAIL {failure}");
+            }
+            println!(
+                "splits={} hits={} filtered_out={}",
+                report.splits, report.hits, report.filtered_out
+            );
+            let mut result = Ok(());
+            if report.failures.is_empty() {
+                println!("all checks passed");
+            } else {
+                result = Err(anyhow::anyhow!("{} checks failed", report.failures.len()));
+            }
+            if !keep {
+                let deleted = delete_scope(&store, &report.workspace).await?;
+                println!("cleaned up {deleted} objects");
+            }
+            result?;
+        }
     }
     Ok(())
+}
+
+fn split_prefix(args: &Args, config: &S3Config) -> Result<String> {
+    let relative = args
+        .split_prefix
+        .as_deref()
+        .context("--split-prefix is required for build and query")?;
+    Ok(format!(
+        "{}/{}",
+        config.prefix.trim_matches('/'),
+        relative.trim_matches('/')
+    ))
 }

@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 mod model;
 
-pub use model::{MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion, WalEntry, derive_page_id};
+pub use model::{
+    CatalogHead, IndexCatalog, MANIFEST_SCHEMA, Manifest, PageEntry, PageVersion, SplitEntry,
+    WalEntry, content_hash, derive_page_id,
+};
 
 /// Version prefix of the object layout. Bumping it is a breaking change.
 pub const KEY_ROOT: &str = "v1";
@@ -232,11 +235,20 @@ impl KeyLayout {
         format!("{}/index/head.json", self.scope_prefix(ws, proj))
     }
 
-    /// Immutable index catalog version.
+    /// Immutable index catalog version, addressed by its content hash.
+    ///
+    /// Content-addressed for the same reason page versions are: a CAS retry
+    /// must be able to rewrite the same key with identical bytes, and a reader
+    /// that pinned an older generation must still find it.
     #[must_use]
-    pub fn catalog_version(&self, ws: &WorkspaceId, proj: &ProjectId, seq: u64) -> String {
+    pub fn catalog_version(
+        &self,
+        ws: &WorkspaceId,
+        proj: &ProjectId,
+        content_hash: &str,
+    ) -> String {
         format!(
-            "{}/index/catalog/{seq:010}.json",
+            "{}/index/catalog/{content_hash}.json",
             self.scope_prefix(ws, proj)
         )
     }
@@ -263,32 +275,6 @@ impl KeyLayout {
     pub fn lease(&self, scope: &str) -> String {
         format!("{}/leases/{scope}.pb", self.root)
     }
-}
-
-/// One published split, as recorded in the index catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SplitEntry {
-    /// Machine that built and published the split.
-    pub writer_id: WriterId,
-    /// Monotonic per-writer sequence number.
-    pub seq: u64,
-    /// Object-key prefix holding the split's files.
-    pub prefix: String,
-    /// Number of documents in the split.
-    pub doc_count: u64,
-    /// Content hash over the split's files, for idempotent republication.
-    pub content_hash: String,
-}
-
-/// Index catalog: the set of splits a reader must open to cover a project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexCatalog {
-    /// Catalog generation; also the CAS sequence.
-    pub generation: u64,
-    /// All splits that make up the current index, oldest first.
-    pub splits: Vec<SplitEntry>,
-    /// Timestamp (ms) through which the catalog is known complete.
-    pub covered_until_ms: i64,
 }
 
 #[cfg(test)]
@@ -336,8 +322,8 @@ mod tests {
             "v1/ws/acme/proj/ai-memory/pages/notes/a.md/versions/abc.md"
         );
         assert_eq!(
-            layout.catalog_version(&ws(), &proj(), 7),
-            "v1/ws/acme/proj/ai-memory/index/catalog/0000000007.json"
+            layout.catalog_version(&ws(), &proj(), "abc123"),
+            "v1/ws/acme/proj/ai-memory/index/catalog/abc123.json"
         );
         let writer = WriterId::new("mbp-1").unwrap();
         assert_eq!(

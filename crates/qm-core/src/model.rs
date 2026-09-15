@@ -17,6 +17,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{PageId, PagePath, ProjectId, WorkspaceId, WriterId};
 
+/// Lower-case hex SHA-256 of an object body, used for content-addressed keys.
+#[must_use]
+pub fn content_hash(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
 /// Manifest/WAL encoding schema. Bumping it is a breaking change.
 pub const MANIFEST_SCHEMA: u32 = 1;
 
@@ -179,6 +185,80 @@ impl Manifest {
     }
 }
 
+/// One published split, as recorded in the index catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitEntry {
+    /// Machine that built and published the split.
+    pub writer_id: WriterId,
+    /// Monotonic per-writer sequence number.
+    pub seq: u64,
+    /// Object-key prefix holding the split's files.
+    pub prefix: String,
+    /// Number of documents in the split.
+    pub doc_count: u64,
+    /// Content hash over the split's files; publishing the same split twice is
+    /// a no-op because the catalog deduplicates on this value.
+    pub content_hash: String,
+}
+
+/// Index catalog: the set of splits a reader must open to cover a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexCatalog {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Catalog generation; increases by one per publish.
+    pub generation: u64,
+    /// Splits that make up the index, oldest first.
+    pub splits: Vec<SplitEntry>,
+    /// Timestamp (ms) through which the catalog is known complete.
+    pub covered_until_ms: i64,
+}
+
+impl IndexCatalog {
+    /// A catalog with no splits.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            schema: MANIFEST_SCHEMA,
+            generation: 0,
+            splits: Vec::new(),
+            covered_until_ms: 0,
+        }
+    }
+
+    /// Whether a split with this content is already published.
+    #[must_use]
+    pub fn contains_hash(&self, content_hash: &str) -> bool {
+        self.splits
+            .iter()
+            .any(|split| split.content_hash == content_hash)
+    }
+
+    /// Append a split and advance the generation.
+    pub fn push_split(&mut self, split: SplitEntry, now_ms: i64) {
+        self.generation += 1;
+        self.covered_until_ms = self.covered_until_ms.max(now_ms);
+        self.splits.push(split);
+    }
+}
+
+/// CAS pointer to the current index catalog.
+///
+/// Separate from the catalog itself so a reader can pin a generation: reading
+/// the head once gives a consistent snapshot even if another machine publishes
+/// while a query is running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogHead {
+    /// Encoding schema.
+    pub schema: u32,
+    /// Generation of the catalog this points at.
+    pub generation: u64,
+    /// Full object key of the immutable catalog.
+    pub catalog_key: String,
+    /// When the head was last swapped, in milliseconds.
+    pub updated_at_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +285,23 @@ mod tests {
             a,
             derive_page_id(&other_path, "Raft", "leader election", None)
         );
+    }
+
+    #[test]
+    fn catalog_dedupes_by_content_hash_and_advances_generation() {
+        let mut catalog = IndexCatalog::empty();
+        assert!(!catalog.contains_hash("h1"));
+        let split = SplitEntry {
+            writer_id: WriterId::new("mbp-1").unwrap(),
+            seq: 1,
+            prefix: "v1/ws/acme/proj/ai-memory/index/splits/mbp-1/0000000001".into(),
+            doc_count: 3,
+            content_hash: "h1".into(),
+        };
+        catalog.push_split(split, 10);
+        assert_eq!(catalog.generation, 1);
+        assert!(catalog.contains_hash("h1"));
+        assert_eq!(catalog.covered_until_ms, 10);
     }
 
     #[test]
