@@ -44,6 +44,15 @@ QM_WRITER=mbp-1 qm search "tantivy"                    # 换一台机器也能�
 
 `qm search` 需要桶里已有分片；`qm publish` 之前检索不到任何东西是正常的。
 
+检索默认融合**正文 / 实体 / 链接**三路词法信号，再按"最近改过的排前面"做一次有界微调。
+三个开关各关掉一路或那个先验：
+
+```bash
+qm search "tantivy" --no-recency      # 关掉新近度先验，纯按相关性排
+qm search "tantivy" --no-neighbors    # 不再用"链接到命中页的页面"扩展召回
+qm search "tantivy" --no-vector       # 即使配了 embedding，也不跑语义流（见第 7 节）
+```
+
 手写页面走同一条路：
 
 ```bash
@@ -52,10 +61,24 @@ qm publish
 qm read-page --path notes/raft.md
 qm history  --path notes/raft.md
 qm log --limit 10
-qm recent --limit 10        # 按最后修改时间列出页面：开场先看这里
 ```
 
-## 4. 接进 agent
+## 4. 开场先看什么：`qm recent` 与 `qm digest`
+
+新会话开始时，先问"上一个会话在做什么"，比上来就检索更快。这两条命令都只读权威对象：
+
+```bash
+qm recent --limit 10                 # 按最后修改时间列出页面（默认 10 条）
+qm digest --hours 24 --limit 20      # 最近 24 小时的提交 / 会话 / 交接棒（默认 24 小时、每段 20 条）
+```
+
+- `qm recent`：**刚接手一个项目时先看它**——它只读 manifest 里的时间戳，回答"哪些页面最近改过"，
+  不碰索引，比跑一次检索便宜得多。
+- `qm digest`：**隔了几天回来、或要接手别人的工作前看它**——`recent` 只看还存在的页面，
+  `digest` 还会告诉你哪些页面**被删了**、哪些会话还在动、有没有留给你的交接棒。
+  三段各自排序、各自封顶 `--limit` 条；时间窗用 `--hours N` 或 `--since-ms N`（两者互斥，不能同时给）。
+
+## 5. 接进 agent
 
 MCP（Codex / Claude Code 等）：
 
@@ -78,10 +101,13 @@ MCP（Codex / Claude Code 等）：
 }
 ```
 
-工具：`memory_search` / `memory_capture` / `memory_consolidate` / `memory_publish` /
-`memory_write_page` / `memory_read_page` / `memory_history` / `memory_restore` /
-`memory_log` / `memory_recent` / `memory_delete_page` / `memory_compact` /
-`memory_sessions` / `memory_status` / `memory_handoff_{open,list,claim,done}`。
+工具共 **25** 个，完整清单见 [`README.md`](../README.md#mcp-接入)。与检索回顾有关的是
+`memory_search` / `memory_recent` / `memory_digest` / `memory_log`，写入用
+`memory_capture` / `memory_consolidate` / `memory_write_page` / `memory_delete_page` /
+`memory_publish` / `memory_compact`，其余包括 `memory_read_page` / `memory_history` /
+`memory_restore` / `memory_sessions` / `memory_compact_session` / `memory_status` /
+`memory_verify` / `memory_handoff_{open,list,claim,done}` /
+`memory_propose` / `memory_proposals` / `memory_approve` / `memory_reject`。
 
 自动采集（把 harness 的生命周期钩子指向它，事件 JSON 走 stdin）：
 
@@ -93,7 +119,7 @@ qm hook-drain      # 桶恢复后重投本地 spool
 `qm hook` 在 `--timeout-ms`（默认 200ms）内写不进桶就落本地 spool 并**返回成功**：
 记忆不可用不该拖垮 agent。
 
-## 5. 可选：让编译器用 LLM
+## 6. 可选：让编译器用 LLM
 
 ```bash
 export QM_LLM_BASE_URL="https://api.openai.com/v1"   # 或任何 OpenAI 兼容端点
@@ -104,7 +130,29 @@ qm consolidate --session sess-1 --compiler llm       # 失败自动回落规则�
 
 幂等由**链指纹**决定：页面里嵌 `<!-- qm:compiled <sha256> -->`，链没变就不会因为措辞不同而反复写版本。
 
-## 6. 多机共享
+## 7. 可选：开启语义检索（embedding）
+
+前三路（正文 / 实体 / 链接）都是词法的：页面必须**含有**查询的词或标识符。想让"一个词都没重合、
+但意思相近"的页面也能被召回，配一个 OpenAI 兼容的 embedding 端点：
+
+```bash
+export QM_EMBEDDING_BASE_URL="https://api.openai.com/v1"
+export QM_EMBEDDING_API_KEY="<key>"
+export QM_EMBEDDING_MODEL="text-embedding-3-small"
+export QM_EMBEDDING_DIM="1536"        # 可选，默认 1536（text-embedding-3-small 的宽度）
+```
+
+- **未配置时这一路自动不跑，且不是错误**：不设 `QM_EMBEDDING_BASE_URL` 时 `publish` 不写向量、
+  `search` 不跑语义流，其余行为完全不变。只配一半（有 URL 但缺 key 或 model）才是硬失败。
+- **配好之后要重新 `qm publish`**：分片里的向量是发布时算出来的。
+  **换模型（或换宽度）必须重新 `publish` 重嵌入**——否则查询向量与分片里存量向量的宽度对不上，
+  整次搜索会 fail-closed 直接报错，而不是悄悄降级。
+- `qm search --no-vector` 可以临时关掉这一路。
+
+它只加召回、不挤掉直接命中。运维与容量细节见 [`ops.md`](ops.md)，
+设计取舍见 [`design.md`](design.md) 的"向量检索流"一节。
+
+## 8. 多机共享
 
 多台机器用**同一套桶 + 不同的 `QM_WRITER`**即可，无需任何服务器：
 
@@ -112,7 +160,7 @@ qm consolidate --session sess-1 --compiler llm       # 失败自动回落规则�
 - 每台机器只发布自己写的页面（本地 watermark 记录发布进度）。
 - 检索会把所有已发布分片材料化到本地缓存；缓存按内容哈希命名，命中就不下载。
 
-## 7. 排障
+## 9. 排障
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -123,7 +171,7 @@ qm consolidate --session sess-1 --compiler llm       # 失败自动回落规则�
 | `handoff ... is not open` | 别的机器已经认领，或它已完成 |
 | `spooled (...)` | 桶暂时不可达；恢复后跑 `qm hook-drain` |
 
-## 8. 读 Quickwit 产出的分片
+## 10. 读 Quickwit 产出的分片
 
 如果某个索引器用 Quickwit 而不是 quick-memory 构建分片，本仓库的读方仍能直接检索它：
 
@@ -134,7 +182,7 @@ cargo run -p qm-probe --bin split-probe -- --file /path/to/<split-id>.split --qu
 它会解包容器（u32/u64 两种 footer 都认）、列出内部文件、用 tantivy 查询并打印命中。
 依赖两个编译期特性（`zstd-compression`、`quickwit`/`sstable`），仓库已经启用。
 
-## 9. 自检探针（需要真桶）
+## 11. 自检探针（需要真桶）
 
 ```bash
 cargo run -p qm-probe --bin cas-conformance            # 条件写契约
