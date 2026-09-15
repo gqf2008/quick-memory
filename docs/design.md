@@ -153,7 +153,7 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   必须自己把 pages（含删除）/ sessions / handoffs 重组出来，并报告 manifest 仍认账的 live pages
   （所以「manifest 已不再返回那条 path、digest 仍报这条删除」是被断言的）。故障对照：stub 把 listing
   第一页当成整份答案 → 同一个正向谓词（三段内容、`at_ms` 时钟序、per-section 窗口与 `limit`）变红。
-  见 §6.20 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
+  见 §6.22 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
 - **两个检索侧的故障注入对照**：stub 把 listing 的第一页当成完整答案（`--fault truncate-listing`）→
   读者只被告知 1 个对象、材料化出来的目录缺 `meta.json`，`query` 必须退出非零且不打印命中；
   stub 把每个 `GET` 的 body 截成 1 字节、`content-length` 仍然诚实（`--fault truncate-read-body`）→
@@ -185,10 +185,10 @@ HTTP `409 Conflict` 被 `object_store` 映射成 `Error::AlreadyExists`，`qm-st
 - **服务端签名校验**：stub 记录并忽略 `Authorization`；签名是否正确，只有真后端才能拒。
 - **R2 的延迟、配额、区域行为、一致性、错误 XML 变体**：stub 一律立刻回答、无错误变体。
 - **检索与向量路径同样只有 stub 级证据**：`search-probe` 的 build/query、project 以及
-  vector-publish/vector-query 已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、5 项）；`project`
+  vector-publish/vector-query 已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、4 项）；`project`
   里的“多台机器”是同一进程内的并发任务，只有桶访问是跨进程的，向量闭环则另有独立进程的 A/B 证据。
 - **检索与 digest 路径同样只有 stub 级证据**：`search-probe` 的 build/query 与 project、以及
-  `digest-probe` 的 seed/read 都已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、6 项）；
+  `digest-probe` 的 seed/read 都已经真打 socket，但**没有在真 R2 上跑过**（§11 第 2、5 项）；
   `project` 里的"多台机器"是同一进程内的并发任务，只有桶访问是跨进程的（`digest-probe` 的两个命令
   才各是一个进程）。
 - **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
@@ -533,7 +533,11 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
    那次提交仍在最终状态里（`seq` 无空洞、`verify` ok）；写者在 CAS 之后才开始时，按形态分别
    落进新形态，或用 `ManifestFormMismatch` 被响亮拒绝、`seq` 不动。另一个测试在每个原子上采样
    一次完整读：迁移过程中**没有任何时刻**提交点指向一个还不存在的对象。
-   **但没有压测**：写者数量、持续冲突下的收敛时间、迁移 CAS 自身的重试次数分布都没有量过。
+   **已有持续竞争压测，但仍不是在线结论**：`sustained_contention_keeps_every_commit_and_every_sequence`
+   以 8 个写者 × 50 轮并发启动迁移，量到 400 次成功提交、提交点 1 581 次写入 / 1 180 次 CAS 拒绝、
+   迁移 5 次尝试后提交；断言覆盖无丢写、`seq` 恰为 `1..=400`、分片 `path_count` 之和正确且 `verify` ok。
+   这些数字来自 `InMemory` + 单线程确定性调度（复跑命令与边界见 `docs/ops.md`「持续写入下的迁移（压测点）」），
+   不能替代真桶多核 RTT 下的持续冲突、收敛时间或重试分布测量。
 3. **出生即分片的 scope 没有 archive**，因此没有"字节级回到迁移前"的东西——它本来就没有迁移前。
 4. **format 1 的写者不能写 format 2 的 scope**（只能读）。混合部署时，升级顺序是先升读侧、
    要写新形态的人显式设置开关。
@@ -570,7 +574,7 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
 ## 6.7 agent 可用面（S5 进行中）
 
 `qm` 是 agent 直接可用的入口，每条命令都是库调用的薄封装——CLI 不引入自己的协议，
-所以 MCP 服务器将来暴露的能力与它完全一致。
+所以 MCP 服务器当前暴露的 25 个 `memory_*` 工具由同一套分发提供。
 
 ```bash
 qm capture --session sess-1 --kind tool_use --text "switched to tantivy splits"
@@ -602,16 +606,16 @@ qm sessions
 
 **MCP 服务器**（`qm-mcp`，stdio）：
 
-- 24 个 `memory_*` 工具：`capture / consolidate / search / write_page / read_page / delete_page /
-  publish / compact / sessions / status / history / restore / log / recent /
-  handoff_open / handoff_list / handoff_claim / handoff_done / verify /
-  compact_session`，沿用 ai-memory 的命名习惯。
+- **25 个 `memory_*` 工具**：`capture / consolidate / search / write_page / read_page / delete_page /
+  publish / compact / sessions / status / history / restore / log / recent / digest /
+  handoff_open / handoff_list / handoff_claim / handoff_done / verify / compact_session /
+  propose / proposals / approve / reject`，沿用 ai-memory 的命名习惯。
 - **每个工具都走 `qm_cli::execute` 这条同一个分发**，因此两个面不可能漂移：工具 = 类型化参数 + 一次调用。
 - 协议层有真实回环测试：拉起 `qm-mcp` 二进制，走 `initialize → tools/list → tools/call`，
   断言工具齐全且都有描述与 inputSchema，跑通 capture → consolidate → publish → search，
   并确认非法路径返回**错误而不是伪成功**。
 - 该测试用 `--synthetic-bucket`（进程内、非持久、**不是后端**，启动时向 stderr 打警告）。
-  真后端仍由三个探针在带凭据时验证。
+  真后端仍由带凭据时运行的 `cas-conformance`、`manifest-probe`、`search-probe`、`session-probe` 等探针验证。
 
 ## 6.11 历史与回滚：回滚本身也是一次提交
 
@@ -678,7 +682,7 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
-## 6.20 最近变化摘要（digest）：三张权威清单
+## 6.22 最近变化摘要（digest）：三张权威清单
 
 `qm recent` 回答"哪些页面最近改过"，但一个刚接手的 agent 还要知道三件不同的事：哪些提交发生了
 （**包括删除**）、哪些会话还在动、有没有留给自己的接力棒。`digest` 把这三件事一次问完：
@@ -1169,7 +1173,7 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 最近变化摘要（digest）：三张**权威**清单（commit log / session head / handoff）各按自己的时钟取窗口、
   各自降序、各自截断；交接棒的时间取 created/claimed/finished 三者中**最新**的那个（所以窗口之前开、
   窗口之内收尾的棒会出现）；删除是提交而非缺席，manifest 已不再返回的 path 仍以 `PageDeleted` 出现。
-  跨进程 S3 协议层证据见 §6.20。
+  跨进程 S3 协议层证据见 §6.22。
 
 - 回收：可达性分析 + 宽限期 + dry-run 默认；live 页面、历史链、会话链在回收后仍可读。
 - 鉴权/凭据方案仍未定（每机全桶 token vs Worker 网关 vs 混合），是**决策项**而非实现项：
@@ -1231,7 +1235,10 @@ mTLS 之外的完整读写链路、多机协作语义。
   因此不能把 Quickwit 作为库依赖，只能作为**外部服务/构建器**。
 - tantivy 0.26 的 `TopDocs` 必须先 `order_by_score()` 才能作为 collector 使用。
 
-待验证（需要真 R2 凭据 / Quickwit 二进制）：
+待验证（只剩真 R2 凭据；Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成）：
+
+Quickwit 官方 `quickwit/quickwit:0.9.0` 产出的真分片已于 2026-09-15 验证（6893 字节、解包 8 个文件、
+检索命中 1 条；见 §6.4/§10.5），因此不再是待验证项。以下只剩真 R2：
 
 1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）—— **协议层已验证（stub），真 R2 待验证**
    （无凭据）：`s3-stub` 起真 socket、`object_store` 的 S3 客户端打上去，条件头（`If-None-Match: *` /
@@ -1241,15 +1248,12 @@ mTLS 之外的完整读写链路、多机协作语义。
    （无凭据）：两个独立 `search-probe` 进程在本地 S3 stub 上跑通 build → query，
    并有"第二个进程取回全部分片对象、命中全量页面"的线上（socket）证据；多机目录场景
    `search-probe project` 也在同一 socket 上跑通。见 §5.1 与 `crates/qm-probe/tests/search_probe_stub.rs`。
-3. ~~Quickwit 产出的 `.split` 能否解包成 tantivy 目录被进程内直读~~ —— **格式已实现并测试**（见 §6.4）；
-   ~~格式版本是否兼容~~ —— **源码核对一致**（fork 0.26.0，`INDEX_FORMAT_VERSION = 7`，与本仓 tantivy 0.26.2 相同）；
-   仅剩**真实字节**验证，需要 `QW_BIN`（本机下载被限速，见 §6.4）；
-4. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`。
-5. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
+3. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`。
+4. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
    `search-probe vector-query`，并把无 provider / 同宽换模型两条 fail-closed 对照一起跑一遍——
    **协议层（stub）已验证，真 R2 待验证**（无凭据）。见 §5.1 与 §6.20。
-6. 真 R2 上跑 `qm-probe digest-probe seed` 然后 `read`（跨进程恢复最近变化摘要）—— **协议层已验证（stub），真 R2 待验证**
+5. 真 R2 上跑 `qm-probe digest-probe seed` 然后 `read`（跨进程恢复最近变化摘要）—— **协议层已验证（stub），真 R2 待验证**
    （无凭据）：两个独立 `digest-probe` 进程在本地 S3 stub 上跑通 seed → read，
    删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，交接棒的开/认领/**收尾**三个阶段
    都跨进程往返（窗口与排序按最新阶段判定），并有一条 listing 截断的故障对照使同一个正向谓词变红。
-   见 §6.20 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
+   见 §6.22 与 `crates/qm-probe/tests/digest_probe_stub.rs`。

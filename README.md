@@ -17,10 +17,10 @@ S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**�
 - 多机并发提交：无覆盖、supersession 链完整、WAL 完整、崩溃重试幂等（`qm-store`）
 - 多机分片发布 + 跨分片 RRF 检索 + 权威可见性过滤：过期副本永不答出、离线机器的内容仍可搜（`qm-store`/`qm-search`）
 - 删除（tombstone）+ 压缩（租约保护、结果不变、分片下降）+ 租约抢占语义（`qm-store`/`qm-search`）
-- Quickwit `.split` 容器解包：读方无需 Quickwit 集群即可检索该格式的分片（`qm-search::quickwit_split`）
+- Quickwit `.split` 容器解包：已用官方 `quickwit/quickwit:0.9.0` 产出的真分片验证，读方无需 Quickwit 集群即可检索该格式的分片（`qm-search::quickwit_split`）
 - 采集与编译：观测按会话链捕获（入口强制脱敏 + 限长），编译成页面并可被检索；重放与重编译幂等（`qm-store`/`qm-search`）
 
-真 R2 与 Quickwit 的验证需要凭据与二进制，见下。
+真 R2 仍未验证（需要凭据）；Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成，见 `docs/design.md` §6.4/§10.5。
 
 ## 布局
 

@@ -213,12 +213,46 @@ cargo run -p qm-probe --bin split-probe -- --file /path/to/<split-id>.split --qu
 
 它会解包容器（u32/u64 两种 footer 都认）、列出内部文件、用 tantivy 查询并打印命中。
 依赖两个编译期特性（`zstd-compression`、`quickwit`/`sstable`），仓库已经启用。
+**已验证（2026-09-15）**：官方 `quickwit/quickwit:0.9.0` 产出的 6893 字节真分片已由
+`split-probe` 解包 8 个文件并检索命中 1 条；见 `design.md` §6.4/§10.5。
 
-## 11. 自检探针（需要真桶）
+## 11. 自检探针
+
+### 真桶（需要 S3/R2 凭据）
 
 ```bash
 cargo run -p qm-probe --bin cas-conformance            # 条件写契约
 cargo run -p qm-probe --bin manifest-probe -- --machines 3 --writes 5   # 多机并发提交
 cargo run -p qm-probe --bin search-probe -- project    # 多机发布 + 检索 + 过期过滤
 cargo run -p qm-probe --bin session-probe              # 采集 → 编译 → 检索
+# 向量闭环（需要 embedding 配置；pages.jsonl 的每行是 {path,title,body}）
+cargo run -p qm-probe --bin search-probe -- vector-publish --workspace acme --project my-project ./pages.jsonl
+cargo run -p qm-probe --bin search-probe -- vector-query --workspace acme --project my-project "语义查询"
+# 最近变化摘要的跨进程真桶验收
+cargo run -p qm-probe --bin digest-probe -- seed
+cargo run -p qm-probe --bin digest-probe -- read --since-ms 0 --limit 20
 ```
+
+### 本地 S3 stub（协议层；不是真 R2）
+
+无凭据时，下面的测试会自动启动 `s3-stub`，并在独立进程中实际运行跨进程检索、
+`vector-publish` / `vector-query` 与 `digest-probe`：
+
+```bash
+cargo test -p qm-probe --test s3_protocol
+cargo test -p qm-probe --test search_probe_stub
+cargo test -p qm-probe --test digest_probe_stub
+```
+
+需要单独查看/启动这些探针时：
+
+```bash
+cargo run -p qm-probe --bin s3-stub -- --help
+cargo run -p qm-probe --bin s3-stub -- --port 0 --port-file /tmp/qm-s3-stub-port
+cargo run -p qm-probe --bin search-probe -- vector-publish --help
+cargo run -p qm-probe --bin search-probe -- vector-query --help
+cargo run -p qm-probe --bin digest-probe -- seed --help
+cargo run -p qm-probe --bin digest-probe -- read --help
+```
+
+stub 证据只覆盖本地 HTTP 协议层；真 R2 的签名、ETag/版本行为、一致性、配额、延迟与错误 XML 变体仍未验证。

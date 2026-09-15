@@ -12,7 +12,11 @@
 //! CLI rejects keeps the failure local and instant, while still happening after
 //! `main` has built the client from the environment.
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use clap::CommandFactory;
 
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
@@ -59,6 +63,80 @@ fn run_qm_args(args: &[&str], env: &[(&str, String)]) -> Output {
         command.env(key, value);
     }
     command.output().expect("running the qm binary")
+}
+
+fn repo_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    root.canonicalize().unwrap_or_else(|error| {
+        panic!("resolving repository root from {}: {error}", root.display())
+    })
+}
+
+fn documented_number_before(text: &str, marker: &str, context: &str) -> usize {
+    let end = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("{context}: marker not found: {marker:?}"));
+    let before = text[..end].trim_end_matches(|ch: char| ch.is_whitespace() || ch == '*');
+    let digits: String = before
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|error| panic!("{context}: no numeric count before {marker:?}: {error}"))
+}
+
+#[test]
+fn documented_cli_and_mcp_counts_match_sources() {
+    let root = repo_root();
+    let readme = fs::read_to_string(root.join("README.md"))
+        .unwrap_or_else(|error| panic!("reading README.md: {error}"));
+    let design = fs::read_to_string(root.join("docs/design.md"))
+        .unwrap_or_else(|error| panic!("reading docs/design.md: {error}"));
+    let source = fs::read_to_string(root.join("crates/qm-mcp/src/lib.rs"))
+        .unwrap_or_else(|error| panic!("reading crates/qm-mcp/src/lib.rs: {error}"));
+
+    let cli_count = qm_cli::Cli::command()
+        .get_subcommands()
+        .filter(|command| command.get_name() != "help")
+        .count();
+    let mcp_count = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("#[tool("))
+        .count();
+
+    assert!(
+        cli_count > 0,
+        "the CLI must expose top-level business commands"
+    );
+    assert!(mcp_count > 0, "the MCP source must expose tools");
+
+    for (label, text, marker) in [
+        ("README CLI", readme.as_str(), "** 个子命令"),
+        ("design §11 CLI", design.as_str(), " 个顶层子命令"),
+    ] {
+        assert_eq!(
+            documented_number_before(text, marker, label),
+            cli_count,
+            "{label} must match the Clap command count"
+        );
+    }
+
+    for (label, text, marker) in [
+        ("README MCP", readme.as_str(), "** 个（"),
+        ("design §6.7 MCP", design.as_str(), " 个 `memory_*` 工具"),
+        ("design §11 MCP", design.as_str(), " 个工具，与 CLI"),
+    ] {
+        assert_eq!(
+            documented_number_before(text, marker, label),
+            mcp_count,
+            "{label} must match the source #[tool( count"
+        );
+    }
 }
 
 fn stderr_of(output: &Output) -> String {
