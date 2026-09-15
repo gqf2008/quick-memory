@@ -65,6 +65,13 @@ pub struct PageDoc {
     /// keeps them readable. A batch is embedded by one embedder at a time, so
     /// every vector in a split carries the same identity, and it is the
     /// *split* that records it — see [`EmbeddingIdentity`].
+    ///
+    /// Note the granularity boundary: this field is per **document**, while the
+    /// record on disk is per **split**. Only the first document that carries an
+    /// identity speaks for the split (see [`batch_identity`]), which is sound
+    /// for a batch [`attach_embeddings`] produced — it stamps one identity
+    /// across the whole batch — and silently lossy for a batch assembled by
+    /// hand with two of them.
     #[serde(default)]
     pub embedding_identity: Option<EmbeddingIdentity>,
 }
@@ -315,6 +322,15 @@ pub async fn attach_embeddings(
 /// `None` is the answer for a batch with no vectors: a split with no vector
 /// column has no provenance to state. Documents are embedded in one batch by
 /// one embedder, so the first record speaks for the split.
+///
+/// "Agrees on" is an assumption, not a check: [`PageDoc::embedding_identity`]
+/// is a per-document field, and `find_map` below returns the *first* document
+/// that carries one and never looks at the rest. That is sound for a batch
+/// [`attach_embeddings`] produced — it is the only producer that stamps a
+/// non-`None` identity, and it stamps one identity across the whole batch,
+/// pinned by `attach_embeddings_stamps_the_whole_batch_with_one_identity` — but
+/// a batch a caller assembled with mixed identities would publish the first one
+/// and record nothing about the second.
 fn batch_identity(docs: &[PageDoc]) -> Option<EmbeddingIdentity> {
     docs.iter().find_map(|doc| doc.embedding_identity.clone())
 }
@@ -3331,6 +3347,43 @@ mod tests {
             embedding_text(&docs()[0]),
             "Raft consensus\n\nleader election and log replication"
         );
+    }
+
+    /// A split records **one** identity, and [`batch_identity`] takes it from
+    /// the first document that has one — so the producer has to stamp the whole
+    /// batch, not merely the first document. Pin that split of the bargain:
+    /// every document, and the split-level record, carry the one identity.
+    #[tokio::test]
+    async fn attach_embeddings_stamps_the_whole_batch_with_one_identity() {
+        let embedder = fake_for_corpus();
+        let expected = EmbeddingIdentity::from(embedder.identity());
+        let batch = attach_embeddings(docs(), Some(&embedder)).await.unwrap();
+
+        // Premise: more than one document, each of them really vectorised —
+        // otherwise "the batch agrees" would hold by having nothing to agree
+        // on, and the assertions below could not fail for the stated reason.
+        assert!(
+            batch.len() > 1,
+            "the premise: a batch of one agrees with itself"
+        );
+        for (index, doc) in batch.iter().enumerate() {
+            assert!(
+                doc.embedding.is_some(),
+                "the premise: document {index} carries a vector to describe"
+            );
+            assert_eq!(
+                doc.embedding_identity.as_ref(),
+                Some(&expected),
+                "document {index} must carry the batch's identity: \
+                 `batch_identity` reads the first record and stops looking, so a \
+                 document stamped with a stale or missing identity would be \
+                 published under the wrong provenance"
+            );
+        }
+
+        // And the identity the split will write down is that same one, so the
+        // per-document field and the per-split file agree by construction.
+        assert_eq!(batch_identity(&batch), Some(expected));
     }
 
     /// Compaction rebuilds the index from authoritative pages. If it dropped
