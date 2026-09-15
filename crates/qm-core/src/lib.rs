@@ -12,10 +12,12 @@ mod model;
 mod scrub;
 
 pub use model::{
-    CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, Lease,
-    MANIFEST_SCHEMA, Manifest, Observation, ObservationSegment, PageEntry, PageVersion, Proposal,
-    ProposalState, SessionHead, SplitEntry, Tombstone, WalEntry, content_hash, derive_handoff_id,
-    derive_observation_id, derive_page_id, derive_proposal_id, derive_segment_id,
+    AnyManifest, CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, Lease,
+    MANIFEST_FORMAT_SHARDED, MANIFEST_FORMAT_WHOLE, MANIFEST_SCHEMA, MANIFEST_SHARD_COUNT,
+    Manifest, ManifestPredecessor, ManifestRoot, ManifestShard, Observation, ObservationSegment,
+    PageEntry, PageVersion, Proposal, ProposalState, SessionHead, ShardRef, SplitEntry, Tombstone,
+    WalEntry, content_hash, derive_handoff_id, derive_observation_id, derive_page_id,
+    derive_proposal_id, derive_segment_id, is_whole_format, manifest_shard_index,
 };
 pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 
@@ -37,6 +39,10 @@ pub enum CoreError {
     /// A page path could not be used as a portable object key.
     #[error("page path {0:?} is not portable")]
     InvalidPagePath(String),
+    /// A manifest object could not be decoded, or is not a form we know, or
+    /// does not describe itself consistently.
+    #[error("manifest: {0}")]
+    Manifest(String),
 }
 
 fn validate_id(raw: &str, kind: &str) -> Result<String, CoreError> {
@@ -204,6 +210,37 @@ impl KeyLayout {
     #[must_use]
     pub fn manifest(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
         format!("{}/manifest.json", self.scope_prefix(ws, proj))
+    }
+
+    /// Prefix holding the shards of a sharded manifest.
+    #[must_use]
+    pub fn manifest_shards_prefix(&self, ws: &WorkspaceId, proj: &ProjectId) -> String {
+        format!("{}/manifest/shards", self.scope_prefix(ws, proj))
+    }
+
+    /// One immutable shard body, addressed by its own content hash.
+    ///
+    /// The key carries the hash because that is what makes a shard reusable
+    /// across a crash and a retry: the same layout always lands on the same
+    /// key, so "write it again" is `create_or_verify` and not a new object.
+    #[must_use]
+    pub fn manifest_shard(&self, ws: &WorkspaceId, proj: &ProjectId, hash: &str) -> String {
+        format!(
+            "{}/manifest/shards/{hash}.json",
+            self.scope_prefix(ws, proj)
+        )
+    }
+
+    /// The archived whole-object manifest a sharded root replaced.
+    ///
+    /// Migration writes this and never deletes it: it is what makes the switch
+    /// auditable, and it is the object `predecessor` points at.
+    #[must_use]
+    pub fn manifest_archive(&self, ws: &WorkspaceId, proj: &ProjectId, hash: &str) -> String {
+        format!(
+            "{}/manifest/archive/{hash}.json",
+            self.scope_prefix(ws, proj)
+        )
     }
 
     /// Committed write-ahead record. The key is the derived event id, so a
