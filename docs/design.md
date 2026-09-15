@@ -294,6 +294,24 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
+## 6.12 观测保留：压缩会话链（而不是删段）
+
+原始观测会无限增长，但**会话链是 `prev` 链接起来的**——删中间一段会直接断链。所以保留策略是
+**重写整条链**：
+
+```bash
+qm compact-session --session <id> --keep-ms 2592000000 --keep-last 50        # dry run
+qm compact-session --session <id> --keep-last 50 --apply                     # 真做
+```
+
+- 保留规则是两条的**并集**：`keep_ms` 限时间、`keep_last` 限数量。只用时间会被错误的时钟清空，
+  只用数量会让安静的项目永远不收敛。
+- 重写 = 写一个 `prev: None` 的新段（只含存活观测）+ CAS 换 head。**旧段立刻不可达**，
+  于是被常规可达性 GC 回收——没有"会话专用清理路径"（测试里断言了这一点）。
+- 幂等：同样的存活集合 → 同样的内容寻址段 id，重放是 no-op。
+- 默认 **dry run**；`--apply` 才写。MCP 对应 `memory_compact_session`。
+- 注意：观测时间戳是**客户端时钟**，所以 `keep_last` 是防错时钟的兜底。
+
 ## 6.8 回收与保留（S5 已实现）
 
 对象都是不可变的，所以"删除"实际是"不再引用"，回收唯一安全的做法是**可达性分析**：

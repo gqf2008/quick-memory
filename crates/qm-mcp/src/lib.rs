@@ -110,6 +110,22 @@ pub struct ReadPageArgs {
     pub as_of: Option<i64>,
 }
 
+/// Arguments for `memory_compact_session`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CompactSessionArgs {
+    /// Session id.
+    pub session: String,
+    /// Keep observations newer than this many milliseconds.
+    #[serde(default)]
+    pub keep_ms: Option<i64>,
+    /// Always keep at least this many of the newest observations.
+    #[serde(default)]
+    pub keep_last: Option<usize>,
+    /// Actually rewrite the chain. Omitted or false is a dry run.
+    #[serde(default)]
+    pub apply: Option<bool>,
+}
+
 /// Arguments for `memory_log`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
@@ -280,6 +296,27 @@ impl MemoryServer {
         self.dispatch(Command::ReadPage {
             path: args.path,
             as_of: args.as_of,
+        })
+        .await
+    }
+
+    /// Retire old observations from a session.
+    #[tool(
+        description = "Retire old observations from a session's chain. Dry run \
+                       unless apply=true. Rewrites the chain as one segment, so \
+                       retired segments become unreachable and are reclaimed by \
+                       memory_compact/gc; keep_last always protects the newest \
+                       observations even if a clock is wrong."
+    )]
+    async fn memory_compact_session(
+        &self,
+        Parameters(args): Parameters<CompactSessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.dispatch(Command::CompactSession {
+            session: args.session,
+            keep_ms: args.keep_ms.unwrap_or(2_592_000_000),
+            keep_last: args.keep_last.unwrap_or(50),
+            apply: args.apply.unwrap_or(false),
         })
         .await
     }

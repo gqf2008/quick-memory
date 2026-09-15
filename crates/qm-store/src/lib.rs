@@ -152,7 +152,7 @@ pub use gc::GcOutcome;
 pub use project::{
     CommitOutcome, CommitPageRequest, DeleteOutcome, IngestObservationsRequest, IngestOutcome,
     LeaseGuard, LoadedCatalog, LoadedManifest, ProjectStore, PublishOutcome, ReplaceCatalogOutcome,
-    RetryPolicy,
+    RetentionPlan, RetryPolicy, SessionRewriteOutcome, plan_retention,
 };
 
 /// Serialize a value for an object body.

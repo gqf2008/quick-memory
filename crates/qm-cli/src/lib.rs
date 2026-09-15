@@ -112,6 +112,21 @@ pub enum Command {
     },
     /// List the sessions of the project.
     Sessions,
+    /// Retire old observations from a session's chain (dry run unless `--apply`).
+    CompactSession {
+        /// Session id.
+        #[arg(long)]
+        session: String,
+        /// Keep observations newer than this many milliseconds.
+        #[arg(long, default_value_t = 2_592_000_000)]
+        keep_ms: i64,
+        /// Always keep at least this many of the newest observations.
+        #[arg(long, default_value_t = 50)]
+        keep_last: usize,
+        /// Actually rewrite the chain instead of reporting.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
     /// Search the project.
     Search {
         /// Query text.
@@ -465,6 +480,76 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     .map(|session| session.to_string())
                     .collect::<Vec<_>>()
                     .join("\n")
+            })
+        }
+        Command::CompactSession {
+            session,
+            keep_ms,
+            keep_last,
+            apply,
+        } => {
+            let session_id = SessionId::new(session)?;
+            let observations = ctx
+                .project
+                .read_session_observations(&ctx.workspace, &ctx.project_id, &session_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let plan = qm_store::plan_retention(&observations, *keep_ms, *keep_last, ctx.now_ms);
+            if plan.dropped == 0 {
+                return Ok(if ctx.json {
+                    serde_json::json!({
+                        "kept": plan.keep.len(),
+                        "dropped": 0,
+                        "applied": false,
+                    })
+                    .to_string()
+                } else {
+                    format!(
+                        "nothing to retire ({} observation(s) kept)",
+                        plan.keep.len()
+                    )
+                });
+            }
+            if !apply {
+                return Ok(if ctx.json {
+                    serde_json::json!({
+                        "kept": plan.keep.len(),
+                        "dropped": plan.dropped,
+                        "applied": false,
+                    })
+                    .to_string()
+                } else {
+                    format!(
+                        "dry run: would keep {} and retire {} observation(s)",
+                        plan.keep.len(),
+                        plan.dropped
+                    )
+                });
+            }
+            let outcome = ctx
+                .project
+                .rewrite_session(
+                    &ctx.workspace,
+                    &ctx.project_id,
+                    &session_id,
+                    plan.keep.clone(),
+                    ctx.now_ms,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(if ctx.json {
+                serde_json::json!({
+                    "kept": outcome.kept,
+                    "retired": plan.dropped,
+                    "segments": outcome.segments,
+                    "already_present": outcome.already_present,
+                })
+                .to_string()
+            } else {
+                format!(
+                    "retired {} observation(s); the session is now one segment of {}",
+                    plan.dropped, outcome.kept
+                )
             })
         }
         Command::Search { query, limit } => {
@@ -1528,6 +1613,106 @@ mod tests {
         .await
         .expect_err("restoring a version that does not exist must fail");
         assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn session_retention_is_a_dry_run_until_applied() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for index in 0..5 {
+            execute(
+                &cli(&[
+                    "capture",
+                    "--session",
+                    "sess-old",
+                    "--text",
+                    &format!("event {index}"),
+                    "--at",
+                    &(index * 1_000).to_string(),
+                ]),
+                Context {
+                    now_ms: 10_000,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Dry run: keeps the newest two, writes nothing.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 10_000;
+        let plan = execute(
+            &cli(&[
+                "compact-session",
+                "--session",
+                "sess-old",
+                "--keep-last",
+                "2",
+                "--keep-ms",
+                "0",
+            ]),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(plan.contains("dry run"), "{plan}");
+        let observations = {
+            let ctx = context(Arc::clone(&bucket), &cache);
+            ctx.project
+                .read_session_observations(
+                    &ctx.workspace,
+                    &ctx.project_id,
+                    &SessionId::new("sess-old").unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        assert_eq!(observations.len(), 5, "a dry run must not retire anything");
+
+        // Apply: the chain becomes one segment holding the two survivors.
+        let mut ctx = context(Arc::clone(&bucket), &cache);
+        ctx.now_ms = 10_000;
+        let applied = execute(
+            &cli(&[
+                "compact-session",
+                "--session",
+                "sess-old",
+                "--keep-last",
+                "2",
+                "--keep-ms",
+                "0",
+                "--apply",
+            ]),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(applied.contains("retired 3"), "{applied}");
+
+        let ctx = context(Arc::clone(&bucket), &cache);
+        let chain = ctx
+            .project
+            .read_session_chain(
+                &ctx.workspace,
+                &ctx.project_id,
+                &SessionId::new("sess-old").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        let observations = ctx
+            .project
+            .read_session_observations(
+                &ctx.workspace,
+                &ctx.project_id,
+                &SessionId::new("sess-old").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].text, "event 3");
     }
 
     #[tokio::test]

@@ -151,6 +151,7 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "memory_history",
         "memory_restore",
         "memory_log",
+        "memory_compact_session",
         "memory_handoff_open",
         "memory_handoff_list",
         "memory_handoff_claim",
@@ -242,6 +243,32 @@ fn mcp_handshake_lists_tools_and_runs_a_capture_search_round_trip() {
         "a second claim must fail: {second_claim}"
     );
     client.call_tool(12, "memory_handoff_done", serde_json::json!({"id": id}));
+
+    // Session retention: a dry run first, then applied.
+    let plan = client.call_tool(
+        18,
+        "memory_compact_session",
+        serde_json::json!({"session": "sess-mcp", "keep_last": 1, "keep_ms": 0}),
+    );
+    let plan_text = tool_text(&plan);
+    let plan_json: serde_json::Value = serde_json::from_str(&plan_text)
+        .unwrap_or_else(|error| panic!("dry run must be JSON: {error}: {plan_text}"));
+    assert_eq!(plan_json["applied"], false, "{plan_json}");
+    let applied = client.call_tool(
+        19,
+        "memory_compact_session",
+        serde_json::json!({
+            "session": "sess-mcp",
+            "keep_last": 1,
+            "keep_ms": 0,
+            "apply": true
+        }),
+    );
+    let applied_text = tool_text(&applied);
+    assert!(
+        applied_text.contains("segments") || applied_text.contains("applied"),
+        "{applied_text}"
+    );
 
     // History and restore over the wire: the older body comes back as a new
     // version rather than overwriting anything.

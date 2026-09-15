@@ -42,6 +42,7 @@ cargo run -p qm-cli --bin qm -- consolidate --session sess-1          # --compil
 cargo run -p qm-cli --bin qm -- publish   # 增量：只发布本机上次发布后变化的页面
 cargo run -p qm-cli --bin qm -- search "suite" --json
 cargo run -p qm-cli --bin qm -- gc            # dry run；--apply 才真删
+cargo run -p qm-cli --bin qm -- compact-session --session sess-1 --keep-last 50   # 观测保留（dry run）
 
 # 自动采集：把 harness 的 lifecycle hook 指向它，事件 JSON 走 stdin
 echo "rolled back the index change" | cargo run -p qm-cli --bin qm -- hook --session sess-1

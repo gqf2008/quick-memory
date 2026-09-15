@@ -28,6 +28,20 @@ qm gc --json
 qm gc --apply --grace-ms 3600000
 ```
 
+## 观测保留
+
+原始观测会一直躺在会话链里。要收敛它们：
+
+```bash
+qm compact-session --session <id> --keep-ms 2592000000 --keep-last 50            # dry run
+qm compact-session --session <id> --keep-ms 2592000000 --keep-last 50 --apply
+```
+
+- 两条规则取**并集**：`keep_ms`（默认 30 天）+ `keep_last`（默认 50 条，防时钟错误清空）。
+- 实现是**重写链**（新段 `prev: None` + CAS 换 head），旧段变成不可达 → 交给 `qm gc` 回收。
+  所以流程是：先 `compact-session --apply`，再择机 `qm gc --apply`。
+- 默认 dry run，只报告会保留/退休多少条。
+
 ## 压缩（compaction）
 
 从**权威页面**重建索引：被 supersede 的旧版本和被删除的页面由构造天然消失，不靠过滤。

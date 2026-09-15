@@ -52,6 +52,55 @@ pub struct LoadedManifest {
     pub version: Option<ObjectVersion>,
 }
 
+/// What a retention pass would keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPlan {
+    /// Observations that survive.
+    pub keep: Vec<Observation>,
+    /// How many would be dropped.
+    pub dropped: usize,
+}
+
+/// Decide which observations survive a retention pass.
+///
+/// Two rules, because either alone is wrong: `keep_ms` bounds age (so a quiet
+/// project still converges), and `keep_last` bounds count (so a burst of
+/// activity, or a machine with a wrong clock, cannot drop everything recent).
+/// Observations are assumed oldest-first, as the chain returns them.
+#[must_use]
+pub fn plan_retention(
+    observations: &[Observation],
+    keep_ms: i64,
+    keep_last: usize,
+    now_ms: i64,
+) -> RetentionPlan {
+    let cutoff = now_ms.saturating_sub(keep_ms);
+    let start_of_recent = observations.len().saturating_sub(keep_last);
+    let keep: Vec<Observation> = observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            *index >= start_of_recent || observation.created_at_ms >= cutoff
+        })
+        .map(|(_, observation)| observation.clone())
+        .collect();
+    let dropped = observations.len() - keep.len();
+    RetentionPlan { keep, dropped }
+}
+
+/// What a session rewrite did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRewriteOutcome {
+    /// Observations kept.
+    pub kept: usize,
+    /// Segments after the rewrite (always one on success).
+    pub segments: u64,
+    /// True when the session already looked like this.
+    pub already_present: bool,
+    /// Attempts consumed, including retries.
+    pub attempts: u32,
+}
+
 /// One batch of observations to ingest.
 #[derive(Debug, Clone)]
 pub struct IngestObservationsRequest {
@@ -696,6 +745,94 @@ impl ProjectStore {
                         generation: head.generation,
                         count: head.count,
                         accepted: observations.len(),
+                        already_present: false,
+                        attempts: attempt,
+                    });
+                }
+                Err(StoreError::Precondition | StoreError::AlreadyExists) => {
+                    if attempt >= self.retry.max_attempts {
+                        return Err(StoreError::Conflict { attempts: attempt });
+                    }
+                    let delay = self.retry.base_delay * attempt;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Replace a session's whole chain with one segment.
+    ///
+    /// This is how retention works without breaking the chain: a segment points
+    /// at its predecessor, so removing a middle one would break the walk.
+    /// Rewriting means the head starts pointing at a new root, and every
+    /// superseded segment becomes unreachable — collectable by the ordinary
+    /// reachability GC, with no special case.
+    ///
+    /// Rewriting is idempotent: the same retained set produces the same
+    /// content-addressed segment, so a replay is a no-op.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when every attempt lost the CAS race, plus
+    /// backend failures.
+    pub async fn rewrite_session(
+        &self,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        observations: Vec<Observation>,
+        now_ms: i64,
+    ) -> Result<SessionRewriteOutcome, StoreError> {
+        let head_key = self
+            .layout
+            .session_head(workspace_id, project_id, session_id);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let current = self
+                .load_session_head(workspace_id, project_id, session_id)
+                .await?;
+            let segment = ObservationSegment {
+                schema: MANIFEST_SCHEMA,
+                session_id: session_id.clone(),
+                prev: None,
+                observations: observations.clone(),
+            };
+            let segment_id = derive_segment_id(&segment);
+            if current.as_ref().map(|(head, _)| head.segment_id.clone()) == Some(segment_id.clone())
+            {
+                return Ok(SessionRewriteOutcome {
+                    kept: observations.len(),
+                    segments: 1,
+                    already_present: true,
+                    attempts: attempt,
+                });
+            }
+            let segment_key =
+                self.layout
+                    .session_segment(workspace_id, project_id, session_id, &segment_id);
+            self.create_or_verify(&segment_key, &segment).await?;
+
+            let head = SessionHead {
+                schema: MANIFEST_SCHEMA,
+                session_id: session_id.clone(),
+                generation: current.as_ref().map_or(1, |(head, _)| head.generation + 1),
+                segment_id: segment_id.clone(),
+                count: observations.len() as u64,
+                updated_at_ms: now_ms,
+            };
+            let bytes = encode(&head)?;
+            let committed = match &current {
+                Some((_, version)) => self.cas.update(&head_key, bytes, version).await,
+                None => self.cas.create(&head_key, bytes).await,
+            };
+            match committed {
+                Ok(_) => {
+                    return Ok(SessionRewriteOutcome {
+                        kept: observations.len(),
+                        segments: 1,
                         already_present: false,
                         attempts: attempt,
                     });
@@ -1721,6 +1858,130 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.generation, 3, "a replay must not add a segment");
+    }
+
+    #[test]
+    fn retention_keeps_recent_observations_and_always_the_newest() {
+        let session = SessionId::new("sess-retain").unwrap();
+        let observations: Vec<Observation> = (0..10)
+            .map(|index| observation("sess-retain", &format!("event {index}"), index as i64))
+            .collect();
+        let _ = session;
+
+        // Age alone: only the newest two are inside the window.
+        let plan = plan_retention(&observations, 1, 0, 9);
+        assert_eq!(plan.keep.len(), 2);
+        assert_eq!(plan.dropped, 8);
+        assert_eq!(plan.keep[0].text, "event 8");
+
+        // Count alone: a wrong clock cannot drop everything recent.
+        let plan = plan_retention(&observations, 0, 3, 1_000_000);
+        assert_eq!(plan.keep.len(), 3);
+        assert_eq!(plan.keep[0].text, "event 7");
+
+        // Both rules union, never intersect.
+        let plan = plan_retention(&observations, 0, 3, 9);
+        assert_eq!(plan.keep.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_session_retires_old_observations_and_frees_segments() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = machine(&bucket);
+        let session = SessionId::new("sess-retain").unwrap();
+
+        for batch in 0..3 {
+            let texts: Vec<String> = (0..2)
+                .map(|index| format!("event {}", batch * 2 + index))
+                .collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            store
+                .ingest_observations(IngestObservationsRequest {
+                    workspace_id: ws(),
+                    project_id: proj(),
+                    session_id: session.clone(),
+                    writer_id: WriterId::new("mbp-1").unwrap(),
+                    observations: refs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, text)| {
+                            observation("sess-retain", text, (batch * 2 + index) as i64)
+                        })
+                        .collect(),
+                    now_ms: batch as i64,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .read_session_chain(&ws(), &proj(), &session)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // Keep only the newest two: the rest retire.
+        let observations = store
+            .read_session_observations(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        let plan = plan_retention(&observations, 0, 2, 10);
+        assert_eq!(plan.dropped, 4);
+        let outcome = store
+            .rewrite_session(&ws(), &proj(), &session, plan.keep.clone(), 10)
+            .await
+            .unwrap();
+        assert!(!outcome.already_present);
+        assert_eq!(outcome.kept, 2);
+
+        // The chain is now a single root segment…
+        let chain = store
+            .read_session_chain(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert!(chain[0].prev.is_none());
+        // …and the surviving observations read back in order.
+        let kept = store
+            .read_session_observations(&ws(), &proj(), &session)
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "event 4");
+        assert_eq!(kept[1].text, "event 5");
+
+        // A replay of the same rewrite is a no-op.
+        let again = store
+            .rewrite_session(&ws(), &proj(), &session, plan.keep, 11)
+            .await
+            .unwrap();
+        assert!(again.already_present);
+
+        // The retired segments are unreachable, so the ordinary GC collects
+        // them — no session-specific cleanup path exists.
+        let before = store
+            .cas()
+            .list("v1/ws/acme/proj/ai-memory/sessions")
+            .await
+            .unwrap()
+            .len();
+        let collected = store
+            .gc_orphans(&ws(), &proj(), 1_000, 0, true)
+            .await
+            .unwrap();
+        let after = store
+            .cas()
+            .list("v1/ws/acme/proj/ai-memory/sessions")
+            .await
+            .unwrap()
+            .len();
+        assert!(
+            collected.deleted >= 2,
+            "retired segments must be collectable: {collected:?}"
+        );
+        assert!(after < before, "the session should shrink on disk");
     }
 
     #[tokio::test]
