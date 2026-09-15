@@ -177,6 +177,31 @@ FileMetadata = 8 字节版本头（magic = 403881646，version = 1）+ JSON {"fi
 - 输出走的是普通页面提交路径（`commit_page`），因此自动获得 supersession 链、索引发布与权威过滤；
   将来接 LLM 重写时，也走同一条路径，不需要新机制。
 
+## 6.7 agent 可用面（S5 进行中）
+
+`qm` 是 agent 直接可用的入口，每条命令都是库调用的薄封装——CLI 不引入自己的协议，
+所以 MCP 服务器将来暴露的能力与它完全一致。
+
+```bash
+qm capture --session sess-1 --kind tool_use --text "switched to tantivy splits"
+qm consolidate --session sess-1        # 编译成 sessions/sess-1.md
+qm publish                             # 把当前页面发布成一个分片
+qm search "tantivy" --json
+qm write-page --path notes/raft.md --body "leader election"
+qm read-page  --path notes/raft.md
+qm delete-page --path notes/raft.md
+qm compact                             # 租约保护的全量重建
+qm status                              # pages / tombstones / splits / sessions
+qm sessions
+```
+
+- 作用域：`--workspace` / `--project` / `--writer`（或 `QM_*` 环境变量），默认 `default/default/machine`。
+- 凭据：`QM_S3_*`（或 `R2_*`）必须在环境里；拿不到就**报错**，不猜、不降级成本地存储。
+- 每条命令都重新读取权威状态：命令之间不缓存，这是多机共享的前提。
+- `--json` 输出机器可读结果，便于被 agent 或脚本直接消费。
+- 命令逻辑（而非仅参数解析）在内存桶上做了端到端测试：capture → consolidate → publish → search、
+  页面的写/读/删、status/sessions、作用域解析。
+
 ## 7. 删除与压缩（S3 已实现）
 
 - **不用 Quickwit delete-tasks**。那是集群形态的产物（只对 mature split 生效、需要协调者与可见性探针）。
@@ -228,6 +253,11 @@ sanitize 作为唯一入口边界、hook 即发即忘 202/429、读路径 fail-c
 - ETag CAS 契约与探针（含阳性对照：接受一切的后端会被探针报错）。
 - **任何一台机器独立搜全量**：A 构建索引上传对象存储，B 只有桶访问权，材料化后进程内查询命中（`qm-search` 集成测试）。
 - 探针在缺少凭据时**报错而非跳过**。
+
+**S5（agent 可用面，进行中）**
+
+- `qm` CLI 11 条命令可用；命令逻辑在内存桶上做了端到端测试（无需凭据）。
+- MCP stdio 服务器尚未实现（下一步），届时暴露同一组能力。
 
 **S4（采集与编译）**
 

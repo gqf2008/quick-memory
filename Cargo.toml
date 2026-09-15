@@ -5,6 +5,7 @@ members = [
     "crates/qm-store",
     "crates/qm-search",
     "crates/qm-probe",
+    "crates/qm-cli",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ rust-version = "1.95"
 qm-core = { path = "crates/qm-core", version = "0.1.0" }
 qm-store = { path = "crates/qm-store", version = "0.1.0" }
 qm-search = { path = "crates/qm-search", version = "0.1.0" }
+qm-cli = { path = "crates/qm-cli", version = "0.1.0" }
 
 anyhow = "1"
 bytes = "1"

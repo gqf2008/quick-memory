@@ -1,0 +1,27 @@
+[package]
+name = "qm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "qm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+qm-core = { workspace = true }
+qm-search = { workspace = true }
+qm-store = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+object_store = { workspace = true }
+
+[dev-dependencies]
+object_store = { workspace = true }

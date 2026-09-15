@@ -1355,6 +1355,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qm-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "object_store",
+ "qm-core",
+ "qm-search",
+ "qm-store",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "qm-core"
 version = "0.1.0"
 dependencies = [

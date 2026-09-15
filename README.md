@@ -25,7 +25,23 @@ crates/qm-core    纯领域类型与对象键布局（无 IO）
 crates/qm-store   对象存储 CAS 原语 + 一致性探针
 crates/qm-search  分片上传/材料化 + tantivy 进程内检索
 crates/qm-probe   S0 探针二进制
+crates/qm-cli     `qm` 命令行（agent 入口）
 ```
+
+## 命令行
+
+```bash
+export QM_S3_ENDPOINT=... QM_S3_BUCKET=... QM_S3_ACCESS_KEY_ID=... QM_S3_SECRET_ACCESS_KEY=...
+export QM_WORKSPACE=acme QM_PROJECT=ai-memory QM_WRITER=mbp-1   # 可选
+
+cargo run -p qm-cli --bin qm -- capture --session sess-1 --text "ran the suite"
+cargo run -p qm-cli --bin qm -- consolidate --session sess-1
+cargo run -p qm-cli --bin qm -- publish
+cargo run -p qm-cli --bin qm -- search "suite" --json
+```
+
+作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，
+不会退回本地存储。
 
 ## 跑测试
 
