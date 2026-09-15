@@ -157,10 +157,12 @@ embedding stub 发布向量、独立进程 B 只靠 `vector` 流召回”的闭�
   latency/quota/一致性，也没有把真 provider 的网络故障形态纳入。
 
 跨进程 digest 这条链的具体形状：`digest-probe` 的 `seed` 与 `read` 是两个独立进程，第二个只有桶坐标，
-必须自己把 pages（含删除）/ sessions / handoffs 三段从对象里重组出来；`read` 同时报告 manifest 仍认账的
-live pages，所以「manifest 已不再返回那条 path、digest 仍然报这条删除」是被断言的事实，而不是对代码的转述
-（见 `design.md` §6.20、`crates/qm-probe/tests/digest_probe_stub.rs`）。它与其他 stub 证据一样，
-**只在协议层验证过，真 R2 仍未验证**。
+必须自己把 pages（含删除）/ sessions / handoffs 三段从对象里重组出来。交接棒那一段走完了**全部三个阶段**
+（开 → 认领 → 收尾），而且收尾时间落在断言的窗口之内、开与认领都在窗口之外：所以「窗口与排序取
+created/claimed/finished 里最新的那个」是被断言的，不是靠一根只开不认领的棒凑出来的。`read` 同时报告
+manifest 仍认账的 live pages，所以「manifest 已不再返回那条 path、digest 仍然报这条删除」也是被断言的
+事实，而不是对代码的转述（见 `design.md` §6.20、`crates/qm-probe/tests/digest_probe_stub.rs`）。
+它与其他 stub 证据一样，**只在协议层验证过，真 R2 仍未验证**。
 
 ## 完整性自检
 

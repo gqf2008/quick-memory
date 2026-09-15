@@ -187,13 +187,23 @@ fn digest_violations(seed: &Value, read: &Value) -> Vec<String> {
         ));
     }
 
-    // handoffs: the window is the *latest* stage change, so a baton opened
-    // before the window and claimed inside it belongs in this window. An
-    // unclaimed baton is still only as recent as its opening.
-    let activity = |created_at_ms: i64, claimed_at_ms: Option<i64>| {
-        claimed_at_ms.map_or(created_at_ms, |claimed| created_at_ms.max(claimed))
+    // handoffs: the window and the order both follow the *latest* stage change
+    // of created / claimed / finished. A baton opened and claimed before the
+    // window but finished inside it therefore belongs in this window, and the
+    // finish is also what puts it first; a baton whose every stage is before
+    // the window belongs in neither.
+    //
+    // The activity clock is recomputed here rather than borrowed from
+    // `qm_store::handoff_activity_ms`, so the reader is checked against an
+    // independent reading of the contract.
+    let activity = |created_at_ms: i64, claimed_at_ms: Option<i64>, finished_at_ms: Option<i64>| {
+        [Some(created_at_ms), claimed_at_ms, finished_at_ms]
+            .into_iter()
+            .flatten()
+            .max()
+            .expect("a handoff has at least its creation time")
     };
-    let mut expected_handoffs: Vec<(String, i64, Option<i64>)> = seed["handoffs"]
+    let mut expected_handoffs: Vec<(String, i64, Option<i64>, Option<i64>)> = seed["handoffs"]
         .as_array()
         .expect("seed handoffs")
         .iter()
@@ -202,19 +212,20 @@ fn digest_violations(seed: &Value, read: &Value) -> Vec<String> {
                 handoff["id"].as_str().expect("id").to_string(),
                 handoff["created_at_ms"].as_i64().expect("created_at_ms"),
                 handoff["claimed_at_ms"].as_i64(),
+                handoff["finished_at_ms"].as_i64(),
             )
         })
-        .filter(|(_, created_at_ms, claimed_at_ms)| {
-            activity(*created_at_ms, *claimed_at_ms) >= since
+        .filter(|(_, created_at_ms, claimed_at_ms, finished_at_ms)| {
+            activity(*created_at_ms, *claimed_at_ms, *finished_at_ms) >= since
         })
         .collect();
     expected_handoffs.sort_by(|a, b| {
-        activity(b.1, b.2)
-            .cmp(&activity(a.1, a.2))
+        activity(b.1, b.2, b.3)
+            .cmp(&activity(a.1, a.2, a.3))
             .then_with(|| a.0.cmp(&b.0))
     });
     expected_handoffs.truncate(limit);
-    let got_handoffs: Vec<(String, i64, Option<i64>)> = read["digest"]["handoffs"]
+    let got_handoffs: Vec<(String, i64, Option<i64>, Option<i64>)> = read["digest"]["handoffs"]
         .as_array()
         .expect("digest handoffs")
         .iter()
@@ -223,6 +234,7 @@ fn digest_violations(seed: &Value, read: &Value) -> Vec<String> {
                 handoff["id"].as_str().expect("id").to_string(),
                 handoff["created_at_ms"].as_i64().expect("created_at_ms"),
                 handoff["claimed_at_ms"].as_i64(),
+                handoff["finished_at_ms"].as_i64(),
             )
         })
         .collect();
@@ -301,7 +313,7 @@ fn a_second_process_reads_the_whole_digest_from_the_bucket() {
     let seed = seed(&stub);
     assert_eq!(seed["commits"].as_array().unwrap().len(), 3);
     assert_eq!(seed["sessions"].as_array().unwrap().len(), 2);
-    assert_eq!(seed["handoffs"].as_array().unwrap().len(), 2);
+    assert_eq!(seed["handoffs"].as_array().unwrap().len(), 3);
 
     let after_seed = stub.requests();
     let read = read(&stub, 0, 20);
@@ -315,6 +327,62 @@ fn a_second_process_reads_the_whole_digest_from_the_bucket() {
     assert!(!read["digest"]["pages"].as_array().unwrap().is_empty());
     assert!(!read["digest"]["sessions"].as_array().unwrap().is_empty());
     assert!(!read["digest"]["handoffs"].as_array().unwrap().is_empty());
+
+    // The baton that was opened, claimed *and* finished carries all three
+    // stages across the process boundary, and the finish is the value the seed
+    // recorded — not a re-derivation the reader could have guessed.
+    let seeded_finished = seed["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|handoff| handoff["finished_at_ms"].is_i64())
+        .expect("the scenario finishes one baton")
+        .clone();
+    let read_finished = read["digest"]["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|handoff| handoff["id"] == seeded_finished["id"])
+        .unwrap_or_else(|| panic!("the finished baton must be in the digest: {read}"));
+    assert_eq!(
+        read_finished["finished_at_ms"], seeded_finished["finished_at_ms"],
+        "the digest's finish time must be the one the seed committed: {read}"
+    );
+    assert_eq!(
+        read_finished["claimed_at_ms"], seeded_finished["claimed_at_ms"],
+        "{read}"
+    );
+    assert_eq!(
+        read_finished["created_at_ms"], seeded_finished["created_at_ms"],
+        "{read}"
+    );
+
+    // ...and the finish is what orders the batons: the finished one has the
+    // oldest creation and the oldest claim, yet leads because its latest stage
+    // is the newest of all three.
+    let baton_order: Vec<&str> = read["digest"]["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|handoff| handoff["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        baton_order.first().copied(),
+        seeded_finished["id"].as_str(),
+        "the baton finished last must lead the handoff section: {read}"
+    );
+    let seeded_finished_created = seeded_finished["created_at_ms"].as_i64().unwrap();
+    assert!(
+        read["digest"]["handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|handoff| handoff["created_at_ms"].as_i64().unwrap() > seeded_finished_created)
+            .count()
+            > 0,
+        "the baton that leads must not also be the one that was created last, \
+         or creation order would explain the result: {read}"
+    );
 
     // The centrepiece: the deletion is reported *and* the manifest has already
     // forgotten the path. Without both halves this would only prove that some
@@ -407,8 +475,11 @@ fn the_window_filters_each_section_by_its_own_clock() {
     let stub = paging_stub();
     let seed = seed(&stub);
 
-    // 2_000ms: the older session head is out, the older page write is out, and
-    // the handoff opened at 500ms is *in* because it was claimed at 2_400ms.
+    // 2_000ms. The older session head and the older page write are out. The
+    // finished baton is *in* even though both its open (400ms) and its claim
+    // (900ms) are outside, because its finish is at 3_200ms — that is the whole
+    // point of following the latest stage. The baton whose every stage is at
+    // 300ms is out.
     let windowed = read(&stub, 2_000, 20);
     let windowed_violations = digest_violations(&seed, &windowed);
     assert!(
@@ -431,14 +502,20 @@ fn the_window_filters_each_section_by_its_own_clock() {
             .all(|page| page["at_ms"].as_i64().unwrap() >= 2_000),
         "the page written at 1_000ms must be outside the window: {windowed}"
     );
+    let handoffs = windowed["digest"]["handoffs"].as_array().unwrap();
     assert!(
-        windowed["digest"]["handoffs"]
-            .as_array()
-            .unwrap()
+        handoffs.iter().any(|handoff| {
+            handoff["created_at_ms"].as_i64() == Some(400)
+                && handoff["claimed_at_ms"].as_i64() == Some(900)
+                && handoff["finished_at_ms"].as_i64() == Some(3_200)
+        }),
+        "a baton opened and claimed before the window but finished inside it must appear: {windowed}"
+    );
+    assert!(
+        !handoffs
             .iter()
-            .any(|handoff| handoff["created_at_ms"].as_i64() == Some(500)
-                && handoff["claimed_at_ms"].as_i64() == Some(2_400)),
-        "a baton opened before the window and claimed inside it must appear: {windowed}"
+            .any(|handoff| handoff["created_at_ms"].as_i64() == Some(300)),
+        "a baton whose every stage is before the window must not appear: {windowed}"
     );
 
     // The same scope with a window wide enough for everything, so the window

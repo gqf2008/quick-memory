@@ -148,7 +148,8 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
   `streams_active` 都只有 `vector`，且无 provider 时命令硬失败、同宽换模型在查询向量生成前被身份守卫拒绝；
   它不是产品 CLI，而是探针的协议层证据。见 `crates/qm-probe/tests/search_probe_stub.rs`。
 - **digest 也有一条跨进程证据**：`digest-probe seed` 与 `digest-probe read` 是**两个独立进程**打同一个
-  stub——第一个提交两页、删掉其中一页、提交两个会话 head、开并认领一个 handoff，第二个只有桶坐标，
+  stub——第一个提交两页、删掉其中一页、提交两个会话 head，并留下三根交接棒（一根开→认领→**收尾**、
+  一根只开不认领、一根全部阶段都在窗口之前），第二个只有桶坐标，
   必须自己把 pages（含删除）/ sessions / handoffs 重组出来，并报告 manifest 仍认账的 live pages
   （所以「manifest 已不再返回那条 path、digest 仍报这条删除」是被断言的）。故障对照：stub 把 listing
   第一页当成整份答案 → 同一个正向谓词（三段内容、`at_ms` 时钟序、per-section 窗口与 `limit`）变红。
@@ -689,7 +690,7 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
 - **提交日志是建议性元数据**：提交与日志之间崩溃会少一条记录，digest 因此少报一条，
   但它**不会报错、也不会报出不存在的东西**——它只回答"什么时候"，从不回答"现在什么是真的"。
 - **窗口按各自的时钟**：pages 按提交时间、sessions 按 head 的 `updated_at_ms`、
-  handoffs 按 created/claimed/finished 三者中**最新**的那个——所以"窗口之前开、窗口之内被认领"的接力棒会出现，
+  handoffs 按 created/claimed/finished 三者中**最新**的那个——所以"窗口之前开、窗口之内被认领或收尾"的接力棒会出现，
   这正是它存在的意义。三部分各自降序，任何一部分为空都是正常答案（`Digest::is_empty()`），
   没有变化是**空 vec**，不是错误。
 - **`limit` 是"每段"的上限**：`pages` / `sessions` / `handoffs` **三段各自**先排序、再各自截断，
@@ -709,12 +710,15 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
 - MCP 对应 `memory_digest { since_hours?, limit? }`（共 25 个工具）。MCP 的窗口在**调用时**按墙钟解析，
   而不是按 server 启动时钟——否则长驻 server 的回看窗口会冻在启动那一刻。
 - **S3 协议层的跨进程证据**：`digest-probe` 的 `seed` / `read` 是两个独立进程。`seed` 通过真实
-  `object_store` S3 客户端提交两页、删掉其中一页、提交两个会话 head、开并认领一个 handoff（外加一个
-  只开不认领的），`read` 只有桶坐标，必须把三段重新组装出来，并同时报告 manifest 仍认账的 live pages——
-  所以「删除还在 digest 里、而 manifest 已经不返回那条 path」是被断言的事实，不是对代码的转述。
+  `object_store` S3 客户端提交两页、删掉其中一页、提交两个会话 head，并留下三根交接棒：一根
+  **开 → 认领 → 收尾**（400/900/3200ms，即开与认领都在 2000ms 窗口之外、**收尾**在窗口之内）、
+  一根只开不认领（2800ms）、一根全部阶段都在窗口之前（300ms）。`read` 只有桶坐标，必须把三段重新
+  组装出来，并同时报告 manifest 仍认账的 live pages——所以「删除还在 digest 里、而 manifest 已经不返回
+  那条 path」是被断言的事实，不是对代码的转述。
   `crates/qm-probe/tests/digest_probe_stub.rs` 还钉住：`at_ms` 时钟序与 commit log 的 `seq` 序
-  **故意不一致**（只按日志顺序返回就会红）、per-section 窗口与 `limit`，以及一条
-  「第一条 listing 当成整份 listing」的故障对照——同一个谓词在健康腿为空、在故障腿非空。
+  **故意不一致**（只按日志顺序返回就会红）、交接棒的窗口与排序都取 created/claimed/finished 的**最新阶段**
+  （收尾那根因此进窗并且排在只开不认领的那根**之前**，尽管它开得最早、认领得最早）、per-section 窗口与
+  `limit`，以及一条「第一条 listing 当成整份 listing」的故障对照——同一个谓词在健康腿为空、在故障腿非空。
   这是协议层（`S3Stub`）证据，**真 R2 仍未验证**（§11）。
 
 ## 6.19 最近变化：会话开始时先看这里
@@ -1154,7 +1158,8 @@ mTLS 之外的完整读写链路、多机协作语义。
 - 自动采集：`qm hook` + `qm hook-drain`，fire-and-forget 契约（超时即 spool，永不阻塞 agent）。
 
 - 最近变化摘要（digest）：三张**权威**清单（commit log / session head / handoff）各按自己的时钟取窗口、
-  各自降序、各自截断；删除是提交而非缺席，manifest 已不再返回的 path 仍以 `PageDeleted` 出现。
+  各自降序、各自截断；交接棒的时间取 created/claimed/finished 三者中**最新**的那个（所以窗口之前开、
+  窗口之内收尾的棒会出现）；删除是提交而非缺席，manifest 已不再返回的 path 仍以 `PageDeleted` 出现。
   跨进程 S3 协议层证据见 §6.20。
 
 - 回收：可达性分析 + 宽限期 + dry-run 默认；live 页面、历史链、会话链在回收后仍可读。
@@ -1235,6 +1240,6 @@ mTLS 之外的完整读写链路、多机协作语义。
    **协议层（stub）已验证，真 R2 待验证**（无凭据）。见 §5.1 与 §6.20。
 6. 真 R2 上跑 `qm-probe digest-probe seed` 然后 `read`（跨进程恢复最近变化摘要）—— **协议层已验证（stub），真 R2 待验证**
    （无凭据）：两个独立 `digest-probe` 进程在本地 S3 stub 上跑通 seed → read，
-   删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，
-   并有一条 listing 截断的故障对照使同一个正向谓词变红。见 §6.20 与
-   `crates/qm-probe/tests/digest_probe_stub.rs`。
+   删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，交接棒的开/认领/**收尾**三个阶段
+   都跨进程往返（窗口与排序按最新阶段判定），并有一条 listing 截断的故障对照使同一个正向谓词变红。
+   见 §6.20 与 `crates/qm-probe/tests/digest_probe_stub.rs`。

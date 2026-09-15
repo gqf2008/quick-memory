@@ -1,9 +1,10 @@
 //! Cross-process evidence for the "what changed recently" digest.
 //!
 //! `seed` writes one scope's whole history **through the real S3 client**:
-//! two page commits, the deletion of one of them, two session heads, a handoff
-//! that is opened and then claimed, and a second handoff opened later.
-//! `read` is a *second process*: it
+//! two page commits, the deletion of one of them, two session heads, and three
+//! batons whose stages land at different points around the window — one opened,
+//! claimed and finished, one opened and left open, one whose every stage
+//! predates the window. `read` is a *second process*: it
 //! is handed nothing but the bucket's coordinates and has to rebuild the same
 //! picture from the objects alone: no state is carried from one to the other,
 //! only the objects the first one committed.
@@ -41,12 +42,19 @@ const BETA_DELETED_AT_MS: i64 = 2_000;
 /// One session head inside the window, one the window has to drop.
 const SESSION_HEAD_AT_MS: i64 = 2_600;
 const SESSION_OLD_AT_MS: i64 = 800;
-/// A baton opened *before* the window and claimed *inside* it: a digest that
-/// only looked at the open time would lose it, which is exactly the baton the
-/// next session needs.
-const HANDOFF_OPENED_AT_MS: i64 = 500;
-const HANDOFF_CLAIMED_AT_MS: i64 = 2_400;
+/// A baton whose *finish* is the stage that matters: it is opened and claimed
+/// before the window the reader asserts, and finished inside it. A digest that
+/// looked only at the open or the claim would drop it — and one that sorted by
+/// either would put it behind [`HANDOFF_LATER_AT_MS`] instead of ahead.
+const HANDOFF_CREATED_AT_MS: i64 = 400;
+const HANDOFF_CLAIMED_AT_MS: i64 = 900;
+const HANDOFF_FINISHED_AT_MS: i64 = 3_200;
+/// A baton opened inside the window and left open: still only as recent as its
+/// creation.
 const HANDOFF_LATER_AT_MS: i64 = 2_800;
+/// A baton whose every stage predates the window: it must not appear in it,
+/// which is the other half of "the window follows the latest stage".
+const HANDOFF_EARLY_AT_MS: i64 = 300;
 
 const ALPHA: &str = "notes/alpha.md";
 const BETA: &str = "notes/beta.md";
@@ -200,16 +208,18 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
         }));
     }
 
-    // One handoff opened before the window and claimed inside it, plus one
-    // opened after the window opens at all.
-    let (claimed, created) = store
+    // Three batons, so the window has something to include on the finish
+    // stage, something to include on the creation stage, and something to
+    // exclude entirely.
+    let claimer = WriterId::new("probe-digest-claimer")?;
+    let (started, created) = store
         .open_handoff(
             &workspace,
             &project,
             "carry the digest work",
             "the S3 stub leg still needs a reader",
             &writer,
-            HANDOFF_OPENED_AT_MS,
+            HANDOFF_CREATED_AT_MS,
         )
         .await?;
     if !created {
@@ -219,11 +229,33 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
         .claim_handoff(
             &workspace,
             &project,
-            &claimed.id,
-            &WriterId::new("probe-digest-claimer")?,
+            &started.id,
+            &claimer,
             HANDOFF_CLAIMED_AT_MS,
         )
         .await?;
+    // The claim is not the last stage. Finishing it is what carries the baton
+    // into the reader's window and makes it the newest one.
+    let finished = store
+        .finish_handoff(
+            &workspace,
+            &project,
+            &claimed.id,
+            &claimer,
+            HANDOFF_FINISHED_AT_MS,
+        )
+        .await?;
+    if finished.finished_at_ms != Some(HANDOFF_FINISHED_AT_MS) {
+        bail!(
+            "finish_handoff recorded {:?}, not {HANDOFF_FINISHED_AT_MS}",
+            finished.finished_at_ms
+        );
+    }
+    // The finish has to outrank the claim and the open on its own, or the
+    // window assertion downstream would pass for the wrong reason.
+    if qm_store::handoff_activity_ms(&finished) != HANDOFF_FINISHED_AT_MS {
+        bail!("the finished baton's activity is not its finish time");
+    }
     let (later, _) = store
         .open_handoff(
             &workspace,
@@ -234,6 +266,16 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
             HANDOFF_LATER_AT_MS,
         )
         .await?;
+    let (early, _) = store
+        .open_handoff(
+            &workspace,
+            &project,
+            "an early baton",
+            "every stage is before the window",
+            &writer,
+            HANDOFF_EARLY_AT_MS,
+        )
+        .await?;
 
     Ok(serde_json::json!({
         "workspace": WORKSPACE,
@@ -242,14 +284,22 @@ async fn seed(store: &ProjectStore) -> Result<serde_json::Value> {
         "sessions": sessions,
         "handoffs": [
             {
-                "id": claimed.id,
-                "created_at_ms": claimed.created_at_ms,
-                "claimed_at_ms": claimed.claimed_at_ms,
+                "id": finished.id,
+                "created_at_ms": finished.created_at_ms,
+                "claimed_at_ms": finished.claimed_at_ms,
+                "finished_at_ms": finished.finished_at_ms,
             },
             {
                 "id": later.id,
                 "created_at_ms": later.created_at_ms,
                 "claimed_at_ms": later.claimed_at_ms,
+                "finished_at_ms": later.finished_at_ms,
+            },
+            {
+                "id": early.id,
+                "created_at_ms": early.created_at_ms,
+                "claimed_at_ms": early.claimed_at_ms,
+                "finished_at_ms": early.finished_at_ms,
             },
         ],
     }))
