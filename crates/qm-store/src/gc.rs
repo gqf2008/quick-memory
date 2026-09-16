@@ -8,7 +8,9 @@
 //!
 //! * the manifest, and for every live page the **whole supersession chain**
 //!   (history is a feature: it is what `read_page` and restore rely on);
-//! * for every tombstone, the version it deleted, so a delete stays reversible;
+//! * for every tombstone, the version it deleted **and everything that version
+//!   supersedes**, so a delete stays reversible and the page's past stays
+//!   readable (`qm history`, `read-page --as-of`);
 //! * the catalog the head points at, and every split that catalog names;
 //! * every session head, and every segment reachable from it.
 //!

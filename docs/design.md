@@ -553,8 +553,8 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
    `x86_64-pc-windows-gnu` target，使用 `x86_64-w64-mingw32-gcc` linker 运行
    `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`，exit 0（§10.7）。
    这只证明 Windows GNU 目标编译；没有在 Windows 上运行 tests/runtime，也没有跑 Windows 真桶。
-   该容器没有跑 MinIO/S3/真桶端到端链路，所以这不证明 Linux 上的对象存储链路；真 R2 与真
-   provider 也仍未验证。
+   该容器没有跑 MinIO/S3/真桶端到端链路，所以这不证明 Linux 上的对象存储链路（真 R2 的独立复验见
+   §10.8，那是在 macOS 上跑的）；仍未验证的是**真 embedding provider** 与 ACL/凭据边界。
 
 ## 6.6 采集与编译（S4 已实现）
 
