@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "qm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "qm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "qm-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "qm-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "qm-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "qm-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "qm-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",

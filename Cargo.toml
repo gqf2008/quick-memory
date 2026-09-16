@@ -11,18 +11,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
 
 [workspace.dependencies]
-qm-core = { path = "crates/qm-core", version = "0.1.0" }
-qm-store = { path = "crates/qm-store", version = "0.1.0" }
-qm-search = { path = "crates/qm-search", version = "0.1.0" }
-qm-cli = { path = "crates/qm-cli", version = "0.1.0" }
-qm-mcp = { path = "crates/qm-mcp", version = "0.1.0" }
-qm-llm = { path = "crates/qm-llm", version = "0.1.0" }
+qm-core = { path = "crates/qm-core", version = "0.2.0" }
+qm-store = { path = "crates/qm-store", version = "0.2.0" }
+qm-search = { path = "crates/qm-search", version = "0.2.0" }
+qm-cli = { path = "crates/qm-cli", version = "0.2.0" }
+qm-mcp = { path = "crates/qm-mcp", version = "0.2.0" }
+qm-llm = { path = "crates/qm-llm", version = "0.2.0" }
 schemars = "1"
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
 
