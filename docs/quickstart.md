@@ -52,10 +52,12 @@ chmod 600 ~/.quick-memory/env
   `=` 两侧空白、CRLF。只采纳 `QM_*` / `R2_*` 开头的键；其余命名空间的赋值、以及 `set -a`、
   shell 函数等**非赋值行一律忽略**（所以这个文件仍然可以被 `source`）。
 - **值不会被求值**：不展开 `$`、不执行命令替换、不做 glob。凡是 shell 会读成**另一个值**的写法
-  都会**报错退出**而不是猜着用——未加引号的 shell 元字符（`$`、"、'、`;`、`|`、`*`、`(` …）、
-  未加引号的第二个词（`K=v w`）、引号拼接（`"a"b`、`"a"#b`）、双引号内的反斜杠转义或 `$`。
+  都会**报错退出**而不是猜着用：未加引号的 `$`、反引号、引号、`\`、`;` `&` `|` `<` `>` `(` `)`，
+  未加引号的第二个词（`K=v w`），引号拼接（`"a"b`、`"a"#b`），双引号内的 `$`/反引号/转义，
+  以及 shell 会展开成家目录的 `~`（值开头，或**任意 `:` 之后**，如 `foo:~/bar`）。
 - **需要字面量就用单引号**：`QM_WRITER='$(hostname)'`、`QM_S3_SECRET_ACCESS_KEY='a$b*c'`
-  —— 单引号内 shell 也按字面量读，两边一致；这也是唯一能同时满足两种读法的写法。
+  —— 单引号内 shell 也按字面量读，两边一致，是唯一能同时满足两种读法的写法。
+  `*`、`{a,b}`、`[abc]` 这类字符在赋值右值里不展开，未加引号也可以（`sh`/`bash`/`zsh` 实测一致）。
 - 文件权限宽于 0600 时会在 stderr 给出一次告警（不阻断）。
 - `QM_EMBEDDING_*` 与 `QM_LLM_*` 由 search/compile 两个 crate 直接从**进程环境**读取，
   **不由这个文件提供服务**——写在文件里会在 stderr 明确告知，请改用环境变量导出。
@@ -103,7 +105,7 @@ splits`；`spool_kept` 统计所有未成功处理的剩余条目（其他 scope
 ```cron
 */15 * * * * /usr/local/bin/qm maintain --json >> "$HOME/.local/state/qm-maintain.log" 2>&1
 # 想显式注入：. "$HOME/.quick-memory/env"; /usr/local/bin/qm maintain --json >> ...
-# 注意 source 会求值 $ 与命令替换，而 qm 读文件时不会——两者对含 $ 的值并不等价。
+# 对本文档接受的写法，source 与 qm 的读法一致（含 $ 的值必须用单引号）；不需要 source。
 ```
 
 不要把 `qm maintain` 放进 agent 的 fire-and-forget hook 路径：`qm hook` 只负责

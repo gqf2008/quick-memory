@@ -47,17 +47,21 @@ pub const DEFAULT_CONFIG_RELATIVE: &str = ".quick-memory/env";
 /// credentials file must not silently change how the process finds its tools.
 const ACCEPTED_PREFIXES: [&str; 2] = ["QM_", "R2_"];
 
-/// Characters a POSIX shell treats specially when they are not quoted.
+/// Characters a shell acts on inside an unquoted assignment value.
 ///
-/// Each one either changes the value (`$`, backtick, backslash, quotes, globs,
-/// braces, a leading tilde) or splits the line (`;`, `&`, `|`, redirection,
-/// parentheses). An unquoted appearance is refused rather than copied, so a
-/// credential is never silently something other than what `sh` would have made
-/// of the same file. Single quotes make all of them literal in *both* readings,
-/// which is what the refusal message points at.
-const SHELL_SPECIAL_WHEN_UNQUOTED: &[char] = &[
-    '\'', '"', '$', '`', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', ']', '{', '}',
-];
+/// Each of these changes the value or splits the line: quote removal (`'`, `"`),
+/// expansion (`$`, backtick), an escape (`\`), redirection or a control
+/// operator (`;`, `&`, `|`, `<`, `>`, `(`, `)`). An unquoted appearance is
+/// refused rather than copied, so a credential is never silently something
+/// other than what `sh` would have made of the same file.
+///
+/// Glob and brace characters are deliberately *not* here: no shell expands them
+/// in an assignment value (`x=*` is the literal `*` in `sh`, `bash` and `zsh`,
+/// verified), so refusing them would reject values a shell reads exactly as
+/// this loader does. The `~` rule is separate below, because a shell expands it
+/// at the start of a value and after every `:` while leaving `a~b` alone.
+const SHELL_SPECIAL_WHEN_UNQUOTED: &[char] =
+    &['\'', '"', '$', '`', ';', '&', '|', '<', '>', '(', ')'];
 
 /// Keys this file accepts but cannot serve.
 ///
@@ -290,13 +294,7 @@ fn parse_value(raw: &str, number: usize) -> Result<String> {
         .find(|ch| SHELL_SPECIAL_WHEN_UNQUOTED.contains(ch))
     {
         bail!(
-            "line {number}: {special:?} is special to a shell in an unquoted value; \
-             wrap the value in single quotes if it is a literal"
-        );
-    }
-    if value.starts_with('~') {
-        bail!(
-            "line {number}: a leading `~` is a home directory to a shell; \
+            "line {number}: a shell would act on {special:?} in an unquoted value; \
              wrap the value in single quotes if it is a literal"
         );
     }
@@ -304,6 +302,16 @@ fn parse_value(raw: &str, number: usize) -> Result<String> {
         bail!(
             "line {number}: a backslash in an unquoted value is an escape to a shell; \
              use single quotes if the backslash is literal, or export it in the environment"
+        );
+    }
+    // A shell expands `~` at the start of an assignment value and again after
+    // every unquoted `:` (that is the rule that makes `PATH=~/bin:~/sbin`
+    // work), so both positions would come back as something else.
+    if value.starts_with('~') || value.contains(":~") {
+        bail!(
+            "line {number}: an unquoted `~` is a home directory to a shell, at the start \
+             of a value and after every `:`; wrap the value in single quotes if it is a \
+             literal"
         );
     }
     expect_comment_or_end(tail, number)?;
@@ -548,17 +556,21 @@ mod tests {
             // An unquoted backslash is an escape to a shell.
             ("QM_WRITER=C:\\tmp\n", "backslash"),
             // Unquoted quote removal: a shell builds `ab` out of both of these.
-            ("QM_WRITER=a\"b\"\n", "special to a shell"),
-            ("QM_WRITER=a'b'\n", "special to a shell"),
-            ("QM_WRITER=a\"b\n", "special to a shell"),
+            ("QM_WRITER=a\"b\"\n", "would act on"),
+            ("QM_WRITER=a'b'\n", "would act on"),
+            ("QM_WRITER=a\"b\n", "would act on"),
             // Unquoted control operators split the line.
-            ("QM_WRITER=v;\n", "special to a shell"),
-            ("QM_WRITER=v|other\n", "special to a shell"),
+            ("QM_WRITER=v;\n", "would act on"),
+            ("QM_WRITER=v|other\n", "would act on"),
             // Expansions, in either unquoted or double-quoted form.
-            ("QM_WRITER=$HOME\n", "special to a shell"),
+            ("QM_WRITER=$HOME\n", "would act on"),
+            ("QM_WRITER=`hostname`\n", "would act on"),
             ("QM_WRITER=\"$HOME\"\n", "expanded by a shell"),
-            ("QM_WRITER=`hostname`\n", "special to a shell"),
-            ("QM_WRITER=~mbp\n", "leading `~`"),
+            ("QM_WRITER=`hostname`\n", "would act on"),
+            ("QM_WRITER=~mbp\n", "unquoted `~`"),
+            ("QM_WRITER=foo:~/bar\n", "unquoted `~`"),
+            ("QM_WRITER=:~/bar\n", "unquoted `~`"),
+            ("QM_WRITER=foo:~\n", "unquoted `~`"),
         ] {
             let error =
                 parse(contents).expect_err("the fixture has to be refused rather than guessed at");
@@ -623,7 +635,12 @@ mod tests {
              QM_S3_SECRET_ACCESS_KEY=\"c\\d\"\n\
              QM_WRITER=v # C:\\tmp\n\
              QM_PROJECT= # nothing here\n\
-             QM_SESSION='$HOME;~*'\n",
+             QM_SESSION='$HOME;~*'\n\
+             QM_TILDE_MID=a~b\n\
+             QM_TILDE_COLON=foo:bar~baz\n\
+             QM_GLOB=*\n\
+             QM_BRACE={a,b}\n\
+             QM_CLASS=[abc]\n",
         );
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
         assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "c\\d");
@@ -638,6 +655,18 @@ mod tests {
             "$HOME;~*",
             "single quotes keep every metacharacter, exactly as a shell would"
         );
+        assert_eq!(
+            parsed.get("QM_TILDE_MID").unwrap(),
+            "a~b",
+            "only a `~` that a shell would expand is refused"
+        );
+        assert_eq!(parsed.get("QM_TILDE_COLON").unwrap(), "foo:bar~baz");
+        // Verified against sh, bash and zsh on this machine: an assignment
+        // value is not subject to pathname or brace expansion, so these are the
+        // same string to both readings and refusing them would be superstition.
+        assert_eq!(parsed.get("QM_GLOB").unwrap(), "*");
+        assert_eq!(parsed.get("QM_BRACE").unwrap(), "{a,b}");
+        assert_eq!(parsed.get("QM_CLASS").unwrap(), "[abc]");
     }
 
     #[test]
