@@ -218,6 +218,22 @@ impl ProjectStore {
         let mut splits_checked = 0usize;
         match self.load_catalog(workspace_id, project_id).await {
             Ok(catalog) => {
+                // An index built by another analyzer is not corruption — it can
+                // be rebuilt from the pages — but it must be *visible* here, or
+                // an operator finds out by getting fewer hits than the corpus
+                // holds. `qm search` refuses it; this is how you see it first.
+                if catalog.catalog.schema != qm_core::INDEX_SCHEMA {
+                    problems.push(Problem {
+                        kind: "catalog_index_schema".into(),
+                        subject: self.layout().catalog_head(workspace_id, project_id),
+                        detail: format!(
+                            "the catalog was written with index schema {} but this build writes {}; \
+                             run `qm compact` to rebuild the index from the pages",
+                            catalog.catalog.schema,
+                            qm_core::INDEX_SCHEMA
+                        ),
+                    });
+                }
                 for split in &catalog.catalog.splits {
                     splits_checked += 1;
                     match self.cas().list(&split.prefix).await {
@@ -293,6 +309,55 @@ mod tests {
             .await
             .unwrap()
             .page_id
+    }
+
+    /// An index built by another analyzer is not corruption — it can be rebuilt
+    /// from the pages — but it has to be *visible* here, because `qm search`
+    /// refuses to search it and an operator should learn that before trying.
+    #[tokio::test]
+    async fn verify_reports_an_index_built_by_another_analyzer() {
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = store(&bucket);
+        commit(&store, "notes/a.md", "a body", 1).await;
+
+        // Write the catalog an older build would have left behind: schema 1.
+        let catalog = qm_core::IndexCatalog {
+            schema: 1,
+            generation: 1,
+            splits: Vec::new(),
+            covered_until_ms: 0,
+        };
+        let bytes = serde_json::to_vec(&catalog).unwrap();
+        let catalog_key = store
+            .layout()
+            .catalog_version(&ws(), &proj(), &content_hash(&bytes));
+        store
+            .cas()
+            .create(&catalog_key, Bytes::from(bytes))
+            .await
+            .unwrap();
+        let head = qm_core::CatalogHead {
+            schema: qm_core::MANIFEST_SCHEMA,
+            generation: 1,
+            catalog_key,
+            updated_at_ms: 1,
+        };
+        let head_key = store.layout().catalog_head(&ws(), &proj());
+        store
+            .cas()
+            .create(&head_key, Bytes::from(serde_json::to_vec(&head).unwrap()))
+            .await
+            .unwrap();
+
+        let report = store.verify_project(&ws(), &proj()).await.unwrap();
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.kind == "catalog_index_schema"),
+            "a foreign-analyzer index has to be visible in verify: {:?}",
+            report.problems
+        );
     }
 
     #[tokio::test]

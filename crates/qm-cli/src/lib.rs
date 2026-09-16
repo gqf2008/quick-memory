@@ -1501,13 +1501,14 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     "pages": loaded.manifest.pages.len(),
                     "tombstones": loaded.manifest.tombstones.len(),
                     "catalog_generation": catalog.catalog.generation,
+                    "index_schema": catalog.catalog.schema,
                     "splits": catalog.catalog.splits.len(),
                     "sessions": sessions.len(),
                 })
                 .to_string()
             } else {
                 format!(
-                    "{} / {}\n  pages: {}\n  tombstones: {}\n  manifest: seq {} format {} ({} shard(s); `qm migrate-manifest` changes it)\n  splits: {} (generation {})\n  sessions: {}",
+                    "{} / {}\n  pages: {}\n  tombstones: {}\n  manifest: seq {} format {} ({} shard(s); `qm migrate-manifest` changes it)\n  index: schema {} (`qm compact` rebuilds it when the analyzer changes)\n  splits: {} (generation {})\n  sessions: {}",
                     ctx.workspace,
                     ctx.project_id,
                     loaded.manifest.pages.len(),
@@ -1515,6 +1516,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                     loaded.manifest.seq,
                     loaded.storage_format(),
                     loaded.root.as_ref().map_or(0, |root| root.shards.len()),
+                    catalog.catalog.schema,
                     catalog.catalog.splits.len(),
                     catalog.catalog.generation,
                     sessions.len()
@@ -3498,6 +3500,44 @@ mod tests {
             vec!["first", "second", "third"],
             "a deleted page still has a history"
         );
+    }
+
+    /// `qm status` has to say which analyzer generation the index is on: that is
+    /// what tells an operator "run `qm compact`" *before* a search does.
+    #[tokio::test]
+    async fn status_reports_the_index_schema() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+        execute(
+            &cli(&["write-page", "--path", "notes/a.md", "--body", "a body"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        execute(
+            &cli(&["publish", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+
+        let json = execute(
+            &cli(&["status", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            status["index_schema"],
+            serde_json::json!(qm_core::INDEX_SCHEMA),
+            "status must name the index generation: {status}"
+        );
+
+        let text = execute(&cli(&["status"]), context(bucket, &cache))
+            .await
+            .unwrap();
+        assert!(text.contains("index: schema"), "{text}");
     }
 
     #[tokio::test]

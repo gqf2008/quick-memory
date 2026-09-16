@@ -102,8 +102,10 @@ fn is_cjk(ch: char) -> bool {
         | '\u{4e00}'..='\u{9fff}'
         | '\u{f900}'..='\u{faff}'
         // ...plus extensions B and beyond, which are single characters outside
-        // the BMP (rare in prose, but they are still Chinese text).
+        // the BMP (rare in prose, but they are still Chinese text). Extensions
+        // G and H live even further out, in plane 3.
         | '\u{20000}'..='\u{2fa1f}'
+        | '\u{30000}'..='\u{323af}'
         // Hangul syllables and the compatibility jamo, and halfwidth katakana.
         | '\u{3130}'..='\u{318f}'
         | '\u{ac00}'..='\u{d7af}'
@@ -338,6 +340,11 @@ mod tests {
             "{tokens:?} should carry the surrogate-pair bigram"
         );
         assert!(tokens.iter().any(|token| token == "𠀀"));
+
+        // U+30000 is extension G, one plane further out: same treatment.
+        let tokens = texts("𰀀𰀁租");
+        assert!(tokens.iter().any(|token| token == "𰀀𰀁"), "{tokens:?}");
+        assert!(tokens.iter().any(|token| token == "𰀀"), "{tokens:?}");
     }
 
     #[test]

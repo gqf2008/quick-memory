@@ -252,6 +252,15 @@ tantivy 的默认分词器按"非字母数字"切分，而**汉字在 Unicode �
 遇到旧世代会直接报错**并让你跑 `qm compact`，而不是静默给出更少命中——
 "解析成功、命中为 0"正是这次要消灭的那种失败。`qm compact` 重建出的 catalog 带新世代。
 
+四处都能看到这个世代，各有各的时机：
+
+| 入口 | 行为 |
+|---|---|
+| `qm status` | 报 `index: schema N`（JSON 里是 `index_schema`）——**搜索之前**就能发现该 compact |
+| `qm verify --strict` | 把旧世代列为 `catalog_index_schema` problem，供定时巡检发现 |
+| `qm search`（单项目） | 直接报错，点名两个 schema 号与 `qm compact` |
+| `qm search --global` | 一次列出**所有**待重建项目（不是遇到第一个就停），批量升级不至于逐个试 |
+
 **分片发布（每个写入方独立）**
 
 1. 本机把"自己写过的页面版本"构建成本地 tantivy 索引目录。

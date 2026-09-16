@@ -213,6 +213,42 @@ fn indexed_text() -> TextOptions {
     )
 }
 
+/// An index whose terms were built by an analyzer this build does not use.
+///
+/// A type rather than a message, so a caller that walks many projects (a global
+/// search) can recognise it, collect them all, and tell the operator everything
+/// that needs rebuilding instead of stopping at the first one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSchemaMismatch {
+    /// Schema the catalog records.
+    pub found: u32,
+    /// Schema this build writes.
+    pub expected: u32,
+}
+
+impl std::fmt::Display for IndexSchemaMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.found < self.expected {
+            write!(
+                f,
+                "the index was built with schema {} (before the CJK analyzer) and this build \
+                 searches with schema {}; run `qm compact` to rebuild it from the pages, then \
+                 search again — searching it as it stands would quietly answer fewer hits",
+                self.found, self.expected
+            )
+        } else {
+            write!(
+                f,
+                "the index was built with schema {}, which is newer than this build knows ({}); \
+                 upgrade quick-memory before searching it",
+                self.found, self.expected
+            )
+        }
+    }
+}
+
+impl std::error::Error for IndexSchemaMismatch {}
+
 /// Refuse a catalog whose splits were built by an analyzer this build no longer
 /// uses.
 ///
@@ -223,23 +259,38 @@ fn indexed_text() -> TextOptions {
 ///
 /// # Errors
 /// Fails when the catalog's index schema is not the one this build writes.
-fn ensure_index_schema_is_current(catalog: &qm_core::IndexCatalog) -> Result<()> {
-    match catalog.schema.cmp(&qm_core::INDEX_SCHEMA) {
-        std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Less => bail!(
-            "this project's index was built with schema {} (before the CJK analyzer) and this \
-             build searches with schema {}; run `qm compact` to rebuild it from the pages, then \
-             search again — searching it as it stands would quietly answer fewer hits",
-            catalog.schema,
-            qm_core::INDEX_SCHEMA
-        ),
-        std::cmp::Ordering::Greater => bail!(
-            "this project's index was built with schema {}, which is newer than this build \
-             knows ({}); upgrade quick-memory before searching it",
-            catalog.schema,
-            qm_core::INDEX_SCHEMA
-        ),
+fn ensure_index_schema_is_current(
+    catalog: &qm_core::IndexCatalog,
+) -> Result<(), IndexSchemaMismatch> {
+    if catalog.schema == qm_core::INDEX_SCHEMA {
+        return Ok(());
     }
+    Err(IndexSchemaMismatch {
+        found: catalog.schema,
+        expected: qm_core::INDEX_SCHEMA,
+    })
+}
+
+/// The message a global search gives when several projects need a rebuild.
+///
+/// Listing them all is the point: a bulk upgrade takes one search per project
+/// otherwise, discovering them one at a time.
+fn describe_stale_projects(stale: &[(String, IndexSchemaMismatch)]) -> String {
+    let listed: Vec<String> = stale
+        .iter()
+        .map(|(project, mismatch)| {
+            format!(
+                "{project} (schema {}, this build {})",
+                mismatch.found, mismatch.expected
+            )
+        })
+        .collect();
+    format!(
+        "{} project(s) hold an index this build cannot search — run `qm compact` in each and \
+         search again: {}",
+        stale.len(),
+        listed.join(", ")
+    )
 }
 
 /// Teach an index the analyzer its schema names.
@@ -1017,6 +1068,7 @@ pub async fn search_workspace_tuned(
     embedder: Option<&dyn Embedder>,
 ) -> Result<SearchOutcome> {
     let mut lists = Vec::new();
+    let mut stale: Vec<(String, IndexSchemaMismatch)> = Vec::new();
     let mut splits_searched = 0usize;
     let mut candidates = 0usize;
     let mut filtered_out = 0usize;
@@ -1033,7 +1085,7 @@ pub async fn search_workspace_tuned(
             recency_half_life_ms: 0,
             ..*tuning
         };
-        let outcome = search_project_tuned(
+        let outcome = match search_project_tuned(
             store,
             project_store,
             workspace_id,
@@ -1044,7 +1096,21 @@ pub async fn search_workspace_tuned(
             &inner,
             embedder,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            // A stale index is the one failure worth collecting: the operator
+            // has to rebuild every such project, and stopping at the first
+            // turns a bulk upgrade into a guessing game. Anything else is still
+            // reported immediately.
+            Err(error) => match error.downcast::<IndexSchemaMismatch>() {
+                Ok(mismatch) => {
+                    stale.push((project_id.to_string(), mismatch));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
+        };
         splits_searched += outcome.splits_searched;
         candidates += outcome.candidates;
         filtered_out += outcome.filtered_out;
@@ -1060,6 +1126,9 @@ pub async fn search_workspace_tuned(
         .filter(|(_, count)| **count > 0)
         .map(|(stream, _)| stream.clone())
         .collect();
+    if !stale.is_empty() {
+        bail!("{}", describe_stale_projects(&stale));
+    }
     let mut hits = fuse_rrf(lists, 60.0);
     tuning.apply(&mut hits);
     hits.truncate(limit);
@@ -2797,6 +2866,35 @@ mod tests {
     /// upgrade, the splits in a bucket were tokenised by the *old* analyzer, and
     /// a reader that just searches them parses fine and answers zero hits — the
     /// exact symptom the analyzer fixes, with nothing to point at the rebuild.
+    /// A global search has to name every project that needs a rebuild, not stop
+    /// at the first one: bulk upgrades otherwise discover them one search at a
+    /// time.
+    #[test]
+    fn a_global_search_lists_every_stale_project() {
+        let stale = vec![
+            (
+                "alpha".to_string(),
+                IndexSchemaMismatch {
+                    found: 1,
+                    expected: qm_core::INDEX_SCHEMA,
+                },
+            ),
+            (
+                "beta".to_string(),
+                IndexSchemaMismatch {
+                    found: 1,
+                    expected: qm_core::INDEX_SCHEMA,
+                },
+            ),
+        ];
+        let message = describe_stale_projects(&stale);
+        assert!(message.contains("2 project(s)"), "{message}");
+        for project in ["alpha", "beta"] {
+            assert!(message.contains(project), "{message}");
+        }
+        assert!(message.contains("qm compact"), "{message}");
+    }
+
     #[test]
     fn a_catalog_whose_terms_come_from_another_analyzer_is_refused() {
         let mut catalog = qm_core::IndexCatalog::empty();
