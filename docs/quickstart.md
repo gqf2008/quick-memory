@@ -58,7 +58,9 @@ chmod 600 ~/.quick-memory/env
   `=命令名` 展开（`K==ls`、`foo:=ls`）。
 - **需要字面量就用单引号**：`QM_WRITER='$(hostname)'`、`QM_S3_SECRET_ACCESS_KEY='a$b*c'`
   —— 单引号内 shell 也按字面量读，两边一致，是唯一能同时满足两种读法的写法。
-  `*`、`{a,b}`、`[abc]` 这类字符在赋值右值里不展开，未加引号也可以（`sh`/`bash`/`zsh` 实测一致）。
+  `*`、`[abc]` 这类字符在赋值右值里不展开，未加引号也可以（`sh`/`bash`/`zsh` 实测一致）；
+  花括号在**纯赋值**行同样保持字面量（`K={a,b}`），但在 `export` 行 `sh`/`bash` 会展开、`zsh` 不会，
+  所以 `export K={a,b}` 会被拒绝——用单引号包起来即可。
 - 文件权限宽于 0600 时会在 stderr 给出一次告警（不阻断）。
 - `QM_EMBEDDING_*` 与 `QM_LLM_*` 由 search/compile 两个 crate 直接从**进程环境**读取，
   **不由这个文件提供服务**——写在文件里会在 stderr 明确告知，请改用环境变量导出。

@@ -228,8 +228,16 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // Whether the line used `export` is part of the value's meaning, not
+        // decoration: `export K={a,b}` is two arguments to a builtin, so the
+        // word is brace-expanded by `sh` and `bash` (`K=b`) while `K={a,b}` as
+        // a plain assignment statement is the literal string in every shell.
+        let mut exported = false;
         let line = match line.strip_prefix("export") {
-            Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+            Some(rest) if rest.starts_with(char::is_whitespace) => {
+                exported = true;
+                rest.trim_start()
+            }
             _ => line,
         };
         let Some((key, raw)) = line.split_once('=') else {
@@ -246,7 +254,7 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
             // file, and no value here can reach the process.
             continue;
         }
-        values.insert(key.to_string(), parse_value(raw, number)?);
+        values.insert(key.to_string(), parse_value(raw, number, exported)?);
     }
     Ok(values)
 }
@@ -276,13 +284,17 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
 /// - A `:`-separated part that starts with `=` (`K==ls`, `K=foo:=ls`) is a
 ///   command path to zsh, so it is refused too. A plain `a=b` and base64
 ///   padding (`YWJjZA==`) are not that shape and stay usable.
+/// - On an `export` line, an unquoted brace is refused: `export K={a,b}` is a
+///   builtin argument, which `sh` and `bash` brace-expand to `b` while `zsh`
+///   leaves alone. A plain `K={a,b}` is the literal string in all three and
+///   stays accepted.
 /// - `~` is refused where a shell expands it — at the start of the value and
 ///   after every `:` — and left alone in `a~b`.
 ///
 /// Whitespace around the `=` is tolerated (`K = v`). That is the one place this
 /// file is deliberately laxer than a shell, and it is why "the value" starts
 /// after any leading whitespace.
-fn parse_value(raw: &str, number: usize) -> Result<String> {
+fn parse_value(raw: &str, number: usize, exported: bool) -> Result<String> {
     let spaced = raw.starts_with(char::is_whitespace);
     let rest = raw.trim_start();
     if rest.is_empty() || (spaced && rest.starts_with('#')) {
@@ -311,6 +323,17 @@ fn parse_value(raw: &str, number: usize) -> Result<String> {
         bail!(
             "line {number}: a backslash in an unquoted value is an escape to a shell; \
              use single quotes if the backslash is literal, or export it in the environment"
+        );
+    }
+    // Braces are the one character that depends on which side of `export` the
+    // assignment sits: `sh` and `bash` brace-expand an argument word, so
+    // `export K={a,b}` leaves `K` as `b` there, while `zsh` and a plain
+    // assignment statement leave the literal. There is no single value to copy,
+    // so the shape is refused; quoting it is unambiguous.
+    if exported && value.contains(['{', '}']) {
+        bail!(
+            "line {number}: shells disagree about braces in an `export` argument \
+             (`sh`/`bash` expand them, `zsh` does not); quote the value or drop `export`"
         );
     }
     // zsh (the default login shell on macOS, and a plausible `source` target)
@@ -598,6 +621,13 @@ mod tests {
             ("QM_WRITER==ls\n", "command path to zsh"),
             ("QM_WRITER=foo:=ls\n", "command path to zsh"),
             ("QM_WRITER=:==\n", "command path to zsh"),
+            // Braces differ by context: a builtin argument is brace-expanded by
+            // `sh`/`bash` but not by `zsh`, so there is no single value.
+            ("export QM_WRITER={a,b}\n", "shells disagree about braces"),
+            (
+                "export QM_WRITER=foo{a,b}\n",
+                "shells disagree about braces",
+            ),
         ] {
             let error =
                 parse(contents).expect_err("the fixture has to be refused rather than guessed at");
@@ -669,7 +699,8 @@ mod tests {
              QM_BRACE={a,b}\n\
              QM_CLASS=[abc]\n\
              QM_EQUALS=a=b\n\
-             QM_BASE64=YWJjZA==\n",
+             QM_BASE64=YWJjZA==\n\
+             export QM_QUOTED_BRACE='{a,b}'\n",
         );
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
         assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "c\\d");
@@ -705,6 +736,11 @@ mod tests {
             parsed.get("QM_BASE64").unwrap(),
             "YWJjZA==",
             "base64 padding must stay usable"
+        );
+        assert_eq!(
+            parsed.get("QM_QUOTED_BRACE").unwrap(),
+            "{a,b}",
+            "quoting a brace is unambiguous in every shell"
         );
     }
 
