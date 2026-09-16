@@ -208,6 +208,48 @@ fn an_environment_variable_beats_the_same_key_in_the_file() {
     );
 }
 
+#[test]
+fn an_environment_alias_beats_a_file_alias() {
+    // Precedence is per *setting*, not per name: `R2_BUCKET` in the environment
+    // has to beat `QM_S3_BUCKET` in the file. Resolving name by name would ask
+    // for `QM_S3_BUCKET` first, find the file's answer, and never look at the
+    // environment at all — so this runs the real binary and looks at which
+    // bucket the request went to.
+    let home = TempDir::new().unwrap();
+    let path = write_named_config(
+        home.path(),
+        "QM_S3_ENDPOINT=\"http://127.0.0.1:1\"\n\
+         QM_S3_BUCKET=\"bucket-from-file\"\n\
+         QM_S3_ACCESS_KEY_ID=\"key-from-file\"\n\
+         QM_S3_SECRET_ACCESS_KEY=\"secret-from-file\"\n",
+    );
+    let config = ("QM_CONFIG_FILE", path.to_str().unwrap());
+
+    let bucket = run_qm(
+        home.path(),
+        &["status", "--json"],
+        &[config, ("R2_BUCKET", "bucket-from-env")],
+    );
+    let bucket_stderr = stderr(&bucket);
+    assert!(
+        bucket_stderr.contains("bucket-from-env") && !bucket_stderr.contains("bucket-from-file"),
+        "an environment alias has to outrank a file alias: {bucket_stderr}"
+    );
+
+    // The same rule for the endpoint, whose alias pair is the one an operator
+    // switches when moving between S3 and R2.
+    let endpoint = run_qm(
+        home.path(),
+        &["status", "--json"],
+        &[config, ("R2_ENDPOINT", "http://127.0.0.1:2")],
+    );
+    let endpoint_stderr = stderr(&endpoint);
+    assert!(
+        endpoint_stderr.contains("127.0.0.1:2") && !endpoint_stderr.contains("127.0.0.1:1"),
+        "an environment endpoint alias has to outrank the file's: {endpoint_stderr}"
+    );
+}
+
 #[tokio::test]
 async fn the_flag_beats_the_file_which_beats_the_default() {
     // The scope settings carry `env = ...` in clap, so clap has already filled

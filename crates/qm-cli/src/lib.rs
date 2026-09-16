@@ -370,19 +370,25 @@ const S3_BUCKET_ENV_NAMES: &[&str] = &["QM_S3_BUCKET", "R2_BUCKET"];
 const S3_ACCESS_KEY_ENV_NAMES: &[&str] = &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"];
 const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"];
 
-/// Read a value out of the process environment or the config file.
+/// Read one of several aliases out of the process environment or the config
+/// file.
 ///
-/// The one place this crate reads the **bucket** environment — `QM_SPOOL_DIR`,
-/// `QM_LLM_BASE_URL` and `QM_SESSION` are read at their own call sites, and all
-/// of them go through [`config::var`] for the same reason.
+/// The lookup is per **alias group**, not per name, because the precedence
+/// rule is "environment before file" and a per-name lookup cannot express it:
+/// asking for `QM_S3_BUCKET` (answerable from the file) before `R2_BUCKET`
+/// (answerable from the environment) would let the file win. [`config::first_of`]
+/// walks the whole environment first and only then the file.
+///
+/// `QM_SPOOL_DIR`, `QM_SESSION` and the scope settings have no aliases; they go
+/// through [`config::var`] at their own call sites.
 /// [`build_bucket_from`] and [`bucket_identity_from_env`] both take this as
 /// their lookup, so the client and the watermark identity cannot end up
 /// consulting different name tables.
-fn env_lookup() -> impl FnMut(&str) -> Option<String> {
-    config::var
+fn env_lookup() -> impl FnMut(&[&str]) -> Option<String> {
+    config::first_of
 }
 
-/// Parse the write-form setting out of an injected name -> value lookup.
+/// Parse the write-form setting out of an injected alias -> value lookup.
 ///
 /// Unset means [`MANIFEST_FORMAT_WHOLE`], which is what every version before
 /// format 2 wrote. A value that is not a form this build knows is an error and
@@ -391,8 +397,8 @@ fn env_lookup() -> impl FnMut(&str) -> Option<String> {
 ///
 /// # Errors
 /// Fails on anything but `1` or `2`.
-pub fn manifest_format_from(mut get: impl FnMut(&str) -> Option<String>) -> Result<u32> {
-    let Some(raw) = env_first_with(&[MANIFEST_FORMAT_ENV], &mut get) else {
+pub fn manifest_format_from(mut get: impl FnMut(&[&str]) -> Option<String>) -> Result<u32> {
+    let Some(raw) = setting_from(&[MANIFEST_FORMAT_ENV], &mut get) else {
         return Ok(MANIFEST_FORMAT_WHOLE);
     };
     match raw.trim() {
@@ -413,15 +419,13 @@ pub fn manifest_format_from_env() -> Result<u32> {
     manifest_format_from(env_lookup())
 }
 
-fn env_first_with(names: &[&str], get: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
-    names
-        .iter()
-        .find_map(|name| get(name).filter(|value| !value.trim().is_empty()))
+fn setting_from(names: &[&str], get: &mut impl FnMut(&[&str]) -> Option<String>) -> Option<String> {
+    get(names).filter(|value| !value.trim().is_empty())
 }
 
-fn bucket_identity_from(mut get: impl FnMut(&str) -> Option<String>) -> String {
-    let endpoint = env_first_with(S3_ENDPOINT_ENV_NAMES, &mut get).unwrap_or_default();
-    let bucket = env_first_with(S3_BUCKET_ENV_NAMES, &mut get).unwrap_or_default();
+fn bucket_identity_from(mut get: impl FnMut(&[&str]) -> Option<String>) -> String {
+    let endpoint = setting_from(S3_ENDPOINT_ENV_NAMES, &mut get).unwrap_or_default();
+    let bucket = setting_from(S3_BUCKET_ENV_NAMES, &mut get).unwrap_or_default();
     if endpoint.is_empty() && bucket.is_empty() {
         return String::new();
     }
@@ -441,26 +445,28 @@ pub fn build_bucket_from_env() -> Result<Arc<dyn ObjectStore>> {
     build_bucket_from(env_lookup())
 }
 
-/// Build the bucket client from an injected name -> value lookup.
+/// Build the bucket client from an injected alias -> value lookup.
 ///
 /// Production reaches this only through [`build_bucket_from_env`]; the seam
-/// exists so a test can record *which* names the client is built from and
-/// compare them with [`bucket_identity_from`]'s, without touching the process
-/// environment (undefined behaviour under Rust 2024, and forbidden textually by
-/// this workspace's `unsafe_code` lint).
+/// exists so a test can record *which* alias groups the client is built from
+/// and compare them with [`bucket_identity_from`]'s, without touching the
+/// process environment (undefined behaviour under Rust 2024, and forbidden
+/// textually by this workspace's `unsafe_code` lint).
 ///
 /// # Errors
 /// Fails when endpoint, bucket, or credentials are missing, or the client
 /// cannot be constructed.
-fn build_bucket_from(mut get: impl FnMut(&str) -> Option<String>) -> Result<Arc<dyn ObjectStore>> {
+fn build_bucket_from(
+    mut get: impl FnMut(&[&str]) -> Option<String>,
+) -> Result<Arc<dyn ObjectStore>> {
     use object_store::aws::AmazonS3Builder;
 
     fn require(
-        get: &mut impl FnMut(&str) -> Option<String>,
+        get: &mut impl FnMut(&[&str]) -> Option<String>,
         names: &[&str],
         what: &str,
     ) -> Result<String> {
-        env_first_with(names, get).ok_or_else(|| {
+        setting_from(names, get).ok_or_else(|| {
             anyhow::anyhow!(
                 "missing {what}; set one of {names:?} (a command that cannot reach the bucket must fail, not guess)"
             )
@@ -471,8 +477,8 @@ fn build_bucket_from(mut get: impl FnMut(&str) -> Option<String>) -> Result<Arc<
     let bucket = require(&mut get, S3_BUCKET_ENV_NAMES, "bucket name")?;
     let access_key_id = require(&mut get, S3_ACCESS_KEY_ENV_NAMES, "access key id")?;
     let secret_access_key = require(&mut get, S3_SECRET_KEY_ENV_NAMES, "secret access key")?;
-    let region = env_first_with(&["QM_S3_REGION"], &mut get).unwrap_or_else(|| "auto".to_string());
-    let force_path_style = env_first_with(&["QM_S3_FORCE_PATH_STYLE"], &mut get)
+    let region = setting_from(&["QM_S3_REGION"], &mut get).unwrap_or_else(|| "auto".to_string());
+    let force_path_style = setting_from(&["QM_S3_FORCE_PATH_STYLE"], &mut get)
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(true);
 
@@ -3002,8 +3008,8 @@ mod tests {
             MANIFEST_FORMAT_WHOLE
         );
         assert_eq!(
-            manifest_format_from(|name| {
-                assert_eq!(name, MANIFEST_FORMAT_ENV);
+            manifest_format_from(|names| {
+                assert_eq!(names, &[MANIFEST_FORMAT_ENV]);
                 Some("   ".to_string())
             })
             .unwrap(),
@@ -4895,13 +4901,13 @@ mod tests {
             &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]
         );
 
-        // Answer every name the client walks, so it gets past all four
+        // Answer every alias group the client walks, so it gets past all four
         // `require`s and the test sees the whole table it consults. The builder
         // does not dial the endpoint, so whether it returns `Ok` or `Err` here
         // is irrelevant: only the questions it asked are load-bearing.
-        let mut client_asked: Vec<String> = Vec::new();
-        let _ = build_bucket_from(|name| {
-            client_asked.push(name.to_string());
+        let mut client_asked: Vec<Vec<String>> = Vec::new();
+        let _ = build_bucket_from(|names| {
+            client_asked.push(names.iter().map(|name| name.to_string()).collect());
             Some("https://dummy.invalid".to_string())
         });
         assert!(
@@ -4909,16 +4915,23 @@ mod tests {
             "the client must walk past its endpoint and bucket lookups: {client_asked:?}"
         );
 
-        // The identity reads exactly two names: endpoint, then bucket.
-        let mut identity_asked: Vec<String> = Vec::new();
-        let _ = bucket_identity_from(|name| {
-            identity_asked.push(name.to_string());
+        // The identity reads exactly two groups: endpoint, then bucket.
+        let mut identity_asked: Vec<Vec<String>> = Vec::new();
+        let _ = bucket_identity_from(|names| {
+            identity_asked.push(names.iter().map(|name| name.to_string()).collect());
             Some("https://dummy.invalid".to_string())
         });
-        assert_eq!(identity_asked, vec!["QM_S3_ENDPOINT", "QM_S3_BUCKET"]);
+        assert_eq!(
+            identity_asked,
+            vec![
+                vec!["QM_S3_ENDPOINT".to_string(), "R2_ENDPOINT".to_string()],
+                vec!["QM_S3_BUCKET".to_string(), "R2_BUCKET".to_string()],
+            ],
+            "the identity resolves whole alias groups, not one name at a time"
+        );
 
-        // And those are the first two names the client asks for, in that order.
-        // Point either side at a different table and the two lists diverge.
+        // And those are the first two groups the client asks for, in that
+        // order. Point either side at a different table and the two diverge.
         assert_eq!(
             client_asked.iter().take(2).cloned().collect::<Vec<_>>(),
             identity_asked,
@@ -4927,20 +4940,34 @@ mod tests {
 
         // Exercise the aliases through the same resolver identity uses, so a
         // future change that only updates one table cannot silently make the
-        // watermark name a different bucket.
-        let mut values = std::collections::HashMap::from([
-            ("R2_ENDPOINT", "https://r2.example".to_string()),
-            ("R2_BUCKET", "bucket-b".to_string()),
-        ]);
-        let identity = bucket_identity_from(|name| values.remove(name));
-        assert_eq!(identity, "https://r2.example\u{0}bucket-b");
-
-        values.extend([
-            ("QM_S3_ENDPOINT", "https://s3.example".to_string()),
-            ("QM_S3_BUCKET", "bucket-a".to_string()),
-        ]);
+        // watermark name a different bucket. The fake resolves within a group
+        // the way `config::first_of` does: the member that is set wins, and
+        // `QM_S3_*` is listed first.
+        let resolve = |values: &mut std::collections::HashMap<String, String>, names: &[&str]| {
+            names.iter().find_map(|name| values.remove(*name))
+        };
+        let mut values: std::collections::HashMap<String, String> =
+            std::collections::HashMap::from([
+                ("R2_ENDPOINT".to_string(), "https://r2.example".to_string()),
+                ("R2_BUCKET".to_string(), "bucket-b".to_string()),
+            ]);
         assert_eq!(
-            bucket_identity_from(|name| values.remove(name)),
+            bucket_identity_from(|names| resolve(&mut values, names)),
+            "https://r2.example\u{0}bucket-b"
+        );
+
+        let mut values: std::collections::HashMap<String, String> =
+            std::collections::HashMap::from([
+                ("R2_ENDPOINT".to_string(), "https://r2.example".to_string()),
+                ("R2_BUCKET".to_string(), "bucket-b".to_string()),
+                (
+                    "QM_S3_ENDPOINT".to_string(),
+                    "https://s3.example".to_string(),
+                ),
+                ("QM_S3_BUCKET".to_string(), "bucket-a".to_string()),
+            ]);
+        assert_eq!(
+            bucket_identity_from(|names| resolve(&mut values, names)),
             "https://s3.example\u{0}bucket-a",
             "QM_S3_* must take precedence over R2_*"
         );
