@@ -17,11 +17,14 @@
 //! 2. **The file is a plain assignments file that can also be `source`d.** It
 //!    holds `K=V` / `export K="V"` lines, `#` comments, and whatever else its
 //!    operator keeps in an environment file — those other lines are ignored,
-//!    not interpreted. Values are copied, never evaluated. Where a *value*
-//!    would mean something different to a shell than it does here (quotes
-//!    concatenated with more text, escapes, an unquoted second word), the line
-//!    is **refused**, so a credential is never silently something else; the one
-//!    deliberate difference is that whitespace around the `=` is tolerated.
+//!    not interpreted. Nothing is evaluated: no `$`, no command substitution,
+//!    no globbing. A value that would mean something *different* to a shell —
+//!    quotes concatenated with more text, escapes, an unquoted second word,
+//!    unquoted shell metacharacters — is **refused**, with single quotes as the
+//!    escape hatch (they mean the same thing to both readings). The two
+//!    deliberate differences left are that whitespace around the `=` is
+//!    tolerated, and that a value the shell cannot express at all is not this
+//!    loader's problem.
 //! 3. **No setting looks like it took effect when it did not.** Keys read by
 //!    crates that never consult this file are called out at load time rather
 //!    than silently ignored; see [`NOT_SERVED_YET`].
@@ -43,6 +46,18 @@ pub const DEFAULT_CONFIG_RELATIVE: &str = ".quick-memory/env";
 /// Everything else is ignored rather than injected: a stray `PATH=` line in a
 /// credentials file must not silently change how the process finds its tools.
 const ACCEPTED_PREFIXES: [&str; 2] = ["QM_", "R2_"];
+
+/// Characters a POSIX shell treats specially when they are not quoted.
+///
+/// Each one either changes the value (`$`, backtick, backslash, quotes, globs,
+/// braces, a leading tilde) or splits the line (`;`, `&`, `|`, redirection,
+/// parentheses). An unquoted appearance is refused rather than copied, so a
+/// credential is never silently something other than what `sh` would have made
+/// of the same file. Single quotes make all of them literal in *both* readings,
+/// which is what the refusal message points at.
+const SHELL_SPECIAL_WHEN_UNQUOTED: &[char] = &[
+    '\'', '"', '$', '`', ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', ']', '{', '}',
+];
 
 /// Keys this file accepts but cannot serve.
 ///
@@ -190,8 +205,9 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
 /// `set -a`, a function, or settings for something else. What *is* refused is
 /// the narrower set of shapes where an assignment's value would mean something
 /// different to a shell than it does here — see [`parse_value`]. Values are
-/// copied, never evaluated, and **no error message ever quotes a value back**:
-/// the value may be the credential this file exists to hold.
+/// copied, never evaluated — use single quotes for a literal `$`, `*` or
+/// space — and **no error message ever quotes a value back**: the value may be
+/// the credential this file exists to hold.
 ///
 /// # Errors
 /// Fails when an assignment to a `QM_*` / `R2_*` key is written in a shape this
@@ -243,6 +259,12 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
 ///   `K=v c` is a second word a shell would run as a command, so it is refused.
 /// - A `#` with no whitespace in front of it is data, so `K=#v` is the value
 ///   `#v` while `K= #v` is an empty value followed by a comment — as in `sh`.
+/// - An unquoted value may not contain [`SHELL_SPECIAL_WHEN_UNQUOTED`]: a shell
+///   would expand, glob, split or quote-remove its way to a different value
+///   (`K=a"b"` is `ab` to a shell, `K=v;` is `v`). Single quotes are the escape
+///   hatch, and they mean the same thing to both readings.
+/// - Inside double quotes, `$` and a backtick would still be expanded, so they
+///   are refused there too.
 ///
 /// Whitespace around the `=` is tolerated (`K = v`). That is the one place this
 /// file is deliberately laxer than a shell, and it is why "the value" starts
@@ -263,6 +285,21 @@ fn parse_value(raw: &str, number: usize) -> Result<String> {
         Some(end) => (&rest[..end], &rest[end..]),
         None => (rest, ""),
     };
+    if let Some(special) = value
+        .chars()
+        .find(|ch| SHELL_SPECIAL_WHEN_UNQUOTED.contains(ch))
+    {
+        bail!(
+            "line {number}: {special:?} is special to a shell in an unquoted value; \
+             wrap the value in single quotes if it is a literal"
+        );
+    }
+    if value.starts_with('~') {
+        bail!(
+            "line {number}: a leading `~` is a home directory to a shell; \
+             wrap the value in single quotes if it is a literal"
+        );
+    }
     if value.contains('\\') {
         bail!(
             "line {number}: a backslash in an unquoted value is an escape to a shell; \
@@ -281,6 +318,12 @@ fn parse_quoted(rest: &str, number: usize) -> Result<String> {
     let mut end = None;
     let mut chars = body.char_indices();
     while let Some((index, ch)) = chars.next() {
+        if quote == '"' && matches!(ch, '$' | '`') {
+            bail!(
+                "line {number}: {ch:?} is expanded by a shell even inside double quotes; \
+                 use single quotes if it is a literal"
+            );
+        }
         if ch == '\\' && quote == '"' {
             match chars.next() {
                 Some((_, '$' | '`' | '"' | '\\')) => bail!(
@@ -465,13 +508,17 @@ mod tests {
         let parsed = parsed(
             "QM_S3_SECRET_ACCESS_KEY=a#b\n\
              QM_S3_ACCESS_KEY_ID=\"a # b\"\n\
-             QM_WRITER=$HOME\n\
+             QM_WRITER='$HOME'\n\
              QM_PROJECT=v # trailing comment\n\
              QM_TRAILING=#value\n",
         );
         assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "a#b");
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a # b");
-        assert_eq!(parsed.get("QM_WRITER").unwrap(), "$HOME");
+        assert_eq!(
+            parsed.get("QM_WRITER").unwrap(),
+            "$HOME",
+            "single quotes are the way to write a literal `$`: both readings agree"
+        );
         assert_eq!(
             parsed.get("QM_PROJECT").unwrap(),
             "v",
@@ -500,6 +547,18 @@ mod tests {
             ("export QM_WRITER=a QM_PROJECT=b\n", "may follow a value"),
             // An unquoted backslash is an escape to a shell.
             ("QM_WRITER=C:\\tmp\n", "backslash"),
+            // Unquoted quote removal: a shell builds `ab` out of both of these.
+            ("QM_WRITER=a\"b\"\n", "special to a shell"),
+            ("QM_WRITER=a'b'\n", "special to a shell"),
+            ("QM_WRITER=a\"b\n", "special to a shell"),
+            // Unquoted control operators split the line.
+            ("QM_WRITER=v;\n", "special to a shell"),
+            ("QM_WRITER=v|other\n", "special to a shell"),
+            // Expansions, in either unquoted or double-quoted form.
+            ("QM_WRITER=$HOME\n", "special to a shell"),
+            ("QM_WRITER=\"$HOME\"\n", "expanded by a shell"),
+            ("QM_WRITER=`hostname`\n", "special to a shell"),
+            ("QM_WRITER=~mbp\n", "leading `~`"),
         ] {
             let error =
                 parse(contents).expect_err("the fixture has to be refused rather than guessed at");
@@ -563,7 +622,8 @@ mod tests {
             "QM_S3_ACCESS_KEY_ID='a\\b'\n\
              QM_S3_SECRET_ACCESS_KEY=\"c\\d\"\n\
              QM_WRITER=v # C:\\tmp\n\
-             QM_PROJECT= # nothing here\n",
+             QM_PROJECT= # nothing here\n\
+             QM_SESSION='$HOME;~*'\n",
         );
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
         assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "c\\d");
@@ -572,6 +632,11 @@ mod tests {
             parsed.get("QM_PROJECT").unwrap(),
             "",
             "`K= #comment` is an empty value, as in sh"
+        );
+        assert_eq!(
+            parsed.get("QM_SESSION").unwrap(),
+            "$HOME;~*",
+            "single quotes keep every metacharacter, exactly as a shell would"
         );
     }
 
