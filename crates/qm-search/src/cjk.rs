@@ -341,10 +341,28 @@ mod tests {
         );
         assert!(tokens.iter().any(|token| token == "𠀀"));
 
-        // U+30000 is extension G, one plane further out: same treatment.
-        let tokens = texts("𰀀𰀁租");
-        assert!(tokens.iter().any(|token| token == "𰀀𰀁"), "{tokens:?}");
-        assert!(tokens.iter().any(|token| token == "𰀀"), "{tokens:?}");
+        // Extension G starts at U+30000 and extension H ends at U+323AF; both
+        // ends of the range, not just the convenient one.
+        for (name, text) in [
+            ("extension G", "𰀀𰀁"),
+            ("extension H", "\u{323ae}\u{323af}"),
+        ] {
+            let tokens = texts(&format!("{text}租"));
+            assert!(
+                tokens.iter().any(|token| token == text),
+                "{name} bigram missing: {tokens:?}"
+            );
+            assert!(
+                tokens.iter().any(|token| token.chars().count() == 1),
+                "{name} unigram missing: {tokens:?}"
+            );
+        }
+        // U+31350 is the first character of extension H.
+        let tokens = texts("\u{31350}租");
+        assert!(
+            tokens.iter().any(|token| token == "\u{31350}租"),
+            "the G/H boundary has to pair with its neighbour: {tokens:?}"
+        );
     }
 
     #[test]

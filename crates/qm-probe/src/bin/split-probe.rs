@@ -4,6 +4,12 @@
 //! Quickwit cluster open an index Quickwit produced? The probe unpacks the
 //! container into a temp directory and searches it with tantivy, exactly as the
 //! read path does for a published split.
+//!
+//! This probe is handed a split prefix and never reads a catalog, so it does not
+//! check the index generation a catalog records: pointed at a split built by an
+//! older analyzer it can answer fewer hits without saying so. Product reads
+//! (`qm search`, the MCP surface) go through that check — see `qm-search`'s
+//! `search_stream` note and `docs/design.md` §6.
 
 use std::path::PathBuf;
 

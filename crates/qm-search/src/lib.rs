@@ -229,11 +229,14 @@ pub struct IndexSchemaMismatch {
 impl std::fmt::Display for IndexSchemaMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.found < self.expected {
+            // Deliberately not "before the CJK analyzer": that names this
+            // generation, and the next one will not be about CJK at all. What
+            // is true for every older schema is the direction and the remedy.
             write!(
                 f,
-                "the index was built with schema {} (before the CJK analyzer) and this build \
-                 searches with schema {}; run `qm compact` to rebuild it from the pages, then \
-                 search again — searching it as it stands would quietly answer fewer hits",
+                "the index was built with schema {} and this build searches with schema {}; run \
+                 `qm compact` to rebuild it from the pages, then search again — searching it as \
+                 it stands would quietly answer fewer hits",
                 self.found, self.expected
             )
         } else {
@@ -276,20 +279,44 @@ fn ensure_index_schema_is_current(
 /// Listing them all is the point: a bulk upgrade takes one search per project
 /// otherwise, discovering them one at a time.
 fn describe_stale_projects(stale: &[(String, IndexSchemaMismatch)]) -> String {
-    let listed: Vec<String> = stale
+    // Two directions, two remedies: an older index is rebuilt here, a newer one
+    // means *this* build is behind and compacting would only make it older.
+    let name = |(project, mismatch): &(String, IndexSchemaMismatch)| {
+        format!(
+            "{project} (schema {}, this build {})",
+            mismatch.found, mismatch.expected
+        )
+    };
+    let older: Vec<String> = stale
         .iter()
-        .map(|(project, mismatch)| {
-            format!(
-                "{project} (schema {}, this build {})",
-                mismatch.found, mismatch.expected
-            )
-        })
+        .filter(|(_, mismatch)| mismatch.found < mismatch.expected)
+        .map(name)
         .collect();
+    let newer: Vec<String> = stale
+        .iter()
+        .filter(|(_, mismatch)| mismatch.found > mismatch.expected)
+        .map(name)
+        .collect();
+
+    let mut parts = Vec::new();
+    if !older.is_empty() {
+        parts.push(format!(
+            "{} need `qm compact` to rebuild from the pages: {}",
+            older.len(),
+            older.join(", ")
+        ));
+    }
+    if !newer.is_empty() {
+        parts.push(format!(
+            "{} were built by a newer quick-memory, so upgrade this build instead: {}",
+            newer.len(),
+            newer.join(", ")
+        ));
+    }
     format!(
-        "{} project(s) hold an index this build cannot search — run `qm compact` in each and \
-         search again: {}",
+        "{} project(s) hold an index this build cannot search — {}",
         stale.len(),
-        listed.join(", ")
+        parts.join("; ")
     )
 }
 
@@ -2866,6 +2893,110 @@ mod tests {
     /// upgrade, the splits in a bucket were tokenised by the *old* analyzer, and
     /// a reader that just searches them parses fine and answers zero hits — the
     /// exact symptom the analyzer fixes, with nothing to point at the rebuild.
+    /// Write the catalog and head an older build would have left behind.
+    ///
+    /// Fabricated through the plain object API on purpose: a legacy catalog is
+    /// exactly what a *previous* binary wrote, so no live code path produces
+    /// one. This is the state an upgrade finds in a bucket.
+    async fn write_legacy_catalog(
+        bucket: &dyn ObjectStore,
+        workspace: &WorkspaceId,
+        project: &ProjectId,
+        schema: u32,
+    ) {
+        let layout = qm_core::KeyLayout::new("v1");
+        let catalog = qm_core::IndexCatalog {
+            schema,
+            generation: 1,
+            splits: Vec::new(),
+            covered_until_ms: 0,
+        };
+        let bytes = serde_json::to_vec(&catalog).unwrap();
+        let key = layout.catalog_version(workspace, project, &qm_core::content_hash(&bytes));
+        bucket
+            .put(&ObjectPath::from(key.clone()), bytes.into())
+            .await
+            .unwrap();
+
+        let head = qm_core::CatalogHead {
+            schema: qm_core::MANIFEST_SCHEMA,
+            generation: 1,
+            catalog_key: key,
+            updated_at_ms: 1,
+        };
+        bucket
+            .put(
+                &ObjectPath::from(layout.catalog_head(workspace, project)),
+                serde_json::to_vec(&head).unwrap().into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A global search over mixed catalogs: every stale project is named in one
+    /// error, and the current one is not what failed.
+    ///
+    /// This is the test for the *loop*, not just for the message: reverting the
+    /// collection back to `?` makes it fail on the first project and the
+    /// assertion that both are named goes red.
+    #[tokio::test]
+    async fn a_global_search_collects_every_stale_project() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let stale_a = ProjectId::new("stale-a").unwrap();
+        let stale_b = ProjectId::new("stale-b").unwrap();
+        let fresh = ProjectId::new("fresh-project").unwrap();
+        for project in [&stale_a, &stale_b] {
+            write_legacy_catalog(
+                bucket.as_ref(),
+                &workspace,
+                project,
+                qm_core::INDEX_SCHEMA - 1,
+            )
+            .await;
+        }
+
+        let cache = TempDir::new().unwrap();
+        let error = search_workspace_tuned(
+            bucket.as_ref(),
+            &store,
+            &workspace,
+            &[stale_a.clone(), fresh.clone(), stale_b.clone()],
+            cache.path(),
+            "anything",
+            5,
+            &SearchTuning::default(),
+            None,
+        )
+        .await
+        .expect_err("a global search cannot answer while a project needs a rebuild");
+
+        let message = error.to_string();
+        assert!(message.contains("2 project(s)"), "{message}");
+        for project in ["stale-a", "stale-b"] {
+            assert!(message.contains(project), "{message}");
+        }
+        assert!(message.contains("qm compact"), "{message}");
+
+        // The same call over current projects answers: the error is about those
+        // catalogs, not about the call itself.
+        let outcome = search_workspace_tuned(
+            bucket.as_ref(),
+            &store,
+            &workspace,
+            &[fresh],
+            cache.path(),
+            "anything",
+            5,
+            &SearchTuning::default(),
+            None,
+        )
+        .await
+        .expect("a current catalog searches");
+        assert!(outcome.hits.is_empty());
+    }
+
     /// A global search has to name every project that needs a rebuild, not stop
     /// at the first one: bulk upgrades otherwise discover them one search at a
     /// time.
@@ -2893,6 +3024,22 @@ mod tests {
             assert!(message.contains(project), "{message}");
         }
         assert!(message.contains("qm compact"), "{message}");
+
+        // A *newer* schema is the opposite remedy: this build is behind, and
+        // telling the operator to compact would send them the wrong way.
+        let newer = vec![(
+            "from-the-future".to_string(),
+            IndexSchemaMismatch {
+                found: qm_core::INDEX_SCHEMA + 1,
+                expected: qm_core::INDEX_SCHEMA,
+            },
+        )];
+        let message = describe_stale_projects(&newer);
+        assert!(message.contains("upgrade"), "{message}");
+        assert!(
+            !message.contains("qm compact"),
+            "a newer index is not rebuilt with the old binary: {message}"
+        );
     }
 
     #[test]

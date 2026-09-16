@@ -226,12 +226,21 @@ impl ProjectStore {
                     problems.push(Problem {
                         kind: "catalog_index_schema".into(),
                         subject: self.layout().catalog_head(workspace_id, project_id),
-                        detail: format!(
-                            "the catalog was written with index schema {} but this build writes {}; \
-                             run `qm compact` to rebuild the index from the pages",
-                            catalog.catalog.schema,
-                            qm_core::INDEX_SCHEMA
-                        ),
+                        detail: if catalog.catalog.schema < qm_core::INDEX_SCHEMA {
+                            format!(
+                                "the catalog was written with index schema {} and this build writes \
+                                 {}; run `qm compact` to rebuild the index from the pages",
+                                catalog.catalog.schema,
+                                qm_core::INDEX_SCHEMA
+                            )
+                        } else {
+                            format!(
+                                "the catalog was written with index schema {}, which is newer than \
+                                 this build knows ({}); upgrade quick-memory",
+                                catalog.catalog.schema,
+                                qm_core::INDEX_SCHEMA
+                            )
+                        },
                     });
                 }
                 for split in &catalog.catalog.splits {

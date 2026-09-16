@@ -3534,10 +3534,54 @@ mod tests {
             "status must name the index generation: {status}"
         );
 
-        let text = execute(&cli(&["status"]), context(bucket, &cache))
+        let text = execute(&cli(&["status"]), context(bucket.clone(), &cache))
             .await
             .unwrap();
         assert!(text.contains("index: schema"), "{text}");
+
+        // …and it reports what the *catalog* says rather than a constant:
+        // replace it with the one an older build would have left behind.
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project = ProjectId::new("ai-memory").unwrap();
+        let layout = qm_core::KeyLayout::new("v1");
+        let legacy = qm_core::IndexCatalog {
+            schema: qm_core::INDEX_SCHEMA - 1,
+            generation: 1,
+            splits: Vec::new(),
+            covered_until_ms: 0,
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let key = layout.catalog_version(&workspace, &project, &qm_core::content_hash(&bytes));
+        bucket
+            .put(&object_store::path::Path::from(key.clone()), bytes.into())
+            .await
+            .unwrap();
+        let head = qm_core::CatalogHead {
+            schema: qm_core::MANIFEST_SCHEMA,
+            generation: 1,
+            catalog_key: key,
+            updated_at_ms: 1,
+        };
+        bucket
+            .put(
+                &object_store::path::Path::from(layout.catalog_head(&workspace, &project)),
+                serde_json::to_vec(&head).unwrap().into(),
+            )
+            .await
+            .unwrap();
+
+        let json = execute(
+            &cli(&["status", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            status["index_schema"],
+            serde_json::json!(qm_core::INDEX_SCHEMA - 1),
+            "status has to report the catalog's own value: {status}"
+        );
     }
 
     #[tokio::test]
