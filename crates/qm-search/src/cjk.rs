@@ -31,10 +31,25 @@ pub const TOKENIZER_NAME: &str = "cjk";
 /// Longest Latin/digit run that becomes a term, in bytes.
 ///
 /// tantivy's `default` analyzer is `SimpleTokenizer + RemoveLongFilter(40) +
-/// LowerCaser`, and `RemoveLongFilter` keeps a token when `len() < 40` — so the
-/// bound is exclusive *and* applies after lower-casing (two things this module
-/// got wrong once, see the tests at 38/39/40/41 bytes).
+/// LowerCaser`, and the filter chain is evaluated inside-out: the length
+/// predicate runs on the **raw** token and the lower-casing is applied to what
+/// survives. The bound is therefore exclusive *and* measured before
+/// lower-casing — the reverse of what this module did once, which real
+/// characters show: `İ` is 2 bytes and lower-cases to 3, so nineteen of them are
+/// inside the bound going in (`default` keeps them) and 57 bytes coming out,
+/// while nineteen `ẞ` are 57 bytes going in (dropped) and 38 coming out. The
+/// differential test against tantivy's own analyzer is what pins the order.
 const MAX_LATIN_TOKEN_BYTES: usize = 40;
+
+/// Lower-case a token the way tantivy's `LowerCaser` does: character by
+/// character, with no word-final special cases.
+///
+/// `str::to_lowercase` implements the Unicode *default* mappings, which turn
+/// `ΣΣ` into `σς`; tantivy folds each character on its own and gets `σσ`. A
+/// token that differs from `default`'s is a token that searches differently.
+fn lowercase_like_tantivy(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
 
 /// Splits text into CJK unigrams and bigrams, and Latin/digit runs.
 #[derive(Clone, Default)]
@@ -123,16 +138,15 @@ fn tokenize(text: &str) -> Vec<Token> {
         let word = &text[start..end];
 
         if !word.chars().any(is_cjk) {
-            // Measured after lower-casing, and strictly below the bound: that is
-            // how `default` decides, and a test pins the four byte lengths
-            // around it.
-            let lowered = word.to_lowercase();
-            if lowered.len() < MAX_LATIN_TOKEN_BYTES {
+            // Strictly below the bound, measured on the raw word: that is the
+            // order `default` uses (`RemoveLongFilter` sees the token before
+            // `LowerCaser` does).
+            if word.len() < MAX_LATIN_TOKEN_BYTES {
                 tokens.push(Token {
                     offset_from: start,
                     offset_to: end,
                     position,
-                    text: lowered,
+                    text: lowercase_like_tantivy(word),
                     position_length: 1,
                 });
             }
@@ -154,13 +168,12 @@ fn tokenize(text: &str) -> Vec<Token> {
                 let from = run[0].0;
                 let last = run[run.len() - 1];
                 let to = last.0 + last.1.len_utf8();
-                let lowered = text[from..to].to_lowercase();
-                if lowered.len() < MAX_LATIN_TOKEN_BYTES {
+                if to - from < MAX_LATIN_TOKEN_BYTES {
                     tokens.push(Token {
                         offset_from: from,
                         offset_to: to,
                         position,
-                        text: lowered,
+                        text: lowercase_like_tantivy(&text[from..to]),
                         position_length: 1,
                     });
                 }
@@ -235,9 +248,7 @@ mod tests {
 
     #[test]
     fn the_long_latin_bound_matches_tantivys_default() {
-        // `default` = SimpleTokenizer + RemoveLongFilter(40) + LowerCaser, and
-        // RemoveLongFilter keeps `len() < 40` *after* lower-casing. Pin all four
-        // lengths around the edge so an off-by-one cannot come back.
+        // The four byte lengths around the edge, so an off-by-one cannot return.
         for length in [38, 39] {
             assert_eq!(
                 texts(&"x".repeat(length)).len(),
@@ -251,12 +262,71 @@ mod tests {
                 "{length} bytes is past the bound"
             );
         }
-        // Lower-casing can change the byte length, and the bound applies after
-        // it: `İ` is 2 bytes and lower-cases to 3, so nineteen of them are 38
-        // bytes going in and 57 coming out — out of bounds, like `default`.
+        // The bound is on the *raw* token, and these two characters show why
+        // the order matters: nineteen `İ` are 38 bytes raw (kept) and 57 bytes
+        // lower-cased; nineteen `ẞ` are 57 raw (dropped) and 38 lower-cased.
         let dotted = "İ".repeat(19);
         assert_eq!(dotted.len(), 38);
-        assert!(texts(&dotted).is_empty());
+        assert_eq!(dotted.to_lowercase().len(), 57);
+        assert_eq!(texts(&dotted).len(), 1, "default keeps what is raw-short");
+
+        let sharp = "ẞ".repeat(19);
+        assert_eq!(sharp.len(), 57);
+        assert_eq!(sharp.to_lowercase().len(), 38);
+        assert!(
+            texts(&sharp).is_empty(),
+            "default drops what is raw-long, however short it becomes"
+        );
+    }
+
+    /// The test that would have caught the reversed filter order: run tantivy's
+    /// own `default` analyzer and this tokenizer over the same pure-Latin
+    /// inputs and require identical token text, in order.
+    ///
+    /// Comparing against the real analyzer is the point — a hand-written
+    /// expectation only restates whatever the implementation believes.
+    #[test]
+    fn pure_latin_input_matches_tantivys_default_analyzer() {
+        use tantivy::tokenizer::{
+            LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, Tokenizer,
+        };
+
+        let mut default = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(MAX_LATIN_TOKEN_BYTES))
+            .filter(LowerCaser)
+            .build();
+        let mut ours = CjkTokenizer;
+
+        let inputs = [
+            "Hello World 2026",
+            "a-b_c",
+            &"x".repeat(39),
+            &"x".repeat(40),
+            &"İ".repeat(19),
+            &"ẞ".repeat(19),
+            &"İ".repeat(20),
+            "ΣΣ sigma",
+            &"abcİdef".repeat(5),
+        ];
+        for input in inputs {
+            let expected: Vec<String> = {
+                let mut stream = default.token_stream(input);
+                let mut out = Vec::new();
+                while stream.advance() {
+                    out.push(stream.token().text.clone());
+                }
+                out
+            };
+            let actual: Vec<String> = {
+                let mut stream = ours.token_stream(input);
+                let mut out = Vec::new();
+                while stream.advance() {
+                    out.push(stream.token().text.clone());
+                }
+                out
+            };
+            assert_eq!(actual, expected, "differed on {input:?}");
+        }
     }
 
     #[test]

@@ -701,7 +701,9 @@ pub struct SplitEntry {
 /// Index catalog: the set of splits a reader must open to cover a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexCatalog {
-    /// Encoding schema.
+    /// Index schema: which analyzer the terms in these splits were built with
+    /// (see [`INDEX_SCHEMA`]). Deliberately *not* [`MANIFEST_SCHEMA`]: that one
+    /// describes the authority's encoding, this one describes a derived layer.
     pub schema: u32,
     /// Catalog generation; increases by one per publish.
     pub generation: u64,
@@ -731,7 +733,6 @@ impl IndexCatalog {
             .any(|split| split.content_hash == content_hash)
     }
 
-    /// Append a split and advance the generation.
     /// Append a split.
     ///
     /// The catalog's [`schema`](Self::schema) is deliberately *not* raised here:

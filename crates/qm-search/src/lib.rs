@@ -573,6 +573,12 @@ pub fn search(dir: &Path, query: &str, limit: usize) -> Result<Vec<Hit>> {
 
 /// Search one field set, labelling the hits with the stream that found them.
 ///
+/// This is the per-split entry point: it takes a materialised index directory
+/// and does **not** check the analyzer generation a catalog records, because it
+/// never reads a catalog. Product paths (`search_project*`, and therefore `qm
+/// search` and the MCP surface) go through that check; a caller that reaches
+/// here directly is responsible for knowing what it opened.
+///
 /// Fields are named rather than passed as a slice of `Field`s so callers (and
 /// tests) can talk about streams the same way the outcome does.
 ///
