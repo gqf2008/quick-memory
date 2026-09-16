@@ -62,6 +62,60 @@ fn write_named_config(home: &Path, contents: &str) -> PathBuf {
     path
 }
 
+fn repo_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    root.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "resolving the repository root from {}: {error}",
+            root.display()
+        )
+    })
+}
+
+/// The `~/.quick-memory/env` the quickstart tells an operator to write.
+///
+/// Documentation that the parser refuses is worse than no documentation: the
+/// operator pastes it, collects a parse error, and cannot tell whether the file
+/// or the tool is wrong. This extracts the heredoc from the quick-start and
+/// runs the real parser over it.
+#[test]
+fn the_documented_config_file_example_parses() {
+    let quickstart = fs::read_to_string(repo_root().join("docs/quickstart.md"))
+        .expect("reading docs/quickstart.md");
+    let mut body = String::new();
+    let mut inside = false;
+    for line in quickstart.lines() {
+        if !inside {
+            inside = line.contains("cat > ~/.quick-memory/env <<'EOF'");
+            continue;
+        }
+        if line.trim() == "EOF" {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    assert!(
+        !body.trim().is_empty(),
+        "the quickstart must still show a config file to paste"
+    );
+
+    let values = qm_cli::config::parse(&body)
+        .unwrap_or_else(|error| panic!("the documented example must parse: {error}\n{body}"));
+    for key in [
+        "QM_S3_ENDPOINT",
+        "QM_S3_BUCKET",
+        "QM_S3_ACCESS_KEY_ID",
+        "QM_S3_SECRET_ACCESS_KEY",
+        "QM_WRITER",
+    ] {
+        assert!(
+            values.contains_key(key),
+            "{key} has to survive the documented example: {values:?}"
+        );
+    }
+}
+
 fn stub_settings(stub: &S3Stub) -> String {
     format!(
         "QM_S3_ENDPOINT=\"{}\"\n\

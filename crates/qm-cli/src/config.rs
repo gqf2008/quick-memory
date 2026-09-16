@@ -14,12 +14,14 @@
 //!    bucket the file names. That is why resolution is per alias *group* and
 //!    per source ([`first_of`]), not per name: a per-name lookup lets the file
 //!    answer a name the environment would have answered differently.
-//! 2. **The file is a subset of a shell script.** Every line it accepts is a
-//!    line `sh` reads the same way (`K=V`, `export K="V"`, `#` comments), and
-//!    the file can be `source`d — but it is *not* a general shell script:
-//!    anything that is not a single assignment, and every shape where the two
-//!    readings could disagree (concatenated quotes, backslash escapes, one line
-//!    with two assignments), is **refused**, never half-applied.
+//! 2. **The file is a plain assignments file that can also be `source`d.** It
+//!    holds `K=V` / `export K="V"` lines, `#` comments, and whatever else its
+//!    operator keeps in an environment file — those other lines are ignored,
+//!    not interpreted. Values are copied, never evaluated. Where a *value*
+//!    would mean something different to a shell than it does here (quotes
+//!    concatenated with more text, escapes, an unquoted second word), the line
+//!    is **refused**, so a credential is never silently something else; the one
+//!    deliberate difference is that whitespace around the `=` is tolerated.
 //! 3. **No setting looks like it took effect when it did not.** Keys read by
 //!    crates that never consult this file are called out at load time rather
 //!    than silently ignored; see [`NOT_SERVED_YET`].
@@ -178,25 +180,22 @@ pub fn load(path: &Path) -> Result<BTreeMap<String, String>> {
 
 /// Parse the assignment syntax the config file is allowed to use.
 ///
-/// Understands one assignment per line (`K=V`, `export K=V`), single and double
-/// quotes, `#` comments on their own line or after whitespace, blank lines,
-/// CRLF, and whitespace around the key and the `=`; ignores assignments in
-/// other namespaces, keeps only [`ACCEPTED_PREFIXES`], and lets a repeated key
-/// take its last value, exactly as a shell would.
+/// One assignment per line — `K=V` or `export K=V` — with single or double
+/// quotes, blank lines, `#` comments on their own line or after whitespace, and
+/// whitespace around the key and the `=`. Only [`ACCEPTED_PREFIXES`] are kept,
+/// and a repeated key takes its last value, as a shell would.
 ///
-/// Values are copied, never evaluated: `$HOME` stays `$HOME`. The shapes where
-/// a shell would do more than copy are the ones this returns an error for,
-/// because guessing would mean an operator's credential silently became
-/// something else:
-///
-/// - a backslash anywhere in a value (an escape in `sh`, a literal here),
-/// - content after a closing quote (`"a"b`, which `sh` concatenates),
-/// - an unterminated quote,
-/// - more than one assignment on a line (`export A=1 B=2`), and
-/// - a line that is not an assignment at all (`set -a`, `export QM_OK`).
+/// Everything that is not an assignment to one of those namespaces is ignored:
+/// the documented cron snippet sources this same file, so it may also hold
+/// `set -a`, a function, or settings for something else. What *is* refused is
+/// the narrower set of shapes where an assignment's value would mean something
+/// different to a shell than it does here — see [`parse_value`]. Values are
+/// copied, never evaluated, and **no error message ever quotes a value back**:
+/// the value may be the credential this file exists to hold.
 ///
 /// # Errors
-/// Fails on any of the shapes listed above.
+/// Fails when an assignment to a `QM_*` / `R2_*` key is written in a shape this
+/// loader will not guess at.
 pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for (index, line) in contents.lines().enumerate() {
@@ -209,26 +208,119 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
             Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
             _ => line,
         };
-        let (key, raw) = line
-            .split_once('=')
-            .with_context(|| format!("line {number} has no assignment"))?;
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
-        if !is_identifier(key) {
-            bail!("line {number}: {key:?} is not an identifier");
-        }
-        if !ACCEPTED_PREFIXES
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
+        if !is_identifier(key)
+            || !ACCEPTED_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
         {
-            // Not ours: a shell may keep it, this loader has no business
-            // injecting it. Silence is the contract for other namespaces, so
-            // the file can double as a general environment file.
+            // Not one of ours — including a name that is not an identifier at
+            // all. Ignoring it keeps the file usable as a general environment
+            // file, and no value here can reach the process.
             continue;
         }
-        let value = parse_value(raw.trim(), number)?;
-        values.insert(key.to_string(), value);
+        values.insert(key.to_string(), parse_value(raw, number)?);
     }
     Ok(values)
+}
+
+/// Take one raw value out of a parsed line.
+///
+/// Every rule here exists because a shell would read the shape differently, and
+/// the difference can be a credential that is silently not what the operator
+/// wrote:
+///
+/// - A quoted value ends at its closing quote, and followed by anything but a
+///   comment (`"a"b`, `"a"#b`) that is concatenation to a shell, so it is
+///   refused.
+/// - Inside double quotes a backslash before `$`, `` ` ``, `"` or `\` is an
+///   escape a shell would act on, so it is refused; every other backslash, and
+///   every backslash inside single quotes, is a literal and is kept.
+/// - An unquoted value ends at whitespace: `K=v # c` is a comment, while
+///   `K=v c` is a second word a shell would run as a command, so it is refused.
+/// - A `#` with no whitespace in front of it is data, so `K=#v` is the value
+///   `#v` while `K= #v` is an empty value followed by a comment — as in `sh`.
+///
+/// Whitespace around the `=` is tolerated (`K = v`). That is the one place this
+/// file is deliberately laxer than a shell, and it is why "the value" starts
+/// after any leading whitespace.
+fn parse_value(raw: &str, number: usize) -> Result<String> {
+    let spaced = raw.starts_with(char::is_whitespace);
+    let rest = raw.trim_start();
+    if rest.is_empty() || (spaced && rest.starts_with('#')) {
+        return Ok(String::new());
+    }
+    if rest.starts_with('"') || rest.starts_with('\'') {
+        return parse_quoted(rest, number);
+    }
+    // The value is the first word; a backslash anywhere *in it* is an escape a
+    // shell would act on. A backslash in the trailing comment is none of our
+    // business, which is why the word is split off first.
+    let (value, tail) = match rest.find(char::is_whitespace) {
+        Some(end) => (&rest[..end], &rest[end..]),
+        None => (rest, ""),
+    };
+    if value.contains('\\') {
+        bail!(
+            "line {number}: a backslash in an unquoted value is an escape to a shell; \
+             use single quotes if the backslash is literal, or export it in the environment"
+        );
+    }
+    expect_comment_or_end(tail, number)?;
+    Ok(value.to_string())
+}
+
+/// A quoted value: everything between the quotes, with the escapes a shell
+/// would act on refused rather than applied.
+fn parse_quoted(rest: &str, number: usize) -> Result<String> {
+    let quote = rest.chars().next().expect("caller checked for a quote");
+    let body = &rest[quote.len_utf8()..];
+    let mut end = None;
+    let mut chars = body.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\\' && quote == '"' {
+            match chars.next() {
+                Some((_, '$' | '`' | '"' | '\\')) => bail!(
+                    "line {number}: a backslash escape inside double quotes means something \
+                     else to a shell; use single quotes if the backslash is literal"
+                ),
+                Some(_) => continue,
+                None => bail!("line {number}: the line ends on a backslash"),
+            }
+        }
+        if ch == quote {
+            end = Some(index);
+            break;
+        }
+    }
+    let Some(end) = end else {
+        bail!("line {number}: unterminated {quote} quote");
+    };
+    expect_comment_or_end(&body[end + quote.len_utf8()..], number)?;
+    Ok(body[..end].to_string())
+}
+
+/// What may follow a value: nothing, or whitespace and then a comment.
+///
+/// A `#` with no whitespace in front of it is part of the value a shell would
+/// build by concatenation, so it is refused rather than read as a comment.
+fn expect_comment_or_end(tail: &str, number: usize) -> Result<()> {
+    if tail.is_empty() {
+        return Ok(());
+    }
+    if tail.starts_with(char::is_whitespace) {
+        let after = tail.trim_start();
+        if after.is_empty() || after.starts_with('#') {
+            return Ok(());
+        }
+    }
+    bail!(
+        "line {number}: only whitespace or a `#` comment may follow a value; a shell \
+         would read the rest as another word, and this loader will not guess"
+    )
 }
 
 /// Merge a setting that also has a command-line flag.
@@ -301,62 +393,6 @@ fn is_identifier(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Take one raw value out of a parsed line, following `sh` where `sh` is
-/// unambiguous and refusing to guess where it is not.
-fn parse_value(raw: &str, number: usize) -> Result<String> {
-    if raw.contains('\\') {
-        bail!(
-            "line {number}: backslash escapes are not interpreted here; \
-             write the value plainly or export it in the environment instead"
-        );
-    }
-    for quote in ['"', '\''] {
-        if let Some(rest) = raw.strip_prefix(quote) {
-            let end = rest
-                .find(quote)
-                .with_context(|| format!("line {number}: unterminated {quote} quote"))?;
-            let after = rest[end + 1..].trim();
-            if !after.is_empty() && !after.starts_with('#') {
-                bail!(
-                    "line {number}: {:?} follows a quoted value, which a shell would \
-                     concatenate and this loader will not guess at",
-                    after
-                );
-            }
-            return Ok(rest[..end].to_string());
-        }
-    }
-    let mut value = String::new();
-    // `#` starts a comment only where a shell starts one: after whitespace, or
-    // at the beginning of the line (handled by the caller). A value begins
-    // *inside* the assignment word, so `K=#value` is the value `#value` — not
-    // an empty one, which is what starting the scan "at a word start" would
-    // have produced.
-    let mut at_word_start = false;
-    for ch in raw.chars() {
-        if ch == '#' && at_word_start {
-            break;
-        }
-        at_word_start = ch.is_whitespace();
-        value.push(ch);
-    }
-    let value = value.trim_end();
-    // `export A=1 B=2` is two assignments to a shell and one to this parser.
-    // Reading it as `A="1 B=2"` would hand the operator a setting that looks
-    // like the shell's and is not, so it is refused.
-    if let Some(token) = value.split_whitespace().skip(1).find(|token| {
-        token
-            .split_once('=')
-            .is_some_and(|(name, _)| is_identifier(name))
-    }) {
-        bail!(
-            "line {number}: {token:?} looks like a second assignment; \
-             this file takes one per line"
-        );
-    }
-    Ok(value.to_string())
 }
 
 /// Say out loud when a credentials file is readable by other users.
@@ -453,10 +489,17 @@ mod tests {
         // Each of these is an error rather than a guess: a wrong credential
         // that fails loudly beats a credential silently read as something else.
         for (contents, expected) in [
-            ("QM_S3_SECRET_ACCESS_KEY=\"a\\\"b\"\n", "backslash"),
-            ("QM_WRITER=\"a\"b\n", "quoted value"),
+            // An escape a shell would apply inside double quotes.
+            ("QM_S3_SECRET_ACCESS_KEY=\"a\\\"b\"\n", "backslash escape"),
+            // Concatenation: a shell would build one value out of two pieces.
+            ("QM_WRITER=\"a\"b\n", "may follow a value"),
+            ("QM_WRITER=\"a\"#b\n", "may follow a value"),
             ("QM_WRITER='unterminated\n", "unterminated"),
-            ("export QM_WRITER=a QM_PROJECT=b\n", "second assignment"),
+            // Unquoted whitespace: a shell reads the rest as another word.
+            ("QM_WRITER=a b\n", "may follow a value"),
+            ("export QM_WRITER=a QM_PROJECT=b\n", "may follow a value"),
+            // An unquoted backslash is an escape to a shell.
+            ("QM_WRITER=C:\\tmp\n", "backslash"),
         ] {
             let error =
                 parse(contents).expect_err("the fixture has to be refused rather than guessed at");
@@ -480,17 +523,56 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_line_that_is_not_an_assignment() {
-        // The file is a *subset* of a shell script: every line it accepts is
-        // read the same way by `sh`, but a file with commands in it is refused
-        // rather than half-applied, so an operator finds out instead of
-        // wondering which half took effect.
-        for contents in ["set -a\n", "1QM_BUCKET=nope\n", "export QM_OK\n"] {
-            assert!(
-                parse(contents).is_err(),
-                "{contents:?} is not an assignment and must be refused"
-            );
-        }
+    fn ignores_lines_that_are_not_assignments() {
+        // The documented cron snippet sources this file, and an environment
+        // file may hold more than assignments. Only an assignment to a
+        // `QM_*` / `R2_*` key written in a shape a shell would read differently
+        // is an error; everything else is simply not this loader's business.
+        let parsed = parsed(
+            "set -a\n\
+             export QM_OK\n\
+             if [ -n \"$CI\" ]; then :; fi\n\
+             f() { echo hi; }\n\
+             QM_LOADED=yes\n\
+             set +a\n",
+        );
+        assert_eq!(parsed, values(&[("QM_LOADED", "yes")]));
+    }
+
+    #[test]
+    fn an_error_never_quotes_a_value_back() {
+        // The value may be the credential this file exists to hold, and errors
+        // go to stderr, which ends up in logs and CI output.
+        const SENTINEL: &str = "SENTINEL-SECRET-0123456789";
+        let contents = format!("QM_S3_SECRET_ACCESS_KEY=\"{SENTINEL}\"{SENTINEL}\n");
+
+        let error = parse(&contents).expect_err("concatenation is refused");
+        assert!(
+            !error.to_string().contains(SENTINEL),
+            "the error must not echo the value: {error}"
+        );
+    }
+
+    #[test]
+    fn keeps_backslashes_a_shell_would_keep() {
+        // A refusal that swallows legal values is its own bug: single quotes
+        // make a backslash literal, a double-quoted backslash before anything
+        // but an escapable character stays literal, and a comment may contain
+        // anything at all.
+        let parsed = parsed(
+            "QM_S3_ACCESS_KEY_ID='a\\b'\n\
+             QM_S3_SECRET_ACCESS_KEY=\"c\\d\"\n\
+             QM_WRITER=v # C:\\tmp\n\
+             QM_PROJECT= # nothing here\n",
+        );
+        assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
+        assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "c\\d");
+        assert_eq!(parsed.get("QM_WRITER").unwrap(), "v");
+        assert_eq!(
+            parsed.get("QM_PROJECT").unwrap(),
+            "",
+            "`K= #comment` is an empty value, as in sh"
+        );
     }
 
     #[test]
