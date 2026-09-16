@@ -66,7 +66,9 @@ export QM_WORKSPACE=acme QM_PROJECT=ai-memory QM_WRITER=mbp-1   # 可选
 # 下面用安装后的 `qm`；没装的话把 `qm` 换成 `cargo run -p qm-cli --bin qm --`
 qm capture --session sess-1 --text "ran the suite"
 qm consolidate --session sess-1          # --compiler auto|rules|llm
-# LLM 编译（可选）：设置 QM_LLM_BASE_URL / QM_LLM_API_KEY / QM_LLM_MODEL；失败自动回落 rules
+# LLM 编译（可选）：设置 QM_LLM_BASE_URL / QM_LLM_API_KEY / QM_LLM_MODEL。
+# --compiler auto 没配 provider 就用 rules；显式 --compiler llm 没配 provider 会直接报错；
+# 已配 provider 但调用失败时才回落 rules（报告里 used_fallback=true）
 qm publish                               # 增量：只发布本机上次发布后变化的页面
 qm maintain --json                       # 定时收口：drain spool + 编译所有会话 + 按需 publish
 qm search "suite"

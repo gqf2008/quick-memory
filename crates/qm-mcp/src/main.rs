@@ -18,7 +18,7 @@ use rmcp::transport::io::stdio;
 
 /// Command line options.
 #[derive(Debug, Parser)]
-#[command(name = "qm-mcp", about = "MCP server for quick-memory")]
+#[command(name = "qm-mcp", version, about = "MCP server for quick-memory")]
 struct Args {
     /// Serve an in-process, non-durable bucket.
     ///

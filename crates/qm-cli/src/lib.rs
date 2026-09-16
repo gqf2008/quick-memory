@@ -55,7 +55,7 @@ pub const HOOK_DRAIN_DEFAULT_LIMIT: usize = 100;
 
 /// Command line interface.
 #[derive(Debug, Parser)]
-#[command(name = "qm", about = "Shared agent memory on object storage")]
+#[command(name = "qm", version, about = "Shared agent memory on object storage")]
 pub struct Cli {
     /// Workspace to operate in.
     #[arg(long, env = "QM_WORKSPACE", default_value = "default", global = true)]

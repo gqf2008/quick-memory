@@ -196,7 +196,8 @@ qm hook-drain      # 桶恢复后重投本地 spool
 export QM_LLM_BASE_URL="https://api.openai.com/v1"   # 或任何 OpenAI 兼容端点
 export QM_LLM_API_KEY="..."
 export QM_LLM_MODEL="gpt-4o-mini"
-qm consolidate --session sess-1 --compiler llm       # 失败自动回落规则渲染
+qm consolidate --session sess-1 --compiler llm       # 需要 QM_LLM_*；没配 provider 会报错，
+                                                     # 调用失败才会回落规则渲染（used_fallback=true）
 ```
 
 幂等由**链指纹**决定：页面里嵌 `<!-- qm:compiled <sha256> -->`，链没变就不会因为措辞不同而反复写版本。

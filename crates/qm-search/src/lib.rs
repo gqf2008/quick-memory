@@ -1440,7 +1440,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::consolidate::consolidate_session;
+    use crate::consolidate::{
+        CompilerChoice, ConsolidationRequest, consolidate_session, consolidate_session_with,
+    };
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::{
@@ -2410,6 +2412,67 @@ mod tests {
 
     /// S4 acceptance: raw capture becomes a durable, searchable page, and
     /// re-running the compiler over an unchanged chain writes nothing.
+    /// Asking for the LLM compiler with nothing configured is a configuration
+    /// error, not a quiet rules compilation.
+    ///
+    /// The report used to name the rule compiler with `used_fallback: false`,
+    /// which reads as "rules were chosen" rather than "the LLM you asked for
+    /// was not there". A *configured* provider that fails still falls back —
+    /// that is what `used_fallback` records — but an unconfigured one is not a
+    /// failure to recover from.
+    #[tokio::test]
+    async fn asking_for_the_llm_compiler_without_a_provider_is_an_error() {
+        if std::env::var("QM_LLM_BASE_URL").is_ok_and(|value| !value.trim().is_empty()) {
+            // The premise is a property of the environment this test runs in,
+            // so say so rather than passing for a different reason.
+            eprintln!("not exercised: QM_LLM_BASE_URL is set in this environment");
+            return;
+        }
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let project = reader(&bucket);
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let session = SessionId::new("sess-llm").unwrap();
+        let consolidator = WriterId::new("mbp-a").unwrap();
+        ingest(&project, &session, &["this session needs a compiler"], 100).await;
+
+        let error = consolidate_session_with(
+            CompilerChoice::Llm,
+            &project,
+            ConsolidationRequest {
+                workspace_id: &workspace,
+                project_id: &project_id,
+                session_id: &session,
+                consolidator: &consolidator,
+                now_ms: 200,
+                lease_ttl_ms: 60_000,
+            },
+        )
+        .await
+        .expect_err("an unconfigured provider cannot compile with the LLM");
+
+        assert!(
+            error.to_string().contains("no provider is configured"),
+            "the error has to name what is missing: {error}"
+        );
+
+        // The refusal must not leave behind a page compiled by something the
+        // caller did not ask for.
+        let page = project
+            .read_page(
+                &workspace,
+                &project_id,
+                &PagePath::new("sessions/sess-llm.md").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.is_none(),
+            "a refused LLM request must not commit a rule-rendered page"
+        );
+    }
+
     #[tokio::test]
     async fn a_session_is_compiled_into_a_searchable_page() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

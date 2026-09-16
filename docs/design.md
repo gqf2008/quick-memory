@@ -575,7 +575,9 @@ qm migrate-manifest --to 1       # format 2 -> format 1（回滚）
 
 - 编译器**可插拔**：`CompilerChoice::Rules`（确定性渲染，永远是地板）或 `CompilerChoice::Llm`
   （OpenAI 兼容 `/chat/completions`，`QM_LLM_BASE_URL/API_KEY/MODEL`）。**LLM 失败一律回落到 rules 并标记
-  `used_fallback`**——丢掉页面比丢掉文采严重得多。
+  `used_fallback`**——丢掉页面比丢掉文采严重得多。**没配 provider 是另一回事**：显式要 LLM 却没有
+  provider 时直接报错，而不是回落到 rules——否则报告会写着 `compiler: rules`、`used_fallback: false`，
+  读起来像"选了规则"，而不是"你要的 LLM 不在"。
 - **幂等由链指纹决定，不由正文决定**：页面里嵌 `<!-- qm:compiled <sha256> -->`，指纹覆盖观测 id 序列。
   链没变就不再写版本——否则一个每次措辞都不同的 LLM 会产生无限版本。链变了才重编译。
 - 链没变时**不追加版本**（`already_up_to_date`）。

@@ -7,10 +7,17 @@
 //! Compilation is guarded in three ways. It runs under a lease, so two machines
 //! do not compile the same session at once. It is a function of the chain's
 //! *fingerprint*, not of the body, so a nondeterministic compiler (an LLM) does
-//! not cause a new version every time it runs. And a compiler failure falls back
-//! to the rule renderer, because losing the page is worse than losing polish.
+//! not cause a new version every time it runs. And a *configured* compiler's
+//! failure falls back to the rule renderer, because losing the page is worse
+//! than losing polish.
+//!
+//! Asking for the LLM compiler with nothing configured is a different case and
+//! is **not** a fallback: it is a configuration error. Falling back silently
+//! would produce a report that names the rule compiler with
+//! `used_fallback: false`, which reads as "rules were chosen" rather than "the
+//! LLM you asked for was not there".
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use qm_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId};
 use qm_store::{CommitPageRequest, ProjectStore};
 
@@ -172,13 +179,10 @@ pub async fn consolidate_session_with(
                     true,
                 ),
             },
-            None => (
-                rules
-                    .compile(session_id, &observations)
-                    .await
-                    .context("rule compiler failed")?,
-                rules.name(),
-                false,
+            None => bail!(
+                "the LLM compiler was requested but no provider is configured: set \
+                 QM_LLM_BASE_URL, QM_LLM_API_KEY and QM_LLM_MODEL (or ask for rules/auto, \
+                 which uses the rule renderer when no provider is configured)"
             ),
         },
     };

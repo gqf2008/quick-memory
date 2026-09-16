@@ -230,6 +230,24 @@ fn the_real_binary_refuses_a_storage_form_it_does_not_know() {
     }
 }
 
+/// `qm --version` has to answer: an installed binary must be identifiable
+/// without reading `--help` or the repository's git log.
+#[test]
+fn the_real_binary_reports_its_version() {
+    let output = run_qm_args(&["--version"], &[]);
+    assert!(
+        output.status.success(),
+        "`qm --version` must succeed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected version {} in {stdout:?}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 /// A maintain pass with one broken session must still print its complete JSON
 /// report on stdout and exit non-zero. This runs the real `qm` binary against a
 /// local S3 protocol stub, so the process boundary is part of the evidence.

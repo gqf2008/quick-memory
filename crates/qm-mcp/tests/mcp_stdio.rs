@@ -14,6 +14,29 @@ use object_store::aws::AmazonS3Builder;
 use qm_core::{KeyLayout, ProjectId, SessionId, WorkspaceId};
 use qm_probe::s3_stub::S3Stub;
 
+/// Clients start this binary without ever running `--help`, so `--version` has
+/// to work — and it has to work before any bucket configuration is consulted,
+/// which is why this runs with a cleared environment.
+#[test]
+fn the_mcp_binary_reports_its_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_qm-mcp"))
+        .arg("--version")
+        .env_clear()
+        .output()
+        .expect("running qm-mcp --version");
+    assert!(
+        output.status.success(),
+        "`qm-mcp --version` must succeed without any configuration: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected version {} in {stdout:?}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 struct Client {
     child: Child,
     stdin: ChildStdin,

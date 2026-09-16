@@ -337,13 +337,25 @@ fn parse_value(raw: &str, number: usize, exported: bool) -> Result<String> {
         );
     }
     // zsh (the default login shell on macOS, and a plausible `source` target)
-    // turns a `:`-separated part that starts with `=` into a command path:
-    // `K==ls` is `/bin/ls` there, and `K=foo:=ls` is `foo:/bin/ls`. A bare `=`
-    // and a trailing base64 `==` are not that shape, so they stay usable.
-    if value
-        .split(':')
-        .any(|part| part.len() > 1 && part.starts_with('='))
-    {
+    // turns a `:`-separated part that starts with `=` into a command path. The
+    // exact rule, measured against `zsh -f` on this machine:
+    //
+    //   `=ls`  → `/bin/ls`      (something follows the `=`)
+    //   `==`   → error          (ditto — it looks for a command named `=`)
+    //   `foo:=` → `foo:=`       (a bare `=` *as the last part* is left alone)
+    //   `foo:=:bar` → error     (a bare `=` with a `:` after it is not)
+    //   `foo::=` → `foo::=`     (still the last part)
+    //
+    // So the shape to refuse is "a part that starts with `=`, unless it is
+    // exactly `=` and it is the last part". A trailing base64 `==` and a plain
+    // `a=b` are neither.
+    let parts: Vec<&str> = value.split(':').collect();
+    let last = parts.len().saturating_sub(1);
+    let zsh_equals = parts
+        .iter()
+        .enumerate()
+        .any(|(index, part)| part.starts_with('=') && (part.len() > 1 || index != last));
+    if zsh_equals {
         bail!(
             "line {number}: a `=`-prefixed part of an unquoted value is a command path to \
              zsh; wrap the value in single quotes if it is a literal"
@@ -616,11 +628,15 @@ mod tests {
             ("QM_WRITER=foo:~/bar\n", "unquoted `~`"),
             ("QM_WRITER=:~/bar\n", "unquoted `~`"),
             ("QM_WRITER=foo:~\n", "unquoted `~`"),
-            // zsh's EQUALS expansion, which needs a `=` at the start of a
-            // `:`-separated part.
+            // zsh's EQUALS expansion, measured on this machine: a `=`-prefixed
+            // `:`-separated part expands or fails there.
             ("QM_WRITER==ls\n", "command path to zsh"),
             ("QM_WRITER=foo:=ls\n", "command path to zsh"),
             ("QM_WRITER=:==\n", "command path to zsh"),
+            ("QM_WRITER=:===\n", "command path to zsh"),
+            ("QM_WRITER=foo:=:bar\n", "command path to zsh"),
+            ("QM_WRITER==:\n", "command path to zsh"),
+            ("QM_WRITER=:=:\n", "command path to zsh"),
             // Braces differ by context: a builtin argument is brace-expanded by
             // `sh`/`bash` but not by `zsh`, so there is no single value.
             ("export QM_WRITER={a,b}\n", "shells disagree about braces"),
@@ -700,6 +716,8 @@ mod tests {
              QM_CLASS=[abc]\n\
              QM_EQUALS=a=b\n\
              QM_BASE64=YWJjZA==\n\
+             QM_EQ_LAST=:=\n\
+             QM_EQ_TRAILING=foo::=\n\
              export QM_QUOTED_BRACE='{a,b}'\n",
         );
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
@@ -737,6 +755,10 @@ mod tests {
             "YWJjZA==",
             "base64 padding must stay usable"
         );
+        // Measured against `zsh -f`: a bare `=` that is the *last* part is left
+        // alone, so refusing it would reject a value every shell reads the same.
+        assert_eq!(parsed.get("QM_EQ_LAST").unwrap(), ":=");
+        assert_eq!(parsed.get("QM_EQ_TRAILING").unwrap(), "foo::=");
         assert_eq!(
             parsed.get("QM_QUOTED_BRACE").unwrap(),
             "{a,b}",
