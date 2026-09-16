@@ -56,7 +56,9 @@ pub struct ConsolidateOutcome {
 pub enum CompilerChoice {
     /// The deterministic renderer.
     Rules,
-    /// An OpenAI-compatible LLM, falling back to rules on failure.
+    /// An OpenAI-compatible LLM. A *configured* provider that fails falls back
+    /// to rules (with `used_fallback` set); a missing provider is a
+    /// configuration error, not a fallback.
     Llm,
 }
 
@@ -96,23 +98,11 @@ pub async fn consolidate_session_with(
         now_ms,
         lease_ttl_ms,
     } = request;
-    // Resolve which compiler will actually run *before* touching any state.
-    // Two reasons, both learned from review: asking for the LLM with nothing
-    // configured is a configuration error rather than a fallback, and an error
-    // raised after the lease was taken would leave that lease behind — one bad
-    // invocation would then make the session `skipped` until the TTL passes.
-    // Doing it here also means the empty-session and already-up-to-date early
-    // returns cannot quietly succeed under a configuration that is wrong.
-    let llm = match choice {
-        CompilerChoice::Rules => None,
-        CompilerChoice::Llm => Some(OpenAiCompatCompiler::from_env()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "the LLM compiler was requested but no provider is configured: set \
-                 QM_LLM_BASE_URL, QM_LLM_API_KEY and QM_LLM_MODEL (or ask for rules/auto, \
-                 which uses the rule renderer when no provider is configured)"
-            )
-        })?),
-    };
+    // Which compiler will actually run is decided *before* any state is touched:
+    // a configuration error raised under the lease would leave the lease object
+    // behind, and the empty-session / already-up-to-date early returns must not
+    // quietly succeed under a configuration that is wrong.
+    let llm = resolve_compiler(choice)?;
 
     let scope = format!("consolidate/{workspace_id}/{project_id}/{session_id}");
     let Some(lease) = project_store
@@ -123,6 +113,64 @@ pub async fn consolidate_session_with(
         return Ok(skipped_outcome(0, 0, 0, true, false));
     };
 
+    // Everything below runs under the lease, so the work *returns* its result
+    // instead of releasing on each path: a single early `?` that dropped the
+    // guard would leave the lease object behind and park this session as
+    // `skipped` until its TTL. The release happens once, on both outcomes.
+    let outcome = compile_under_lease(
+        project_store,
+        llm,
+        workspace_id,
+        project_id,
+        session_id,
+        consolidator,
+        now_ms,
+    )
+    .await;
+    let released = lease.release(project_store, now_ms).await;
+    match outcome {
+        // The work failure is what explains the run; a release failure on top of
+        // it would only hide it.
+        Err(error) => Err(error),
+        Ok(outcome) => {
+            released.map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(outcome)
+        }
+    }
+}
+
+/// Which compiler a request will actually run.
+///
+/// Asking for the LLM with nothing configured is a configuration error, not a
+/// fallback: rules are the floor when a *configured* provider fails, but a
+/// missing provider means the report would name the rule compiler with
+/// `used_fallback: false` — reading as "rules were chosen" rather than "the LLM
+/// you asked for is not there".
+fn resolve_compiler(choice: CompilerChoice) -> Result<Option<OpenAiCompatCompiler>> {
+    match choice {
+        CompilerChoice::Rules => Ok(None),
+        CompilerChoice::Llm => Ok(Some(OpenAiCompatCompiler::from_env()?.ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "the LLM compiler was requested but no provider is configured: set \
+                     QM_LLM_BASE_URL, QM_LLM_API_KEY and QM_LLM_MODEL (or ask for rules/auto, \
+                     which uses the rule renderer when no provider is configured)"
+                )
+            },
+        )?)),
+    }
+}
+
+/// The work that runs while the consolidation lease is held.
+async fn compile_under_lease(
+    project_store: &ProjectStore,
+    llm: Option<OpenAiCompatCompiler>,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    consolidator: &WriterId,
+    now_ms: i64,
+) -> Result<ConsolidateOutcome> {
     let chain = project_store
         .read_session_chain(workspace_id, project_id, session_id)
         .await
@@ -139,10 +187,6 @@ pub async fn consolidate_session_with(
         .seq;
 
     if observations.is_empty() {
-        lease
-            .release(project_store, now_ms)
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(skipped_outcome(0, chain.len(), manifest_seq, false, true));
     }
 
@@ -157,10 +201,6 @@ pub async fn consolidate_session_with(
         .map_err(|error| anyhow::anyhow!("{error}"))?
         && fingerprint_of(&current.body).as_deref() == Some(fingerprint.as_str())
     {
-        lease
-            .release(project_store, now_ms)
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
         return Ok(ConsolidateOutcome {
             skipped: false,
             lease_held: false,
@@ -210,10 +250,6 @@ pub async fn consolidate_session_with(
             writer_id: consolidator.clone(),
             now_ms,
         })
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    lease
-        .release(project_store, now_ms)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 

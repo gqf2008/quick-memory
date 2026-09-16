@@ -2412,6 +2412,67 @@ mod tests {
 
     /// S4 acceptance: raw capture becomes a durable, searchable page, and
     /// re-running the compiler over an unchanged chain writes nothing.
+    /// A failure raised *after* the lease was taken must still release it.
+    ///
+    /// Dropping the guard only shortens the wait: the lease object stays in the
+    /// bucket until its TTL, and every consolidation of that session answers
+    /// `skipped` until then. The session read below is broken on purpose, which
+    /// happens after `acquire_lease` and before any compile or commit.
+    #[tokio::test]
+    async fn a_failure_under_the_lease_releases_it() {
+        let inner = Arc::new(InMemory::new());
+        let recorder = RecordingStore::new(Arc::clone(&inner));
+        let project = reader(&(Arc::clone(&recorder) as Arc<dyn ObjectStore>));
+        let workspace = WorkspaceId::new("acme").unwrap();
+        let project_id = ProjectId::new("ai-memory").unwrap();
+        let session = SessionId::new("sess-under-lease").unwrap();
+        let consolidator = WriterId::new("mbp-a").unwrap();
+        ingest(
+            &project,
+            &session,
+            &["this consolidation will fail under the lease"],
+            100,
+        )
+        .await;
+
+        recorder.fail_reads_containing("/sessions/");
+        let error = consolidate_session(
+            &project,
+            &workspace,
+            &project_id,
+            &session,
+            &consolidator,
+            200,
+            60_000,
+        )
+        .await
+        .expect_err("the injected read failure has to surface");
+        assert!(
+            error.to_string().contains("injected read failure"),
+            "the failure has to be the injected one: {error}"
+        );
+        recorder.stop_failing_reads();
+
+        // Same scope, well inside the TTL: a leaked lease would answer
+        // `skipped` instead of compiling.
+        let after = consolidate_session(
+            &project,
+            &workspace,
+            &project_id,
+            &session,
+            &consolidator,
+            300,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !after.skipped && !after.lease_held,
+            "the failed run must not keep the lease: {after:?}"
+        );
+        assert_eq!(after.observations, 1);
+    }
+
     /// Asking for the LLM compiler with nothing configured is a configuration
     /// error, not a quiet rules compilation.
     ///
@@ -4882,6 +4943,9 @@ mod tests {
         /// handle and have the recording not see any of that.
         inner: Arc<InMemory>,
         reads: Mutex<Vec<String>>,
+        /// When set, every `get` whose key contains this string fails. It exists
+        /// so a test can break a read that happens *after* a lease was taken.
+        fail_reads_containing: Mutex<Option<String>>,
     }
 
     impl RecordingStore {
@@ -4889,7 +4953,24 @@ mod tests {
             Arc::new(Self {
                 inner,
                 reads: Mutex::new(Vec::new()),
+                fail_reads_containing: Mutex::new(None),
             })
+        }
+
+        /// Make reads of keys containing `marker` fail.
+        fn fail_reads_containing(&self, marker: &str) {
+            *self.fail_reads_containing.lock().unwrap() = Some(marker.to_string());
+        }
+
+        fn stop_failing_reads(&self) {
+            *self.fail_reads_containing.lock().unwrap() = None;
+        }
+
+        fn injected_read_failure() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "recording-store-test",
+                source: Box::new(std::io::Error::other("injected read failure")),
+            }
         }
 
         /// Forget what has been read, so a test can time one call.
@@ -4966,12 +5047,16 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move {
-                let out = self.inner.get_opts(location, options).await;
                 self.reads
                     .lock()
                     .unwrap()
                     .push(location.as_ref().to_string());
-                out
+                if let Some(marker) = self.fail_reads_containing.lock().unwrap().clone()
+                    && location.as_ref().contains(&marker)
+                {
+                    return Err(Self::injected_read_failure());
+                }
+                self.inner.get_opts(location, options).await
             })
         }
 
