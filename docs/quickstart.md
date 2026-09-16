@@ -93,7 +93,10 @@ QM_WRITER=mbp-1 qm publish                             # 发布会话页，使�
 QM_WRITER=mbp-1 qm search "tantivy"                    # 换一台机器也能搜到
 ```
 
-`qm search` 需要桶里已有分片；`qm publish` 之前检索不到任何东西是正常的。
+`qm search` 需要桶里已有分片：`qm publish` 之前检索不到。注意两个入口的区别——
+**写进去的东西 `recent` / `log` / `digest` / `history` / `read-page` 立刻看得见**（它们读权威对象），
+但 `search` 要等 `publish`（或 `maintain`）。另外，覆盖已发布页面的新版本在 publish 之前，
+那个 path 在 `search` 里会**暂时完全查不到**（旧版本已被权威判为过期），不是"查到旧内容"。
 
 ### 一键收口（可定时）
 

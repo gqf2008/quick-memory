@@ -2109,7 +2109,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .to_string()
             } else {
                 format!(
-                    "committed {} at seq {} (page {})",
+                    "committed {} at seq {} (page {}); not searchable until `qm publish`",
                     page_path.as_str(),
                     outcome.manifest_seq,
                     &outcome.page_id.as_str()[..12.min(outcome.page_id.as_str().len())]
@@ -3504,6 +3504,115 @@ mod tests {
 
     /// `qm status` has to say which analyzer generation the index is on: that is
     /// what tells an operator "run `qm compact`" *before* a search does.
+    /// Publishing is what makes a page searchable, and the two families of reads
+    /// disagree on purpose until then.
+    ///
+    /// The design used to claim a local tail ("read your writes"); it does not
+    /// exist, so this pins the real behaviour instead: an unpublished page is
+    /// visible to `recent` (authority) and invisible to `search` (index). The
+    /// second half is the sharper case — a *new version* of a published page
+    /// hides the path from search entirely until it is published, because the
+    /// index still holds the old version and the authority rejects it.
+    #[tokio::test]
+    async fn an_unpublished_page_is_visible_to_recent_but_not_to_search() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/ryw.md",
+                "--body",
+                "first body",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+
+        // Authority readers see it immediately…
+        let recent = execute(
+            &cli(&["recent", "--limit", "5", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(recent.contains("notes/ryw.md"), "{recent}");
+
+        // …the index does not, because nothing has been published.
+        let searched = execute(
+            &cli(&["search", "first body", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !searched.contains("notes/ryw.md"),
+            "an unpublished page must not be searchable: {searched}"
+        );
+
+        // Publishing is the step that closes the gap.
+        execute(
+            &cli(&["publish", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let searched = execute(
+            &cli(&["search", "first body", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(
+            searched.contains("notes/ryw.md"),
+            "a published page has to be searchable: {searched}"
+        );
+
+        // A new version hides the path again until it is published: the index
+        // still holds the first version, and the authority rejects it.
+        execute(
+            &cli(&[
+                "write-page",
+                "--path",
+                "notes/ryw.md",
+                "--body",
+                "second body",
+            ]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        for query in ["first body", "second body"] {
+            let searched = execute(
+                &cli(&["search", query, "--json"]),
+                context(Arc::clone(&bucket), &cache),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !searched.contains("notes/ryw.md"),
+                "neither version answers before the new one is published ({query}): {searched}"
+            );
+        }
+
+        // And publishing the new version restores it.
+        execute(
+            &cli(&["publish", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let searched = execute(
+            &cli(&["search", "second body", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        assert!(searched.contains("notes/ryw.md"), "{searched}");
+    }
+
     #[tokio::test]
     async fn status_reports_the_index_schema() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
