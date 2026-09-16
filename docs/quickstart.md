@@ -54,7 +54,8 @@ chmod 600 ~/.quick-memory/env
 - **值不会被求值**：不展开 `$`、不执行命令替换、不做 glob。凡是 shell 会读成**另一个值**的写法
   都会**报错退出**而不是猜着用：未加引号的 `$`、反引号、引号、`\`、`;` `&` `|` `<` `>` `(` `)`，
   未加引号的第二个词（`K=v w`），引号拼接（`"a"b`、`"a"#b`），双引号内的 `$`/反引号/转义，
-  以及 shell 会展开成家目录的 `~`（值开头，或**任意 `:` 之后**，如 `foo:~/bar`）。
+  以及 shell 会展开成家目录的 `~`（值开头，或**任意 `:` 之后**，如 `foo:~/bar`）与 zsh 的
+  `=命令名` 展开（`K==ls`、`foo:=ls`）。
 - **需要字面量就用单引号**：`QM_WRITER='$(hostname)'`、`QM_S3_SECRET_ACCESS_KEY='a$b*c'`
   —— 单引号内 shell 也按字面量读，两边一致，是唯一能同时满足两种读法的写法。
   `*`、`{a,b}`、`[abc]` 这类字符在赋值右值里不展开，未加引号也可以（`sh`/`bash`/`zsh` 实测一致）。
@@ -105,7 +106,8 @@ splits`；`spool_kept` 统计所有未成功处理的剩余条目（其他 scope
 ```cron
 */15 * * * * /usr/local/bin/qm maintain --json >> "$HOME/.local/state/qm-maintain.log" 2>&1
 # 想显式注入：. "$HOME/.quick-memory/env"; /usr/local/bin/qm maintain --json >> ...
-# 对本文档接受的写法，source 与 qm 的读法一致（含 $ 的值必须用单引号）；不需要 source。
+# 只有在「LF 换行 + 只使用本文档语法」时，source 与 qm 才保证读法一致；
+# qm 另外容忍 CRLF 与 `=` 两侧空白（shell 不认），交互式 `!` 历史展开不在保证内。
 ```
 
 不要把 `qm maintain` 放进 agent 的 fire-and-forget hook 路径：`qm hook` 只负责

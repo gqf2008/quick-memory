@@ -21,10 +21,14 @@
 //!    no globbing. A value that would mean something *different* to a shell —
 //!    quotes concatenated with more text, escapes, an unquoted second word,
 //!    unquoted shell metacharacters — is **refused**, with single quotes as the
-//!    escape hatch (they mean the same thing to both readings). The two
-//!    deliberate differences left are that whitespace around the `=` is
-//!    tolerated, and that a value the shell cannot express at all is not this
-//!    loader's problem.
+//!    escape hatch (they mean the same thing to both readings). What remains
+//!    are two *permissive* differences: this loader accepts whitespace around
+//!    the `=` and strips a CRLF line ending, where a shell would read `K = v`
+//!    as a command and keep the `\r`. The equivalence promise is therefore
+//!    narrow and stated on purpose: **an LF-terminated file written in the
+//!    syntax below is read the same way by both**; anything outside that syntax
+//!    is refused rather than half-honored. Interactive `!` history expansion is
+//!    outside the promise — it belongs to the shell session, not the file.
 //! 3. **No setting looks like it took effect when it did not.** Keys read by
 //!    crates that never consult this file are called out at load time rather
 //!    than silently ignored; see [`NOT_SERVED_YET`].
@@ -269,6 +273,11 @@ pub fn parse(contents: &str) -> Result<BTreeMap<String, String>> {
 ///   hatch, and they mean the same thing to both readings.
 /// - Inside double quotes, `$` and a backtick would still be expanded, so they
 ///   are refused there too.
+/// - A `:`-separated part that starts with `=` (`K==ls`, `K=foo:=ls`) is a
+///   command path to zsh, so it is refused too. A plain `a=b` and base64
+///   padding (`YWJjZA==`) are not that shape and stay usable.
+/// - `~` is refused where a shell expands it — at the start of the value and
+///   after every `:` — and left alone in `a~b`.
 ///
 /// Whitespace around the `=` is tolerated (`K = v`). That is the one place this
 /// file is deliberately laxer than a shell, and it is why "the value" starts
@@ -302,6 +311,19 @@ fn parse_value(raw: &str, number: usize) -> Result<String> {
         bail!(
             "line {number}: a backslash in an unquoted value is an escape to a shell; \
              use single quotes if the backslash is literal, or export it in the environment"
+        );
+    }
+    // zsh (the default login shell on macOS, and a plausible `source` target)
+    // turns a `:`-separated part that starts with `=` into a command path:
+    // `K==ls` is `/bin/ls` there, and `K=foo:=ls` is `foo:/bin/ls`. A bare `=`
+    // and a trailing base64 `==` are not that shape, so they stay usable.
+    if value
+        .split(':')
+        .any(|part| part.len() > 1 && part.starts_with('='))
+    {
+        bail!(
+            "line {number}: a `=`-prefixed part of an unquoted value is a command path to \
+             zsh; wrap the value in single quotes if it is a literal"
         );
     }
     // A shell expands `~` at the start of an assignment value and again after
@@ -571,6 +593,11 @@ mod tests {
             ("QM_WRITER=foo:~/bar\n", "unquoted `~`"),
             ("QM_WRITER=:~/bar\n", "unquoted `~`"),
             ("QM_WRITER=foo:~\n", "unquoted `~`"),
+            // zsh's EQUALS expansion, which needs a `=` at the start of a
+            // `:`-separated part.
+            ("QM_WRITER==ls\n", "command path to zsh"),
+            ("QM_WRITER=foo:=ls\n", "command path to zsh"),
+            ("QM_WRITER=:==\n", "command path to zsh"),
         ] {
             let error =
                 parse(contents).expect_err("the fixture has to be refused rather than guessed at");
@@ -640,7 +667,9 @@ mod tests {
              QM_TILDE_COLON=foo:bar~baz\n\
              QM_GLOB=*\n\
              QM_BRACE={a,b}\n\
-             QM_CLASS=[abc]\n",
+             QM_CLASS=[abc]\n\
+             QM_EQUALS=a=b\n\
+             QM_BASE64=YWJjZA==\n",
         );
         assert_eq!(parsed.get("QM_S3_ACCESS_KEY_ID").unwrap(), "a\\b");
         assert_eq!(parsed.get("QM_S3_SECRET_ACCESS_KEY").unwrap(), "c\\d");
@@ -667,6 +696,16 @@ mod tests {
         assert_eq!(parsed.get("QM_GLOB").unwrap(), "*");
         assert_eq!(parsed.get("QM_BRACE").unwrap(), "{a,b}");
         assert_eq!(parsed.get("QM_CLASS").unwrap(), "[abc]");
+        assert_eq!(
+            parsed.get("QM_EQUALS").unwrap(),
+            "a=b",
+            "only a part that starts with `=` is a command path to zsh"
+        );
+        assert_eq!(
+            parsed.get("QM_BASE64").unwrap(),
+            "YWJjZA==",
+            "base64 padding must stay usable"
+        );
     }
 
     #[test]
