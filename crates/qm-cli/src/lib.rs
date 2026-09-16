@@ -2109,7 +2109,7 @@ pub async fn execute(cli: &Cli, mut ctx: Context) -> Result<String> {
                 .to_string()
             } else {
                 format!(
-                    "committed {} at seq {} (page {}); not searchable until `qm publish`",
+                    "committed {} at seq {} (page {}); not searchable until an index update (`qm publish`, `maintain` or `compact`)",
                     page_path.as_str(),
                     outcome.manifest_seq,
                     &outcome.page_id.as_str()[..12.min(outcome.page_id.as_str().len())]
@@ -3502,8 +3502,6 @@ mod tests {
         );
     }
 
-    /// `qm status` has to say which analyzer generation the index is on: that is
-    /// what tells an operator "run `qm compact`" *before* a search does.
     /// Publishing is what makes a page searchable, and the two families of reads
     /// disagree on purpose until then.
     ///
@@ -3596,6 +3594,19 @@ mod tests {
                 "neither version answers before the new one is published ({query}): {searched}"
             );
         }
+        // Directly: the old version is *in* the index and was refused by the
+        // authority, rather than never having been a candidate.
+        let searched = execute(
+            &cli(&["search", "first body", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let outcome: serde_json::Value = serde_json::from_str(&searched).unwrap();
+        assert!(
+            outcome["filtered_out"].as_u64().unwrap_or(0) > 0,
+            "the superseded version has to reach the authority filter: {searched}"
+        );
 
         // And publishing the new version restores it.
         execute(
@@ -3613,6 +3624,8 @@ mod tests {
         assert!(searched.contains("notes/ryw.md"), "{searched}");
     }
 
+    /// `qm status` has to say which analyzer generation the index is on: that is
+    /// what tells an operator "run `qm compact`" *before* a search does.
     #[tokio::test]
     async fn status_reports_the_index_schema() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

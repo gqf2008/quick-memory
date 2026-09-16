@@ -20,7 +20,9 @@
 2. **没有稳定拓扑**：不能靠 peer 列表或固定主机名发现彼此；只能靠桶里的对象。
 3. **没有分布式事务**：唯一的原子原语是单对象的条件写（ETag CAS）。
 4. **索引必须可重建**：索引损坏、格式升级、逻辑变更都能从权威数据重跑出来。
-5. **搜索允许有界滞后**，但写入不能丢，且必须能证明"覆盖到哪个时间点"。
+5. **搜索允许有界滞后**，但写入不能丢。滞后是**双向**的：新写入要等 `publish` / `maintain` / `compact`
+   之后才进检索，而删除（tombstone）立刻生效（见 §6）。目前**没有**可对外证明"索引覆盖到哪个时间点"的水位
+   ——`IndexCatalog.covered_until_ms` 只是 publish 那一刻的墙上时间，不是覆盖水位（见 §6 末段）。
 
 与 moltlink 的差别：moltlink 跑在服务器上，可以强约束一个 indexer、常驻 coordinator、单一 metastore writer；
 quick-memory 跑在多机上，这三条全部不可用，因此**索引发布单元从"共享索引的一次 ingest"改成"每个写入方自己的分片"**。
@@ -294,13 +296,19 @@ tantivy 的默认分词器按"非字母数字"切分，而**汉字在 Unicode �
   `capture` + `consolidate`）而还没 `publish` 的内容搜不到。
 - 更微妙的一种：新版本提交后会 supersede 旧版本，而旧分片里的旧版本随即被权威判为过期——
   因此在 `publish` 之前，这个 path 可能**暂时完全搜不到**，而不是"搜到旧内容"。
-- 同一时刻 `recent` / `log` / `digest` / `history` / `read-page` **看得见**它，因为它们直接读权威对象。
-  两个入口给出不同印象是设计使然（索引只提供候选、权威给结论），不是不一致。
+- **反向的删除是例外**：已经发布过的页面被 `delete-page` 之后，即使不 publish，权威 tombstone 也会立刻让
+  旧索引里的命中被判为过期——path **立刻**从 `search` 消失。也就是说"索引没更新"只影响**正向**写入，
+  负向的删除不需要等。
+- 同一时刻另外几条读路径**看得见**它，但要分清两类：`recent` / `history` / `read-page`（以及 `status` / `verify`）
+  直接读**manifest 支撑的权威对象**，写入成功即立即可见；`log` / `digest` 依赖**建议性的 commit log**——
+  它在 manifest CAS 成功之后异步追加、失败会被忽略（见 §6.5 与 `docs/ops.md`），所以它们可能少一条记录，
+  是 best-effort 而非权威。
 - `publish` / `maintain` / `compact` 之后它才进入检索。跨机可见性本来就允许有界滞后。
 
-`IndexCatalog.covered_until_ms` 记录索引覆盖到的提交时间，但**没有对外暴露**（`SearchOutcome` 里没有该字段），
-所以调用方目前无法知道"索引落后多少"。要做到"本机写入立即可搜"，需要一条真正的本地尾部读路径，
-而不是文档承诺——那是一个独立的工作项，不在这句话的范围内。
+`IndexCatalog.covered_until_ms` **不是覆盖水位**：它取的是 publish / compact 那一刻调用方传入的 `now_ms`
+（`push_split` / `replace_catalog` 取最大值），所以别人更早提交、但还没发布的页面同样会被这个数字"越过"。
+即便把它暴露到检索结果里，也回答不了"索引落后多少"；要做到"本机写入立即可搜"，需要一条真正的本地尾部
+读路径，那是独立工作项。
 
 ## 6.20 向量检索流（第 4 路，可选）
 
@@ -981,7 +989,7 @@ qm compact-session --session <id> --keep-last 50 --apply                     # �
 | 机器离线/休眠 | 其分片已在桶里，别人照搜；租约到期后被接管 |
 | 时钟漂移 | 权威顺序只认 CAS 时的 seq；排序用 `(updated_at, writer_id, seq)` |
 | 重复发布 | 分片名含 writer+seq；查询期按 `page_id` 去重取最新 |
-| 目录滞后 | 本机写走本地档；跨机结果显式带 `covered_until` |
+| 目录滞后 | 新写入在 `search` 里要等 index 更新（`publish`/`maintain`/`compact`）；`recent`/`history`/`read-page` 读权威所以立刻可见；**删除立刻生效**（tombstone 过滤旧索引命中）。没有对外暴露的覆盖水位，见 §6 |
 | CAS 竞争 | 重读重试；不同 project 之间零竞争 |
 | 凭据泄露 | 当前形态（每机全桶 token）下全桶可读写；轮换凭据，是否改用网关见 §9（**待拍板的决策项**） |
 
