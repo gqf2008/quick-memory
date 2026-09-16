@@ -96,8 +96,9 @@ R2 的 PUT 可能返回只在 PUT 出现的 `x-amz-version-id`，后续 GET/HEAD
 - 探针会把这一特征直接印出来：`cas-conformance` 第一步同时报告 PUT 返回的 ETag 与 version，
   在 R2 上会看到 `version=Some(...)`，在 MinIO 上是 `version=None`。
 
-**仍然没有做的**：在真 R2 上跑一次 `cas-conformance`。上面是"按构造 + 回归"级别的证据，
-不是"在 R2 上观测到的证据"，两者不应混为一谈。
+**曾经没有做的**：在真 R2 上跑一次 `cas-conformance`。2026-09-16 补上了这一步（§10.8）：真 R2 上
+`7/7 PASS`，并且真的观测到了下面描述的 PUT-only version 形状。本文其余部分保留"按构造 + 回归"与
+"实测观测"的区分。
 
 #### 协议层验证（stub）
 
@@ -181,20 +182,17 @@ HTTP `409 Conflict` 被 `object_store` 映射成 `Error::AlreadyExists`，`qm-st
 - **条件读的语义**：`If-None-Match` 命中时本该是 `304`（并带 ETag），stub 一律回 `501`——是"我们没建模"
   的诚实表达，不是"304 已被验证"。
 
-- **真 R2 账号**：没有凭据，仍然没有在真 R2 上跑过 `cas-conformance`；MinIO 的 2026-09-16
-  current-head 复验见 §10.5，它是真实 S3-compatible HTTP 后端，不是 R2，不能代替 R2 观测。
+- **真 R2 账号**：已于 2026-09-16 在真 R2 上复验（§10.8）：`cas-conformance` `7/7 PASS`，并观测到
+  PUT-only version。这里仍然空着的是 ACL / 凭据边界，以及"错误签名必须被拒"的反向对照。
 - **服务端签名校验**：stub 记录并忽略 `Authorization`；签名是否正确，只有真后端才能拒。MinIO 复验走真实
   签名路径，但本次没有验证"错误签名必须被拒"的反向对照。
 - **R2 的延迟、配额、区域行为、一致性、错误 XML 变体**：stub 一律立刻回答、无错误变体；MinIO 运行也不
   提供 R2 的行为证据。
-- **检索与向量路径在 R2 上仍只有 stub 级证据**：`search-probe` 的 build/query、project 以及
-  vector-publish/vector-query 在本地 S3 stub 上真打 socket，MinIO current-head 又跑过 `search-probe project`
-  与向量闭环；它们都**没有在真 R2 上跑过**（§11 第 2、4 项）。`project` 里的“多台机器”是同一进程内的
-  并发任务，只有桶访问是跨进程的；向量闭环另有独立进程 A/B 证据。
-- **检索与 digest 路径在 R2 上仍只有 stub 级证据**：`search-probe` 的 build/query 与 project、以及
-  `digest-probe` 的 seed/read 在本地 S3 stub 上真打 socket，MinIO current-head 又跑过 digest 的
-  seed/read；它们都**没有在真 R2 上跑过**（§11 第 2、5 项）。`project` 里的"多台机器"是同一进程内的
-  并发任务，只有桶访问是跨进程的（`digest-probe` 的两个命令才各是一个进程）。
+- **检索与向量路径**：真 R2 上已复验 build/query（两个进程）、project 与向量闭环（§10.8）。仍然空着的
+  是"真的两台机器"：`project` 里的多机器是同一进程内的并发任务，向量闭环是独立进程 A/B，都不含真实网络
+  分区；向量链的 embedding 仍是本地 stub。
+- **检索与 digest 路径**：真 R2 上已复验 build/query、project 与 digest 的 seed/read（§10.8）。
+  `digest-probe` 的 seed 与 read 各是一个进程；"多台机器"的边界同上。
 - **multipart**：本仓的对象都远小于 5 MiB，客户端走单次 PUT；stub 不实现分片上传，
   所以"大对象"这条路径没有被覆盖。
 - **真实网络故障**：重试/退避只被单元测试覆盖，stub 不制造超时、5xx 或连接断裂。
@@ -289,12 +287,11 @@ QM_S3_ACCESS_KEY_ID=stub-access QM_S3_SECRET_ACCESS_KEY=stub-secret QM_S3_FORCE_
   永不回答的确定性 stall endpoint 会让调用返回超时错误，而不是让读/发布路径永久挂住；测试用短超时
   跑这条阳性对照，生产值只在一个常量里。
 
-**MinIO 已复验 S3 组合路径，embedding 仍是本地 stub；真 R2/真 provider 未验证**：上面的向量闭环在
-2026-09-16 `c9006a0` 的 MinIO current-head 运行中也跨两个独立 `search-probe` 进程，经本地 deterministic
-HTTP embedding stub 与真实 S3-compatible MinIO 完成；这证明向量流和 identity guard 在真实 HTTP/S3
-路径上的组合行为，但不证明真 provider 的网络/模型行为，也不是 R2 观测。R2 的签名、延迟、配额、一致性、
-错误 XML 变体仍未覆盖；真 R2 上仍应跑一次 `vector-publish` + `vector-query`，并保留无 provider / 换模型
-两条 fail-closed 对照。
+**MinIO 与真 R2 都已复验 S3 组合路径；embedding 仍是本地 stub，真 provider 未验证**：上面的向量闭环在
+2026-09-16 `c9006a0` 的 MinIO current-head 运行中跨两个独立 `search-probe` 进程，经本地 deterministic
+HTTP embedding stub 与真实 S3-compatible MinIO 完成；同日又在真 R2 上重跑了一遍（命中
+`streams_active=["vector"]`，无 provider 与同宽换模型两条 fail-closed 对照都生效，见 §10.8）。这证明向量流
+与 identity guard 在真实 HTTP/S3 路径（含 R2）上的组合行为，但**不证明真 provider 的网络/模型/维度行为**。
 
 已知取舍：embedding 服务是**读路径上的一个外部依赖**——配置了它，检索就可能等它，最多等到 30 秒超时。
 这是 fail-closed 的代价，换来的是"索引里的向量一定与查询向量同源、同宽"。
@@ -753,8 +750,8 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
   **故意不一致**（只按日志顺序返回就会红）、交接棒的窗口与排序都取 created/claimed/finished 的**最新阶段**
   （收尾那根因此进窗并且排在只开不认领的那根**之前**，尽管它开得最早、认领得最早）、per-section 窗口与
   `limit`，以及一条「第一条 listing 当成整份 listing」的故障对照——同一个谓词在健康腿为空、在故障腿非空。
-  这是 `S3Stub` 协议层证据；2026-09-16 `c9006a0` 还在真实 MinIO HTTP 后端跑通了 `seed` → `read`
-  （见 §10.5），但那不是 R2 证据，**真 R2 仍未验证**（§11）。
+  这是 `S3Stub` 协议层证据；2026-09-16 `c9006a0` 在真实 MinIO HTTP 后端、同日又在真 R2 上跑通了
+  `seed` → `read`（见 §10.5 与 §10.8）。
 
 ## 6.19 最近变化：会话开始时先看这里
 
@@ -1208,8 +1205,9 @@ GET 不返回 version、ACL/凭据边界、服务端签名拒绝、区域/一致
 工作树的 `git status --porcelain` 均为空。
 
 边界：这只证明 Linux 1.95 上源码/测试套件可编译并通过；本次没有在容器内跑 MinIO/S3/真桶
-端到端链路。Windows 目标的编译证据见 §10.7，但那不是 Windows 运行时/测试或真桶验证；
-真 R2、真 provider 仍未验证。
+端到端链路。Windows 目标的编译证据见 §10.7，但那不是 Windows 运行时/测试或真桶验证。
+真 R2 已于 2026-09-16 在 macOS 上复验（§10.8），但那次不是在这台 Linux 容器里跑的；
+真 provider 仍未验证。
 
 ## 10.7 Windows GNU 目标编译验证（2026-09-16 @ 41dec72）
 
@@ -1229,6 +1227,64 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
 
 边界：这是 Windows GNU **目标编译**证据，不是 Windows 运行时测试；没有在 Windows 上执行
 tests/runtime，没有运行 Windows 真桶、R2 或真 provider，也不把它们写成已验证。
+
+## 10.8 真实 R2 复验（2026-09-16）
+
+2026-09-16 在一个真实的 Cloudflare R2 桶上（S3 端点 `<account>.r2.cloudflarestorage.com`、path-style、
+region `auto`）跑过下列链路，全部通过。探针与 CLI 链跑在 `2025815`；同日又在 `c258009` 上复验了
+`qm status`（此时凭据已改由本机配置文件 `~/.quick-memory/env` 提供，见 §6.7）。凭据只从环境变量或该文件
+读取，不写进仓库。
+
+```bash
+export QM_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+export QM_S3_BUCKET="<bucket>"
+export QM_S3_REGION=auto
+export QM_S3_FORCE_PATH_STYLE=true
+# QM_S3_ACCESS_KEY_ID / QM_S3_SECRET_ACCESS_KEY（或写进 ~/.quick-memory/env）
+
+cargo run -p qm-probe --bin cas-conformance
+cargo run -p qm-probe --bin manifest-probe -- --machines 3 --writes 5
+cargo run -p qm-probe --bin search-probe -- project
+cargo run -p qm-probe --bin session-probe
+cargo run -p qm-probe --bin search-probe -- --split-prefix <prefix> build docs.jsonl   # 进程 A
+cargo run -p qm-probe --bin search-probe -- --split-prefix <prefix> query "consensus"  # 进程 B
+cargo run -p qm-probe --bin search-probe -- vector-publish --workspace <ws> --project <proj> pages.jsonl
+cargo run -p qm-probe --bin search-probe -- vector-query  --workspace <ws> --project <proj> "…"
+qm capture …; qm maintain --json; qm maintain --json; qm search …; qm status --json; qm verify --strict
+qm write-page …; qm delete-page …; qm read-page --as-of …; qm compact --json
+qm migrate-manifest --to 2; qm migrate-manifest --to 1
+```
+
+| 验证 | 真 R2 原始结果 |
+|---|---|
+| `cas-conformance`（条件写契约） | `7/7 PASS`；PUT 返回 `version=Some(...)`、读回 ETag 稳定、陈旧与已消费 ETag 均被拒 |
+| `manifest-probe --machines 3 --writes 5` | `commits=15 attempts=42 pages=3 wal=15 all checks passed`（`attempts > commits`，说明 CAS 竞争与重试确实发生过） |
+| `search-probe project`（S2） | `splits=3 hits=1 filtered_out=1` |
+| `session-probe`（S4） | `observations=3 segments=2 splits=1 hits=1` |
+| `search-probe build` / `query`（两个进程） | 进程 A 上传 8 个文件 / 3 页；进程 B 用全新缓存只靠桶材料化 8 个文件，命中 `notes/raft.md`、`notes/paxos.md` |
+| `digest-probe seed` / `read` | `pages=3`（含 1 条 `page_deleted`）、`sessions=2`、`handoffs=3`、`live_pages=1` |
+| `search-probe vector-publish` / `vector-query` | 命中 `notes/agreement.md`；`streams_active=["vector"]`、`stream_candidates.vector=1`、正文候选 `0` |
+| 向量 fail-closed 对照 | 不配 provider → 拒绝（exit 1）；同宽度换模型 → identity guard 拒绝（exit 1） |
+| `qm capture` → `maintain` ×2 | 首次 `consolidated=1 published=true manifest_seq=1 splits=1`；第二次 `already_up_to_date=1 published=false`（幂等） |
+| `qm search` / `status` / `verify --strict` | 命中会话页；`verify` 输出 `no problems`、exit 0 |
+| `qm delete-page` ×2 / `read-page --as-of` | 重复删除 `already_deleted=true` 且 `seq` 不变；`tombstones=1`；删除前的时间点仍读到正文（两个负对照正确报"无版本"） |
+| `qm compact` | `splits_before=2 splits_after=1 skipped=false`，压缩后检索结果不变 |
+| `qm migrate-manifest --to 2` → 写入 → `--to 1` | 3 片 → 4 片 → 回滚；未设 `QM_MANIFEST_FORMAT` 时写入被形态守卫拒绝（fail closed）；`verify` 通过 |
+| `qm gc`（dry run） | `scanned 37 live 27 collectable 0 kept within grace 10 deleted 0` |
+
+**R2 的版本语义实测**：`aws s3api put-object` 的响应含 `VersionId`，随后 `head-object` 返回**同一个 ETag
+但不含 `VersionId`** —— §5.1 描述并据以实现的 "PUT-only version" 形状在真 R2 上确实存在，而
+`cas-conformance` 仍 `7/7`，说明 ETag-CAS 路径不依赖该字段。
+
+**边界**（这组证据不覆盖什么）：
+
+- 全程是**单机上的多个独立进程**；"多机"仍是同机多进程，不含真实网络分区与时钟偏斜；
+- 向量链的 embedding 来自**本地 deterministic HTTP stub**，不是真 provider：真 provider 的网络、模型与
+  维度行为仍未验证（§6.20）；
+- **没有做 ACL / 凭据边界测试**（全程一把 token），也没有"错误签名必须被拒"的反向对照；
+- 该桶不是 quick-memory 专用桶（同时存在其它项目的对象），因此每次运行都用唯一的 workspace / prefix
+  隔离，验证结束后清理了本次自建的对象；
+- §5.1 列出的其余 R2 行为（延迟、配额、区域、错误 XML 变体）依旧没有观测。
 
 ## 11. 实证结论（截至本次提交）
 
@@ -1320,30 +1376,20 @@ tests/runtime，没有运行 Windows 真桶、R2 或真 provider，也不把它�
   因此不能把 Quickwit 作为库依赖，只能作为**外部服务/构建器**。
 - tantivy 0.26 的 `TopDocs` 必须先 `order_by_score()` 才能作为 collector 使用。
 
-待验证（2026-09-16 的 MinIO current-head 复验已完成）：
+真 R2 的复验（2026-09-16，§10.8）关闭了此前"后端专属项只剩真 R2 凭据"的口径。仍然空着的是
+**真 embedding provider**（向量链跑的是本地 deterministic stub）与 **ACL / 凭据边界**（全程一把 token、
+没有"错误签名必须被拒"的反向对照）。下表保留每一项各自的证据层级：
 
-MinIO current-head 复验完成后分两层：**后端专属项仍只剩真 R2 凭据；向量链另有真 provider 待验证**。
-MinIO 这次是真实 S3-compatible HTTP 后端，不是 R2；它复验了下列命令的 MinIO 行为，不能抵掉真 R2 项。
-原始结果与复现命令见 §10.5。Quickwit 官方 `quickwit/quickwit:0.9.0` 产出的真分片已于 2026-09-15 验证
-（6893 字节、解包 8 个文件、检索命中 1 条；见 §6.4），因此不再是待验证项。
-
-1. 真 R2 上跑 `qm-probe cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）—— **stub 已验证；
-   MinIO current-head 已复验 `7/7 PASS`、`version=None`；真 R2 待验证**。R2 特有的
-   PUT-only version / GET 不返回 version 尚未被这组运行触发；见 §5.1、§10.5 与
-   `crates/qm-probe/tests/s3_protocol.rs`。
-2. 真 R2 上跑 `qm-probe search-probe build/query`（跨进程/跨机器检索）—— **stub 已验证；
-   MinIO current-head 已复验 `search-probe project`（`splits=3 hits=1 filtered_out=1`）；
-   真 R2 待验证**。stub 的两个独立 `search-probe` 进程仍提供 build → query 的 socket 证据；
-   见 §5.1、§10.5 与 `crates/qm-probe/tests/search_probe_stub.rs`。
-3. 真 R2 上的 S2 场景：`cargo run -p qm-probe --bin search-probe -- project`——**MinIO current-head
-   已复验同一命令；真 R2 待验证**。
-4. 真 R2 上的向量闭环：`search-probe vector-publish` 写入一个向量分片后，由另一个进程运行
-   `search-probe vector-query`，并把无 provider / 同宽换模型两条 fail-closed 对照一起跑一遍——
-   **stub 已验证；MinIO current-head 已复验向量流与 identity guard，但 embedding 是本地
-   deterministic HTTP stub，不是真 provider；真 R2 与真 provider 待验证**。见 §5.1、§6.20、§10.5。
-5. 真 R2 上跑 `qm-probe digest-probe seed --workspace <unique> --project <unique>`，再用同一组参数跑
-   `read`（跨进程恢复最近变化摘要）——**stub 已验证；MinIO current-head 已复验 seed → read
-   （`pages=2`、`page_deleted=1`、`sessions=1`、`handoffs=2`、`live_pages=1`）；真 R2 待验证**。
-   删除在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，交接棒的开/认领/**收尾**三个阶段
-   都跨进程往返（窗口与排序按最新阶段判定），并有一条 listing 截断的故障对照使同一个正向谓词变红。
-   见 §6.22、§10.5 与 `crates/qm-probe/tests/digest_probe_stub.rs`。
+1. `cas-conformance`（ETag 稳定性、陈旧 ETag 拒绝）——**真 R2 已复验 `7/7 PASS`**，并观测到 R2 的
+   PUT-only version（PUT 带 `VersionId`、HEAD 不带）；见 §5.1、§10.8。
+2. `search-probe build/query`（跨进程检索）——**真 R2 已复验**：进程 A 上传 8 个文件 / 3 页，进程 B
+   用全新缓存只靠桶材料化并命中；见 §10.8。仍然空着的是"真的两台机器"（网络分区、时钟偏斜）。
+3. S2 场景 `search-probe project`——**真 R2 已复验 `splits=3 hits=1 filtered_out=1`**；见 §10.8。
+   该场景里的多机器是同进程内并发，只有桶访问跨进程。
+4. 向量闭环 `vector-publish` / `vector-query`——**真 R2 已复验**（命中、`streams_active=["vector"]`、
+   无 provider 与同宽换模型两条 fail-closed 对照均生效）；**embedding 仍是本地 deterministic HTTP stub，
+   真 provider 待验证**；见 §5.1、§6.20、§10.8。
+5. `digest-probe seed` / `read`——**真 R2 已复验 `pages=3`（含 1 条 `page_deleted`）、`sessions=2`、
+   `handoffs=3`、`live_pages=1`**；删除的 path 在 manifest 已不再返回该 path 的条件下仍出现在 `pages` 里，
+   交接棒的开 / 认领 / **收尾**三个阶段都跨进程往返（窗口与排序按最新阶段判定），并有一条 listing 截断的
+   故障对照使同一个正向谓词变红。见 §6.22、§10.8 与 `crates/qm-probe/tests/digest_probe_stub.rs`。

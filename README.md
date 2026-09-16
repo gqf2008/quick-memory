@@ -20,7 +20,9 @@ S0（架构验证）与 S1（权威层）已跑通**离线可验证的部分**�
 - Quickwit `.split` 容器解包：已用官方 `quickwit/quickwit:0.9.0` 产出的真分片验证，读方无需 Quickwit 集群即可检索该格式的分片（`qm-search::quickwit_split`）
 - 采集与编译：观测按会话链捕获（入口强制脱敏 + 限长），编译成页面并可被检索；重放与重编译幂等（`qm-store`/`qm-search`）
 
-真 R2 仍未验证（需要凭据）；Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成，见 `docs/design.md` §6.4/§10.5。
+真 R2 已于 2026-09-16 复验（条件写契约、跨进程检索、S2/S4 场景、向量闭环、CLI 收口、删除/压缩、
+format 2 迁移回滚），见 `docs/design.md` §10.8；仍未验证的是**真 embedding provider**（向量链用的是
+本地 deterministic stub）与 ACL/凭据边界。Quickwit 官方 0.9.0 容器产出的真分片读取验证见 §6.4。
 
 ## 布局
 

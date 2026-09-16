@@ -208,8 +208,11 @@ manifest 仍认账的 live pages，所以「manifest 已不再返回那条 path�
 防复用的 best-effort 检查，不是并发锁。`read` 只读。当前 probe 不自动清理，
 所以真桶应使用专用 bucket/prefix，并为每次运行显式传唯一 scope。`QM_S3_PREFIX` 只被
 `cas-conformance` 与 `search-probe build/query` 采用，不是所有 probe 的全局隔离。
-这些 stub 路径本身仍只证明协议层；其中 digest 的同一命令形状也已在 MinIO current-head 跑过（§10.5），
-但**真 R2 仍未验证**。
+这些 stub 路径本身仍只证明协议层；同样的命令形状也已在 MinIO current-head（§10.5）与真 R2（§10.8）上
+跑过，后者是 2026-09-16 的复验。仍未验证的是真 embedding provider 与 ACL/凭据边界。
+
+**真桶是共享资源**：验证用的 bucket 同时可能存有其它项目的对象，所以每次运行都必须用唯一
+workspace / prefix 隔离，并在结束后清理自建对象；`digest-probe` 这类不自带清理的探针尤其如此。
 
 ## 完整性自检
 
