@@ -19,13 +19,15 @@ use qm_cli::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // The config file has to be read before anything consults a setting, and
-    // its values have to be merged into the settings clap resolved on its own:
-    // `--workspace` and friends carry `env = ...`, so clap has already filled
-    // them from the environment or from their default, without saying which.
-    config::init()?;
+    // clap first: `--help` and `--version` have to answer even when the config
+    // file is missing or malformed, and their exit happens inside
+    // `get_matches`. Everything after this point may consult the file.
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches)?;
+    // The file is read before the settings are merged, because `--workspace`
+    // and friends carry `env = ...`: clap has already filled them from the
+    // environment or from their default, without saying which.
+    config::init()?;
     let typed = |id: &str| matches!(matches.value_source(id), Some(ValueSource::CommandLine));
     cli.workspace = config::merge_flagged(
         config::var,

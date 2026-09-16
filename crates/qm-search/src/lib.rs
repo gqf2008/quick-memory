@@ -2471,6 +2471,50 @@ mod tests {
             page.is_none(),
             "a refused LLM request must not commit a rule-rendered page"
         );
+
+        // …nor a lease behind it. A configuration error raised after the lease
+        // was taken would make every later consolidation of this session
+        // `skipped` until the TTL expired — one bad invocation turning into a
+        // silent outage for that session.
+        let after = consolidate_session(
+            &project,
+            &workspace,
+            &project_id,
+            &session,
+            &consolidator,
+            300,
+            60_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !after.skipped && !after.lease_held,
+            "the refused request must not hold the consolidation lease: {after:?}"
+        );
+        assert_eq!(after.observations, 1, "and the rules path still works");
+
+        // The same request on a session with nothing to compile is still a
+        // configuration error: the check belongs before the early returns, or
+        // "explicit llm without a provider fails" would depend on the data.
+        let empty = SessionId::new("sess-empty").unwrap();
+        let error = consolidate_session_with(
+            CompilerChoice::Llm,
+            &project,
+            ConsolidationRequest {
+                workspace_id: &workspace,
+                project_id: &project_id,
+                session_id: &empty,
+                consolidator: &consolidator,
+                now_ms: 400,
+                lease_ttl_ms: 60_000,
+            },
+        )
+        .await
+        .expect_err("an empty session does not make the configuration valid");
+        assert!(
+            error.to_string().contains("no provider is configured"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

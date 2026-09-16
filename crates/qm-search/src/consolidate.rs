@@ -17,7 +17,7 @@
 //! `used_fallback: false`, which reads as "rules were chosen" rather than "the
 //! LLM you asked for was not there".
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use qm_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId, WriterId};
 use qm_store::{CommitPageRequest, ProjectStore};
 
@@ -96,6 +96,24 @@ pub async fn consolidate_session_with(
         now_ms,
         lease_ttl_ms,
     } = request;
+    // Resolve which compiler will actually run *before* touching any state.
+    // Two reasons, both learned from review: asking for the LLM with nothing
+    // configured is a configuration error rather than a fallback, and an error
+    // raised after the lease was taken would leave that lease behind — one bad
+    // invocation would then make the session `skipped` until the TTL passes.
+    // Doing it here also means the empty-session and already-up-to-date early
+    // returns cannot quietly succeed under a configuration that is wrong.
+    let llm = match choice {
+        CompilerChoice::Rules => None,
+        CompilerChoice::Llm => Some(OpenAiCompatCompiler::from_env()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the LLM compiler was requested but no provider is configured: set \
+                 QM_LLM_BASE_URL, QM_LLM_API_KEY and QM_LLM_MODEL (or ask for rules/auto, \
+                 which uses the rule renderer when no provider is configured)"
+            )
+        })?),
+    };
+
     let scope = format!("consolidate/{workspace_id}/{project_id}/{session_id}");
     let Some(lease) = project_store
         .acquire_lease(&scope, consolidator, now_ms, lease_ttl_ms)
@@ -158,8 +176,8 @@ pub async fn consolidate_session_with(
     }
 
     let rules = RuleCompiler;
-    let (body, compiler, used_fallback) = match choice {
-        CompilerChoice::Rules => (
+    let (body, compiler, used_fallback) = match llm {
+        None => (
             rules
                 .compile(session_id, &observations)
                 .await
@@ -167,22 +185,17 @@ pub async fn consolidate_session_with(
             rules.name(),
             false,
         ),
-        CompilerChoice::Llm => match OpenAiCompatCompiler::from_env()? {
-            Some(llm) => match llm.compile(session_id, &observations).await {
-                Ok(body) if !body.trim().is_empty() => (body, llm.name(), false),
-                Ok(_) | Err(_) => (
-                    rules
-                        .compile(session_id, &observations)
-                        .await
-                        .context("rule compiler failed")?,
-                    rules.name(),
-                    true,
-                ),
-            },
-            None => bail!(
-                "the LLM compiler was requested but no provider is configured: set \
-                 QM_LLM_BASE_URL, QM_LLM_API_KEY and QM_LLM_MODEL (or ask for rules/auto, \
-                 which uses the rule renderer when no provider is configured)"
+        // A *configured* provider that fails still falls back: losing the page
+        // is worse than losing polish.
+        Some(llm) => match llm.compile(session_id, &observations).await {
+            Ok(body) if !body.trim().is_empty() => (body, llm.name(), false),
+            Ok(_) | Err(_) => (
+                rules
+                    .compile(session_id, &observations)
+                    .await
+                    .context("rule compiler failed")?,
+                rules.name(),
+                true,
             ),
         },
     };

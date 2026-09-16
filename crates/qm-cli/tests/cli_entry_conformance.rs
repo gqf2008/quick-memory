@@ -234,7 +234,15 @@ fn the_real_binary_refuses_a_storage_form_it_does_not_know() {
 /// without reading `--help` or the repository's git log.
 #[test]
 fn the_real_binary_reports_its_version() {
-    let output = run_qm_args(&["--version"], &[]);
+    // With a config file that cannot be loaded: a version question must not
+    // depend on bucket configuration, which is why clap runs first.
+    let output = run_qm_args(
+        &["--version"],
+        &[(
+            "QM_CONFIG_FILE",
+            "/nonexistent/qm-config-for-the-version-test".to_string(),
+        )],
+    );
     assert!(
         output.status.success(),
         "`qm --version` must succeed: {:?}",
