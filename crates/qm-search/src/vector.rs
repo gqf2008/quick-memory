@@ -195,6 +195,12 @@ pub fn search_vector(dir: &Path, query: &[f32], stream: &str, limit: usize) -> R
         bail!("cannot run the vector stream with an empty query embedding");
     }
     let index = Index::open_in_dir(dir).context("opening index")?;
+    // The tokenizer registry lives on the `Index`, not in the directory: an
+    // index opened here needs it as much as one opened for a keyword search.
+    index.tokenizers().register(
+        crate::cjk::TOKENIZER_NAME,
+        tantivy::tokenizer::TextAnalyzer::builder(crate::cjk::CjkTokenizer).build(),
+    );
     let reader = index.reader().context("opening reader")?;
     let searcher = reader.searcher();
 

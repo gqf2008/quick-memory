@@ -23,9 +23,14 @@ use qm_store::{ProjectStore, PublishOutcome};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{FAST, STORED, STRING, Schema, TEXT, Value};
+use tantivy::schema::{
+    FAST, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
+};
+use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, doc};
 use walkdir::WalkDir;
+
+mod cjk;
 
 /// One searchable page version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,16 +203,40 @@ fn default_multiplier() -> f32 {
     1.0
 }
 
+/// The index options every human-readable field uses: the CJK-aware analyzer,
+/// with term positions so phrase queries work.
+fn indexed_text() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(cjk::TOKENIZER_NAME)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
+/// Teach an index the analyzer its schema names.
+///
+/// tantivy keeps its tokenizer registry on the `Index` value rather than in the
+/// index directory, so every `open_in_dir` has to register it again — a query
+/// parser handed a field whose tokenizer it does not know fails instead of
+/// searching. Registering on the write side too keeps both sides identical,
+/// which is the property the whole scheme rests on.
+fn register_tokenizers(index: &Index) {
+    index.tokenizers().register(
+        cjk::TOKENIZER_NAME,
+        TextAnalyzer::builder(cjk::CjkTokenizer).build(),
+    );
+}
+
 fn schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field("workspace_id", STRING | FAST | STORED);
     builder.add_text_field("project_id", STRING | FAST | STORED);
     builder.add_text_field("path", STRING | FAST | STORED);
     builder.add_text_field("page_id", STRING | STORED);
-    builder.add_text_field("title", TEXT | STORED);
-    builder.add_text_field("body", TEXT);
-    builder.add_text_field("entities", TEXT | STORED);
-    builder.add_text_field("links", TEXT | STORED);
+    builder.add_text_field("title", indexed_text() | STORED);
+    builder.add_text_field("body", indexed_text());
+    builder.add_text_field("entities", indexed_text() | STORED);
+    builder.add_text_field("links", indexed_text() | STORED);
     // Same values, raw tokenizer and one value per link: neighbour lookup asks
     // "who links to exactly this path", which a tokenised field cannot answer.
     builder.add_text_field("links_exact", STRING | STORED);
@@ -226,6 +255,7 @@ fn schema() -> Schema {
 pub fn build_index(dir: &Path, docs: &[PageDoc]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let index = Index::create_in_dir(dir, schema()).context("creating tantivy index")?;
+    register_tokenizers(&index);
     let mut writer = index
         .writer_with_num_threads(1, 32_000_000)
         .context("opening index writer")?;
@@ -527,6 +557,7 @@ pub fn search_stream(
     limit: usize,
 ) -> Result<Vec<Hit>> {
     let index = Index::open_in_dir(dir).context("opening index")?;
+    register_tokenizers(&index);
     let s = index.schema();
 
     // A split carries whatever schema its producer used. Our own splits have
@@ -632,6 +663,7 @@ pub fn search_terms(
         return Ok(Vec::new());
     }
     let index = Index::open_in_dir(dir).context("opening index")?;
+    register_tokenizers(&index);
     let s = index.schema();
     let Some(field_ref) = s.get_field(field).ok() else {
         return Ok(Vec::new());
@@ -2722,6 +2754,49 @@ mod tests {
     /// same queries are run twice, once with entity/link streams active and once
     /// against a corpus with the declared fields stripped. If the numbers do not
     /// move, the harness is measuring nothing.
+    /// A word *inside* a Chinese run has to be findable — the user-visible
+    /// symptom, reproduced from a real bucket on 2026-09-16: `qm search "租约"`
+    /// answered 0 hits while the page body contained the word twice, because
+    /// tantivy's `default` analyzer keeps a whole CJK run as one token.
+    #[test]
+    fn a_chinese_word_inside_a_run_is_findable() {
+        let dir = TempDir::new().unwrap();
+        let page = PageDoc {
+            workspace_id: "personal".into(),
+            project_id: "agents-memory".into(),
+            path: "notes/quick-memory-status.md".into(),
+            page_id: "p1".into(),
+            title: "quick-memory 状态".into(),
+            body: "取租约后每个 ? 都是潜在租约泄漏；删除后 tombstone 才是链头。".into(),
+            updated_at_ms: 1,
+            entities: Vec::new(),
+            links: Vec::new(),
+            embedding: None,
+            embedding_identity: None,
+        };
+        build_index(dir.path(), &[page]).unwrap();
+
+        // `租` (one character) and `租约` (the word) both have to work: the
+        // unigrams are what answer a one-character query, the bigrams are what
+        // keep a two-character one precise.
+        for query in ["租约", "租", "潜在租约泄漏", "删除后", "tombstone", "链头"] {
+            let hits = search(dir.path(), query, 10).unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "query {query:?} has to find the page: {hits:?}"
+            );
+        }
+
+        // The flip side: a query whose n-grams are absent must not match, or the
+        // recall would have been bought with noise.
+        let misses = search(dir.path(), "完全不存在的词", 10).unwrap();
+        assert!(
+            misses.is_empty(),
+            "a absent word must not match: {misses:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recall_eval_separates_declared_matches_from_prose() {
         use std::collections::BTreeMap;
