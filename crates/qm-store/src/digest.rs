@@ -7,7 +7,6 @@
 //! advisory commit log, which is appended after the CAS and whose failure is
 //! ignored. The pages section can therefore be missing a record; it answers
 //! "what happened recently", not "what is true now".
-//! than as an absence.
 
 use qm_core::{CommitRecord, Handoff, SessionId};
 use serde::{Deserialize, Serialize};
