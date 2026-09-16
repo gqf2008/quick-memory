@@ -55,6 +55,8 @@ crates/qm-mcp     `qm-mcp` MCP stdio 服务器（26 个 memory_* 工具）
 | `verify` / `gc` | 桶完整性自检（只读）/ 回收不可达对象（默认 dry run） |
 
 ```bash
+# 也可以把下面这些写进 ~/.quick-memory/env，qm / qm-mcp 会自己读；
+# 优先级：命令行 > 环境变量 > 配置文件 > 内置默认（详见 quickstart 的「配置文件」）
 export QM_S3_ENDPOINT=... QM_S3_BUCKET=... QM_S3_ACCESS_KEY_ID=... QM_S3_SECRET_ACCESS_KEY=...
 export QM_WORKSPACE=acme QM_PROJECT=ai-memory QM_WRITER=mbp-1   # 可选
 
@@ -96,8 +98,9 @@ qm compact-session --session sess-1 --keep-last 50   # 观测保留
 qm export --to ./exported && qm import --from ./exported
 ```
 
-作用域来自 `--workspace/--project/--writer` 或同名环境变量；凭据缺失时命令直接报错，
-不会退回本地存储。
+作用域来自 `--workspace/--project/--writer`、同名环境变量，或 `~/.quick-memory/env`
+（见 quickstart 的「配置文件」；该文件由 `qm` 与 `qm-mcp` 原生读取，探针不读）。
+凭据缺失时命令直接报错，不会退回本地存储。
 
 ## MCP 接入
 

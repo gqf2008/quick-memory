@@ -2,14 +2,16 @@
 //!
 //! Scope and credentials come from the environment, exactly as for the `qm`
 //! command line (`QM_WORKSPACE` / `QM_PROJECT` / `QM_WRITER`, `QM_S3_*` or
-//! `R2_*`, optional `QM_CACHE_DIR`). Configure it in your agent's MCP settings
-//! alongside those variables.
+//! `R2_*`, optional `QM_CACHE_DIR`), and fall back to the machine-local config
+//! file when the environment leaves them empty — see [`qm_cli::config`]. Both
+//! surfaces read that file through the same resolver, so a server started from
+//! an MCP client that sets nothing sees what the command line sees.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use qm_cli::{bucket_identity_from_env, build_bucket_from_env, manifest_format_from_env};
+use qm_cli::{bucket_identity_from_env, build_bucket_from_env, config, manifest_format_from_env};
 use qm_mcp::MemoryServer;
 use rmcp::ServiceExt;
 use rmcp::transport::io::stdio;
@@ -29,12 +31,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let workspace = std::env::var("QM_WORKSPACE").unwrap_or_else(|_| "default".to_string());
-    let project = std::env::var("QM_PROJECT").unwrap_or_else(|_| "default".to_string());
-    let writer = std::env::var("QM_WRITER").unwrap_or_else(|_| "machine".to_string());
-    let cache_dir = std::env::var("QM_CACHE_DIR")
+    // Load the config file before reading any setting: an MCP client that
+    // passes no environment at all is a normal way to run this, and the file is
+    // then the only thing standing between it and a working bucket.
+    config::init()?;
+    let setting = |name: &str| config::var(name).filter(|value| !value.trim().is_empty());
+    let workspace = setting("QM_WORKSPACE").unwrap_or_else(|| "default".to_string());
+    let project = setting("QM_PROJECT").unwrap_or_else(|| "default".to_string());
+    let writer = setting("QM_WRITER").unwrap_or_else(|| "machine".to_string());
+    let cache_dir = setting("QM_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join(format!("qm-cache-{writer}")));
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("qm-cache-{writer}")));
 
     let bucket: Arc<dyn object_store::ObjectStore> = if args.synthetic_bucket {
         eprintln!(

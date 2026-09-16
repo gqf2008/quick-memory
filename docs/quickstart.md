@@ -29,6 +29,31 @@ export QM_PROJECT="my-project"            # 可选，默认 default
 export QM_WRITER="$(hostname -s)"         # 重要：多机时每台机器一个稳定名字
 ```
 
+### 配置文件
+
+上面的变量也可以写进一个本机凭据文件，`qm` 与 `qm-mcp` 会自己读：
+
+```bash
+install -d -m700 ~/.quick-memory
+cat > ~/.quick-memory/env <<'EOF'
+export QM_S3_ENDPOINT="https://<account>.r2.cloudflarestorage.com"
+export QM_S3_BUCKET="<bucket>"
+export QM_S3_ACCESS_KEY_ID="<key>"
+export QM_S3_SECRET_ACCESS_KEY="<secret>"
+export QM_WRITER="$(hostname -s)"
+EOF
+chmod 600 ~/.quick-memory/env
+```
+
+- 路径：默认 `~/.quick-memory/env`；`QM_CONFIG_FILE=<path>` 指定别的文件（**指定了就必须存在**，
+  找不到会报错而不是回落到环境变量）。
+- 优先级：**命令行 > 环境变量 > 配置文件 > 内置默认**。`QM_S3_BUCKET=... qm status` 永远读你刚给的那个桶。
+- 格式：`K=V` 或 `export K="V"`，支持单/双引号、`#` 整行注释、CRLF；只采纳 `QM_*` / `R2_*` 开头的键，
+  其余行忽略（所以这个文件仍然可以被 shell `source`）。**值不会被求值**：`$`、反斜杠、`#` 原样保留。
+- 文件权限宽于 0600 时会在 stderr 给出一次告警（不阻断）。
+- `QM_EMBEDDING_*` 与 `QM_LLM_*` 由 search/compile 两个 crate 直接从**进程环境**读取，
+  **不由这个文件提供服务**——写在文件里会在 stderr 明确告知，请改用环境变量导出。
+
 **凭据缺失时命令会直接报错**，不会退回本地存储——本地文件没有 CAS 语义，静默降级会悄悄丢写。
 
 发布 watermark 按 `(endpoint, bucket)` 分键：**升级，或把环境切到另一个桶后，第一次
@@ -67,10 +92,12 @@ splits`；`spool_kept` 统计所有未成功处理的剩余条目（其他 scope
 `published` 只在本次确实新增 split 且 `publish_error` 为空时为 `true`。
 某个会话坏掉时会继续处理其他会话，但仍以非零状态结束。
 
-定时执行示例（把环境文件保存为 `~/.config/quick-memory/env`）：
+定时执行示例（环境文件就是上面那个 `~/.quick-memory/env`；`qm` 自己会读，
+不需要再 `.` 一次——下面的写法对老版本或想显式注入的场景仍然有效）：
 
 ```cron
-*/15 * * * * . "$HOME/.config/quick-memory/env"; /usr/local/bin/qm maintain --json >> "$HOME/.local/state/qm-maintain.log" 2>&1
+*/15 * * * * /usr/local/bin/qm maintain --json >> "$HOME/.local/state/qm-maintain.log" 2>&1
+# 显式注入的等价写法：. "$HOME/.quick-memory/env"; /usr/local/bin/qm maintain --json >> ...
 ```
 
 不要把 `qm maintain` 放进 agent 的 fire-and-forget hook 路径：`qm hook` 只负责

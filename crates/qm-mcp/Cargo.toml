@@ -27,3 +27,4 @@ tokio = { workspace = true }
 object_store = { workspace = true }
 qm-probe = { path = "../qm-probe" }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

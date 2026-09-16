@@ -29,6 +29,8 @@ use qm_store::{
     CommitPageRequest, Digest, IngestObservationsRequest, MigrateOutcome, ProjectStore,
 };
 
+pub mod config;
+
 /// Default page count for `recent` / `memory_recent`.
 ///
 /// One constant rather than a literal per surface: the CLI default and the MCP
@@ -368,15 +370,16 @@ const S3_BUCKET_ENV_NAMES: &[&str] = &["QM_S3_BUCKET", "R2_BUCKET"];
 const S3_ACCESS_KEY_ENV_NAMES: &[&str] = &["QM_S3_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"];
 const S3_SECRET_KEY_ENV_NAMES: &[&str] = &["QM_S3_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"];
 
-/// Read a value out of the process environment.
+/// Read a value out of the process environment or the config file.
 ///
 /// The one place this crate reads the **bucket** environment — `QM_SPOOL_DIR`,
-/// `QM_LLM_BASE_URL` and `QM_SESSION` are read at their own call sites.
+/// `QM_LLM_BASE_URL` and `QM_SESSION` are read at their own call sites, and all
+/// of them go through [`config::var`] for the same reason.
 /// [`build_bucket_from`] and [`bucket_identity_from_env`] both take this as
 /// their lookup, so the client and the watermark identity cannot end up
 /// consulting different name tables.
 fn env_lookup() -> impl FnMut(&str) -> Option<String> {
-    |name: &str| std::env::var(name).ok()
+    config::var
 }
 
 /// Parse the write-form setting out of an injected name -> value lookup.
@@ -658,9 +661,9 @@ impl Context {
         now_ms: i64,
         json: bool,
     ) -> Result<Self> {
-        let spool_dir = std::env::var("QM_SPOOL_DIR")
+        let spool_dir = config::var("QM_SPOOL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("qm-spool"));
+            .unwrap_or_else(|| std::env::temp_dir().join("qm-spool"));
         Ok(Self {
             project: ProjectStore::new(Arc::clone(&bucket), "v1")
                 .with_manifest_format(manifest_format_from_env()?),
@@ -708,7 +711,7 @@ impl Context {
 fn compiler_choice_from_name(name: &str) -> Result<CompilerChoice> {
     match name {
         "auto" => {
-            if std::env::var("QM_LLM_BASE_URL")
+            if config::var("QM_LLM_BASE_URL")
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false)
             {
@@ -2559,11 +2562,9 @@ pub async fn capture_hook_event(
     raw: &str,
     timeout_ms: u64,
 ) -> Result<String> {
-    let default_session = session.map(ToString::to_string).or_else(|| {
-        std::env::var("QM_SESSION")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    });
+    let default_session = session
+        .map(ToString::to_string)
+        .or_else(|| config::var("QM_SESSION").filter(|value| !value.trim().is_empty()));
     let (session_id, payload_kind, text) = extract_hook_event(raw, default_session.as_deref());
     let session_id = SessionId::new(normalize_session(&session_id))?;
     let kind = kind.unwrap_or(&payload_kind).to_string();

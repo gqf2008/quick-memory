@@ -1,22 +1,59 @@
 //! `qm` — the agent-facing entry point.
 //!
 //! Credentials and scope come from the environment (`QM_S3_*`, `R2_*` for the
-//! bucket; `QM_WORKSPACE` / `QM_PROJECT` / `QM_WRITER` for scope). Nothing is
-//! cached between commands: every invocation re-reads the authoritative state,
-//! which is what lets several machines share one bucket without coordination.
+//! bucket; `QM_WORKSPACE` / `QM_PROJECT` / `QM_WRITER` for scope), or from the
+//! machine-local config file when the environment leaves them empty — see
+//! [`qm_cli::config`]. Nothing is cached between commands: every invocation
+//! re-reads the authoritative state, which is what lets several machines share
+//! one bucket without coordination.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory as _, FromArgMatches as _};
 use qm_cli::{
     Cli, Context as CommandContext, MaintainFailure, bucket_identity_from_env,
-    build_bucket_from_env, execute,
+    build_bucket_from_env, config, execute,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // The config file has to be read before anything consults a setting, and
+    // its values have to be merged into the settings clap resolved on its own:
+    // `--workspace` and friends carry `env = ...`, so clap has already filled
+    // them from the environment or from their default, without saying which.
+    config::init()?;
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    let typed = |id: &str| matches!(matches.value_source(id), Some(ValueSource::CommandLine));
+    cli.workspace = config::merge_flagged(
+        config::var,
+        typed("workspace"),
+        cli.workspace,
+        "QM_WORKSPACE",
+        "default",
+    );
+    cli.project = config::merge_flagged(
+        config::var,
+        typed("project"),
+        cli.project,
+        "QM_PROJECT",
+        "default",
+    );
+    cli.writer = config::merge_flagged(
+        config::var,
+        typed("writer"),
+        cli.writer,
+        "QM_WRITER",
+        "machine",
+    );
+    cli.cache_dir = config::merge_optional_flagged(
+        config::var,
+        typed("cache_dir"),
+        cli.cache_dir,
+        "QM_CACHE_DIR",
+    );
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
