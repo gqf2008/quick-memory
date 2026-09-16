@@ -236,6 +236,17 @@ mod tests {
     use crate::{CommitPageRequest, RetryPolicy};
 
     fn store(bucket: &Arc<dyn object_store::ObjectStore>) -> ProjectStore {
+        store_with_format(bucket, qm_core::MANIFEST_FORMAT_WHOLE)
+    }
+
+    /// A machine writing in `format`: the tombstone a deleted path leaves lives
+    /// in the whole manifest or in the one shard the path hashes to, and both
+    /// branches have to keep the chain reachable.
+    fn store_with_format(bucket: &Arc<dyn object_store::ObjectStore>, format: u32) -> ProjectStore {
+        store_raw(bucket).with_manifest_format(format)
+    }
+
+    fn store_raw(bucket: &Arc<dyn object_store::ObjectStore>) -> ProjectStore {
         ProjectStore::new(Arc::clone(bucket), "v1").with_retry(RetryPolicy {
             max_attempts: 64,
             base_delay: std::time::Duration::ZERO,
@@ -285,8 +296,22 @@ mod tests {
     /// as soon as the grace window passed.
     #[tokio::test]
     async fn gc_keeps_the_whole_history_of_a_deleted_page() {
-        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let store = store(&bucket);
+        // Both storage forms: in the whole form the tombstone is read from the
+        // manifest, in the sharded form from the shard the path hashes to. A
+        // fix that only holds in one of them is not a fix.
+        for format in [
+            qm_core::MANIFEST_FORMAT_WHOLE,
+            qm_core::MANIFEST_FORMAT_SHARDED,
+        ] {
+            let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let store = store_with_format(&bucket, format);
+            gc_keeps_deleted_history_once(&store).await;
+        }
+    }
+
+    /// The body of [`gc_keeps_the_whole_history_of_a_deleted_page`], once per
+    /// storage form.
+    async fn gc_keeps_deleted_history_once(store: &ProjectStore) {
         let path = PagePath::new("notes/doomed.md").unwrap();
 
         for (version, body) in [(1, "first"), (2, "second"), (3, "third")] {
