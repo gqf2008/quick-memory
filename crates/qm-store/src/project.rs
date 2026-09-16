@@ -1683,9 +1683,13 @@ impl ProjectStore {
     /// Everything that changed in this scope since `since_ms`, newest first.
     ///
     /// This is the "what happened while I was away" read. It is assembled from
-    /// authoritative objects only — the commit log, session heads and handoff
-    /// objects — so it needs no index and no cache, and a machine that has just
-    /// started sees the same answer as one that has been running all along.
+    /// bucket objects without the index and without a cache, so a machine that
+    /// has just started sees the same answer as one that has been running all
+    /// along. The three parts are not equally authoritative, though: session
+    /// heads and handoff objects are, while `pages` comes from the advisory
+    /// commit log — appended after the CAS, failures ignored — and can be
+    /// missing a record. It answers "what happened recently", not "what is true
+    /// now" (that is the manifest's job).
     ///
     /// `pages` keeps deletions, as [`CommitKind::PageDeleted`]: "this page was
     /// removed" is exactly the kind of thing a new session needs to know, and

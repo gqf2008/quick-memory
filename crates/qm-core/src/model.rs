@@ -709,7 +709,11 @@ pub struct IndexCatalog {
     pub generation: u64,
     /// Splits that make up the index, oldest first.
     pub splits: Vec<SplitEntry>,
-    /// Timestamp (ms) through which the catalog is known complete.
+    /// Largest caller-supplied `now_ms` seen by `push_split` / `replace_catalog`.
+    ///
+    /// Despite the name this is **not** a coverage watermark: it records when
+    /// publish/compact ran, so another machine's *earlier* unpublished commit is
+    /// passed over by it. It cannot answer "how far behind is this index".
     pub covered_until_ms: i64,
 }
 

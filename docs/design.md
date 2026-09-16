@@ -20,9 +20,10 @@
 2. **没有稳定拓扑**：不能靠 peer 列表或固定主机名发现彼此；只能靠桶里的对象。
 3. **没有分布式事务**：唯一的原子原语是单对象的条件写（ETag CAS）。
 4. **索引必须可重建**：索引损坏、格式升级、逻辑变更都能从权威数据重跑出来。
-5. **搜索允许有界滞后**，但写入不能丢。滞后是**双向**的：新写入要等 `publish` / `maintain` / `compact`
-   之后才进检索，而删除（tombstone）立刻生效（见 §6）。目前**没有**可对外证明"索引覆盖到哪个时间点"的水位
-   ——`IndexCatalog.covered_until_ms` 只是 publish 那一刻的墙上时间，不是覆盖水位（见 §6 末段）。
+5. **搜索允许滞后**，但写入不能丢。滞后是**双向**的：新写入要等 `publish` / `maintain` / `compact`
+   之后才进检索，而删除（tombstone）立刻生效（见 §6）。滞后**没有时间上界**——由下一次成功的索引更新决定，
+   因为没有任何机制强制它按时发生。也**没有**可对外证明"索引覆盖到哪个时间点"的水位
+   ——`IndexCatalog.covered_until_ms` 只是 publish/compact 那一刻的墙上时间，不是覆盖水位（见 §6 末段）。
 
 与 moltlink 的差别：moltlink 跑在服务器上，可以强约束一个 indexer、常驻 coordinator、单一 metastore writer；
 quick-memory 跑在多机上，这三条全部不可用，因此**索引发布单元从"共享索引的一次 ingest"改成"每个写入方自己的分片"**。
@@ -303,7 +304,8 @@ tantivy 的默认分词器按"非字母数字"切分，而**汉字在 Unicode �
   直接读**manifest 支撑的权威对象**，写入成功即立即可见；`log` / `digest` 依赖**建议性的 commit log**——
   它在 manifest CAS 成功之后异步追加、失败会被忽略（见 §6.5 与 `docs/ops.md`），所以它们可能少一条记录，
   是 best-effort 而非权威。
-- `publish` / `maintain` / `compact` 之后它才进入检索。跨机可见性本来就允许有界滞后。
+- `publish` / `maintain` / `compact` 之后它才进入检索。跨机可见性本来就允许滞后，而这个滞后**没有时间上界**
+  ——它由下一次成功的索引更新决定。
 
 `IndexCatalog.covered_until_ms` **不是覆盖水位**：它取的是 publish / compact 那一刻调用方传入的 `now_ms`
 （`push_split` / `replace_catalog` 取最大值），所以别人更早提交、但还没发布的页面同样会被这个数字"越过"。
@@ -757,7 +759,7 @@ echo "rolled back the index change" | qm hook --session sess-1
 - `qm hook-drain` 在桶恢复后重投 spool；**spool 条目带 scope**，绝不会写进别的项目；投递成功才删除本地文件。
 - 测试：不可达的桶（指向关闭端口）→ 事件落 spool；换成可用桶后 drain 成功、spool 清空、事件可在会话链里读到。
 
-## 6.22 最近变化摘要（digest）：三张权威清单
+## 6.22 最近变化摘要（digest）：不读索引，但 pages 段是建议性的
 
 `qm recent` 回答"哪些页面最近改过"，但一个刚接手的 agent 还要知道三件不同的事：哪些提交发生了
 （**包括删除**）、哪些会话还在动、有没有留给自己的接力棒。`digest` 把这三件事一次问完：
@@ -767,9 +769,13 @@ qm digest [--since-ms N | --hours N] [--limit N] [--json]   # 默认 24 小时 /
 ```
 
 - `ProjectStore::digest(ws, proj, since_ms, limit) -> Digest { pages, sessions, handoffs }`，
-  三部分都从**权威对象**读，不碰索引、不碰缓存：pages 来自 commit log（`commits/<seq>.json`）、
-  sessions 来自各会话 head（`SessionSummary { session_id, observations, last_seen_ms }`，
-  `observations` 就是 head 里的 `count`）、handoffs 来自 `handoffs/<id>.json`。
+  三部分都**不碰索引、不碰缓存**，所以一台从未发布过分片的机器也会给出同样的答案。但"权威"这个词只对其中
+  两部分成立：
+  - `sessions` 来自各会话 head（`SessionSummary { session_id, observations, last_seen_ms }`，
+    `observations` 就是 head 里的 `count`），`handoffs` 来自 `handoffs/<id>.json`——两者都是**权威对象**；
+  - `pages` 来自 **建议性的 commit log**（`commits/<seq>.json`）：它在 manifest CAS 成功之后追加、
+    写失败会被忽略（见 §6.5 与 `docs/ops.md`），所以这一段**可能少一条**。它回答"最近发生了什么"，
+    不回答"现在什么是真的"——后者只有 manifest 说了算。
 - **删除是提交，不是缺席**：`pages` 同时保留 `PageWritten` 与 `PageDeleted`。
   只留"还存在的页面"会把"这个被删掉了"洗成"什么都没发生"，而恰恰是前者更需要下一个会话知道——
   manifest 已不再知道那条路径，digest 仍然知道。
@@ -1373,8 +1379,8 @@ qm migrate-manifest --to 2; qm migrate-manifest --to 1
 - 定时收口：`qm maintain` 复用同一 spool drain、consolidate 与 publish 路径；没有常驻进程，
   hook 的 200ms / 202 / 429 语义不变。
 
-- 最近变化摘要（digest）：三张**权威**清单（commit log / session head / handoff）各按自己的时钟取窗口、
-  各自降序、各自截断；交接棒的时间取 created/claimed/finished 三者中**最新**的那个（所以窗口之前开、
+- 最近变化摘要（digest）：三张清单各按自己的时钟取窗口、
+  各自降序、各自截断（其中 pages 段来自**建议性** commit log，可能少一条；见 §6.22）；交接棒的时间取 created/claimed/finished 三者中**最新**的那个（所以窗口之前开、
   窗口之内收尾的棒会出现）；删除是提交而非缺席，manifest 已不再返回的 path 仍以 `PageDeleted` 出现。
   跨进程 S3 协议层证据见 §6.22。
 

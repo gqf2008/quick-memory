@@ -1,9 +1,12 @@
-//! "What changed recently" — assembled from authoritative objects only.
+//! "What changed recently" — assembled from bucket objects without the index.
 //!
-//! A digest is a read, not a cache: pages come from the advisory commit log,
-//! sessions from their heads, handoffs from the handoff objects. Nothing here
-//! consults the search index, so a machine that has never published a split
-//! still gets the same answer, and a deletion shows up as a deletion rather
+//! A digest is a read, not a cache, and it never consults the search index: a
+//! machine that has never published a split gets the same answer, and a deletion
+//! shows up as a deletion. Its three parts are not equally authoritative
+//! though — session heads and handoff objects are, while pages come from the
+//! advisory commit log, which is appended after the CAS and whose failure is
+//! ignored. The pages section can therefore be missing a record; it answers
+//! "what happened recently", not "what is true now".
 //! than as an absence.
 
 use qm_core::{CommitRecord, Handoff, SessionId};

@@ -544,8 +544,9 @@ impl MemoryServer {
         description = "Summarise what changed recently in three sections: pages \
                        (commits, including deletions), sessions (whose heads \
                        moved) and handoffs (created, claimed or finished). \
-                       Assembled from authoritative objects, not from the search \
-                       index. Call this FIRST at the start of a session to find \
+                       Assembled from bucket objects — session heads, handoffs \
+                       and the advisory commit log — not from the search index. \
+                       The pages section is best-effort and can miss a record. Call this FIRST at the start of a session to find \
                        out what happened while you were away."
     )]
     async fn memory_digest(
