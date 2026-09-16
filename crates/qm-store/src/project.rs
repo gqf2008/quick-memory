@@ -2538,7 +2538,10 @@ impl ProjectStore {
             attempt += 1;
             let loaded = self.load_catalog(workspace_id, project_id).await?;
             let catalog = IndexCatalog {
-                schema: MANIFEST_SCHEMA,
+                // A replacement catalog is built from authoritative pages right
+                // now, so it carries the current index schema — this is the path
+                // that heals a catalog stamped by an older analyzer.
+                schema: qm_core::INDEX_SCHEMA,
                 generation: loaded.catalog.generation + 1,
                 splits: splits.clone(),
                 covered_until_ms: loaded.catalog.covered_until_ms.max(now_ms),

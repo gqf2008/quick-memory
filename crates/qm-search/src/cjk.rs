@@ -28,8 +28,12 @@ use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 /// Name this analyzer is registered under, and the name the schema asks for.
 pub const TOKENIZER_NAME: &str = "cjk";
 
-/// The longest Latin/digit run that becomes a term, in bytes, mirroring
-/// tantivy's `default` analyzer.
+/// Longest Latin/digit run that becomes a term, in bytes.
+///
+/// tantivy's `default` analyzer is `SimpleTokenizer + RemoveLongFilter(40) +
+/// LowerCaser`, and `RemoveLongFilter` keeps a token when `len() < 40` — so the
+/// bound is exclusive *and* applies after lower-casing (two things this module
+/// got wrong once, see the tests at 38/39/40/41 bytes).
 const MAX_LATIN_TOKEN_BYTES: usize = 40;
 
 /// Splits text into CJK unigrams and bigrams, and Latin/digit runs.
@@ -77,12 +81,18 @@ fn is_cjk(ch: char) -> bool {
     matches!(ch,
         // Hiragana and katakana.
         '\u{3040}'..='\u{30ff}'
-        // CJK Unified Ideographs, its extension A, and compatibility forms.
+        // CJK Unified Ideographs: extension A, the main block, and the
+        // compatibility forms...
         | '\u{3400}'..='\u{4dbf}'
         | '\u{4e00}'..='\u{9fff}'
         | '\u{f900}'..='\u{faff}'
-        // Hangul syllables.
-        | '\u{ac00}'..='\u{d7af}')
+        // ...plus extensions B and beyond, which are single characters outside
+        // the BMP (rare in prose, but they are still Chinese text).
+        | '\u{20000}'..='\u{2fa1f}'
+        // Hangul syllables and the compatibility jamo, and halfwidth katakana.
+        | '\u{3130}'..='\u{318f}'
+        | '\u{ac00}'..='\u{d7af}'
+        | '\u{ff66}'..='\u{ff9f}')
 }
 
 /// Split `text` into the tokens the index stores.
@@ -113,8 +123,11 @@ fn tokenize(text: &str) -> Vec<Token> {
         let word = &text[start..end];
 
         if !word.chars().any(is_cjk) {
+            // Measured after lower-casing, and strictly below the bound: that is
+            // how `default` decides, and a test pins the four byte lengths
+            // around it.
             let lowered = word.to_lowercase();
-            if word.len() <= MAX_LATIN_TOKEN_BYTES {
+            if lowered.len() < MAX_LATIN_TOKEN_BYTES {
                 tokens.push(Token {
                     offset_from: start,
                     offset_to: end,
@@ -141,12 +154,13 @@ fn tokenize(text: &str) -> Vec<Token> {
                 let from = run[0].0;
                 let last = run[run.len() - 1];
                 let to = last.0 + last.1.len_utf8();
-                if to - from <= MAX_LATIN_TOKEN_BYTES {
+                let lowered = text[from..to].to_lowercase();
+                if lowered.len() < MAX_LATIN_TOKEN_BYTES {
                     tokens.push(Token {
                         offset_from: from,
                         offset_to: to,
                         position,
-                        text: text[from..to].to_lowercase(),
+                        text: lowered,
                         position_length: 1,
                     });
                 }
@@ -217,10 +231,43 @@ mod tests {
     #[test]
     fn latin_words_and_digits_stay_whole_and_lower_cased() {
         assert_eq!(texts("Hello World 2026"), ["hello", "world", "2026"]);
-        // Same bound as tantivy's `default`: long junk does not become a term.
-        let long = "x".repeat(41);
-        assert!(texts(&long).is_empty(), "41 bytes is past the bound");
-        assert_eq!(texts(&"x".repeat(40)).len(), 1);
+    }
+
+    #[test]
+    fn the_long_latin_bound_matches_tantivys_default() {
+        // `default` = SimpleTokenizer + RemoveLongFilter(40) + LowerCaser, and
+        // RemoveLongFilter keeps `len() < 40` *after* lower-casing. Pin all four
+        // lengths around the edge so an off-by-one cannot come back.
+        for length in [38, 39] {
+            assert_eq!(
+                texts(&"x".repeat(length)).len(),
+                1,
+                "{length} bytes is inside the bound"
+            );
+        }
+        for length in [40, 41] {
+            assert!(
+                texts(&"x".repeat(length)).is_empty(),
+                "{length} bytes is past the bound"
+            );
+        }
+        // Lower-casing can change the byte length, and the bound applies after
+        // it: `İ` is 2 bytes and lower-cases to 3, so nineteen of them are 38
+        // bytes going in and 57 coming out — out of bounds, like `default`.
+        let dotted = "İ".repeat(19);
+        assert_eq!(dotted.len(), 38);
+        assert!(texts(&dotted).is_empty());
+    }
+
+    #[test]
+    fn cjk_outside_the_basic_plane_is_expanded_too() {
+        // U+20000 is CJK extension B: one character, still Chinese text.
+        let tokens = texts("𠀀𠀁租");
+        assert!(
+            tokens.iter().any(|token| token == "𠀀𠀁"),
+            "{tokens:?} should carry the surrogate-pair bigram"
+        );
+        assert!(tokens.iter().any(|token| token == "𠀀"));
     }
 
     #[test]

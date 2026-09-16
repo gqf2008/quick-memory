@@ -213,6 +213,35 @@ fn indexed_text() -> TextOptions {
     )
 }
 
+/// Refuse a catalog whose splits were built by an analyzer this build no longer
+/// uses.
+///
+/// The failure this prevents is the quiet one: opening an old split with a new
+/// query analyzer *parses fine* and answers zero hits, because the terms simply
+/// do not match — the reader would report "nothing found" for a page that is
+/// right there. Rebuilding is one command, so the error says which one.
+///
+/// # Errors
+/// Fails when the catalog's index schema is not the one this build writes.
+fn ensure_index_schema_is_current(catalog: &qm_core::IndexCatalog) -> Result<()> {
+    match catalog.schema.cmp(&qm_core::INDEX_SCHEMA) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => bail!(
+            "this project's index was built with schema {} (before the CJK analyzer) and this \
+             build searches with schema {}; run `qm compact` to rebuild it from the pages, then \
+             search again — searching it as it stands would quietly answer fewer hits",
+            catalog.schema,
+            qm_core::INDEX_SCHEMA
+        ),
+        std::cmp::Ordering::Greater => bail!(
+            "this project's index was built with schema {}, which is newer than this build \
+             knows ({}); upgrade quick-memory before searching it",
+            catalog.schema,
+            qm_core::INDEX_SCHEMA
+        ),
+    }
+}
+
 /// Teach an index the analyzer its schema names.
 ///
 /// tantivy keeps its tokenizer registry on the `Index` value rather than in the
@@ -1321,6 +1350,7 @@ pub async fn search_project_tuned(
         .load_catalog(workspace_id, project_id)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    ensure_index_schema_is_current(&loaded.catalog)?;
     let prefixes: Vec<String> = loaded
         .catalog
         .splits
@@ -2754,6 +2784,38 @@ mod tests {
     /// same queries are run twice, once with entity/link streams active and once
     /// against a corpus with the declared fields stripped. If the numbers do not
     /// move, the harness is measuring nothing.
+    /// A catalog has to say which analyzer its terms came from, and a reader has
+    /// to refuse one it cannot match.
+    ///
+    /// This is the operational half of the CJK analyzer change: after an
+    /// upgrade, the splits in a bucket were tokenised by the *old* analyzer, and
+    /// a reader that just searches them parses fine and answers zero hits — the
+    /// exact symptom the analyzer fixes, with nothing to point at the rebuild.
+    #[test]
+    fn a_catalog_whose_terms_come_from_another_analyzer_is_refused() {
+        let mut catalog = qm_core::IndexCatalog::empty();
+        assert_eq!(
+            catalog.schema,
+            qm_core::INDEX_SCHEMA,
+            "a fresh catalog is stamped with the analyzer this build writes"
+        );
+        ensure_index_schema_is_current(&catalog).expect("a current catalog searches");
+
+        catalog.schema = qm_core::INDEX_SCHEMA - 1;
+        let error = ensure_index_schema_is_current(&catalog).unwrap_err();
+        assert!(
+            error.to_string().contains("qm compact"),
+            "an older catalog must say how to rebuild it: {error}"
+        );
+
+        catalog.schema = qm_core::INDEX_SCHEMA + 1;
+        let error = ensure_index_schema_is_current(&catalog).unwrap_err();
+        assert!(
+            error.to_string().contains("newer"),
+            "a catalog from a future build must say so: {error}"
+        );
+    }
+
     /// A word *inside* a Chinese run has to be findable — the user-visible
     /// symptom, reproduced from a real bucket on 2026-09-16: `qm search "租约"`
     /// answered 0 hits while the page body contained the word twice, because

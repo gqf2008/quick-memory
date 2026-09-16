@@ -12,12 +12,12 @@ mod model;
 mod scrub;
 
 pub use model::{
-    AnyManifest, CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, IndexCatalog, Lease,
-    MANIFEST_FORMAT_SHARDED, MANIFEST_FORMAT_WHOLE, MANIFEST_SCHEMA, MANIFEST_SHARD_COUNT,
-    Manifest, ManifestPredecessor, ManifestRoot, ManifestShard, Observation, ObservationSegment,
-    PageEntry, PageVersion, Proposal, ProposalState, SessionHead, ShardRef, SplitEntry, Tombstone,
-    WalEntry, content_hash, derive_handoff_id, derive_observation_id, derive_page_id,
-    derive_proposal_id, derive_segment_id, is_whole_format, manifest_shard_index,
+    AnyManifest, CatalogHead, CommitKind, CommitRecord, Handoff, HandoffState, INDEX_SCHEMA,
+    IndexCatalog, Lease, MANIFEST_FORMAT_SHARDED, MANIFEST_FORMAT_WHOLE, MANIFEST_SCHEMA,
+    MANIFEST_SHARD_COUNT, Manifest, ManifestPredecessor, ManifestRoot, ManifestShard, Observation,
+    ObservationSegment, PageEntry, PageVersion, Proposal, ProposalState, SessionHead, ShardRef,
+    SplitEntry, Tombstone, WalEntry, content_hash, derive_handoff_id, derive_observation_id,
+    derive_page_id, derive_proposal_id, derive_segment_id, is_whole_format, manifest_shard_index,
 };
 pub use scrub::{MAX_OBSERVATION_BYTES, scrub};
 

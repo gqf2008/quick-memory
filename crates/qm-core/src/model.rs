@@ -40,6 +40,20 @@ pub fn content_hash(bytes: &[u8]) -> String {
 /// Manifest/WAL encoding schema. Bumping it is a breaking change.
 pub const MANIFEST_SCHEMA: u32 = 1;
 
+/// Schema of an *index* (a catalog and the splits it lists): what the terms in
+/// those splits were built with.
+///
+/// Unlike [`MANIFEST_SCHEMA`] this is not about the authority — an index is a
+/// derived layer, so a reader can always rebuild it from the pages. It exists so
+/// that a reader can tell "these terms came from an analyzer I no longer use"
+/// apart from "there is nothing to find", and refuse instead of answering with
+/// a silent zero. §6 of the design has the analyzer this identifies.
+///
+/// - `1`: tantivy's `default` analyzer (a CJK run is one token).
+/// - `2`: the CJK analyzer (`qm-search::cjk`): CJK runs become unigrams and
+///   bigrams, so a word inside a run is findable.
+pub const INDEX_SCHEMA: u32 = 2;
+
 /// Manifest storage form: every path of the scope in one object.
 ///
 /// This is the form `quick-memory` shipped first, and the default. Its commit
@@ -702,7 +716,7 @@ impl IndexCatalog {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            schema: MANIFEST_SCHEMA,
+            schema: INDEX_SCHEMA,
             generation: 0,
             splits: Vec::new(),
             covered_until_ms: 0,
@@ -718,6 +732,13 @@ impl IndexCatalog {
     }
 
     /// Append a split and advance the generation.
+    /// Append a split.
+    ///
+    /// The catalog's [`schema`](Self::schema) is deliberately *not* raised here:
+    /// appending a new-analyzer split to a catalog that already holds old ones
+    /// leaves the catalog describing the oldest terms in it, which is what a
+    /// reader needs to know before it answers. `qm compact` is what rebuilds the
+    /// set and raises the value.
     pub fn push_split(&mut self, split: SplitEntry, now_ms: i64) {
         self.generation += 1;
         self.covered_until_ms = self.covered_until_ms.max(now_ms);
