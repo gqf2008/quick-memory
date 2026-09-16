@@ -341,28 +341,34 @@ mod tests {
         );
         assert!(tokens.iter().any(|token| token == "𠀀"));
 
-        // Extension G starts at U+30000 and extension H ends at U+323AF; both
-        // ends of the range, not just the convenient one.
-        for (name, text) in [
-            ("extension G", "𰀀𰀁"),
-            ("extension H", "\u{323ae}\u{323af}"),
+        // Extension G starts at U+30000 and extension H ends at U+323AF. Each
+        // end is asserted as a *precise* unigram and as a bigram crossing into a
+        // known-CJK neighbour: a looser "some one-character token exists" is
+        // satisfied by the trailing 租 even when the whole range is missing —
+        // and an off-by-one at either end would slip through just as easily.
+        for (name, ch) in [
+            // The block spans U+30000–U+3134F but the *assigned* characters
+            // stop at U+3134A; a block end that is unassigned is not
+            // alphanumeric and is dropped as a boundary, which is a different
+            // behaviour entirely.
+            ("extension G start", '\u{30000}'),
+            ("extension G last assigned", '\u{3134a}'),
+            ("extension H start", '\u{31350}'),
+            ("extension H end", '\u{323af}'),
         ] {
+            let text = ch.to_string();
             let tokens = texts(&format!("{text}租"));
             assert!(
-                tokens.iter().any(|token| token == text),
-                "{name} bigram missing: {tokens:?}"
+                tokens.iter().any(|token| token == &text),
+                "{name} (U+{:05X}) has no unigram: {tokens:?}",
+                ch as u32
             );
             assert!(
-                tokens.iter().any(|token| token.chars().count() == 1),
-                "{name} unigram missing: {tokens:?}"
+                tokens.iter().any(|token| token == &format!("{text}租")),
+                "{name} (U+{:05X}) does not pair with its CJK neighbour: {tokens:?}",
+                ch as u32
             );
         }
-        // U+31350 is the first character of extension H.
-        let tokens = texts("\u{31350}租");
-        assert!(
-            tokens.iter().any(|token| token == "\u{31350}租"),
-            "the G/H boundary has to pair with its neighbour: {tokens:?}"
-        );
     }
 
     #[test]
