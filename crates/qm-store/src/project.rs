@@ -173,6 +173,17 @@ impl LoadedManifest {
 pub struct PathState {
     /// Current entry for the path, if the scope names one.
     pub head: Option<PageEntry>,
+    /// The version that was current when the path was deleted, if a tombstone
+    /// says so.
+    ///
+    /// A tombstone is not the absence of a chain, it is the *end* of one: this
+    /// id is the same "where do I start walking" answer a live head gives, and
+    /// three readers depend on it — `page_history` (the past of a deleted page
+    /// is still history), `commit_page` (`supersedes` of a rewrite, so a
+    /// restored page keeps its chain) and `gc` (everything the tombstone's
+    /// version supersedes is still reachable, or reclaiming would erase the
+    /// past of a page that happens not to exist right now).
+    pub last_page_id: Option<qm_core::PageId>,
     /// Whether the path is tombstoned.
     pub tombstoned: bool,
     /// Commit sequence of the scope's last successful CAS (0 = never).
@@ -851,6 +862,7 @@ impl ProjectStore {
         match self.cas.read(&key).await {
             Err(StoreError::NotFound) => Ok(PathState {
                 head: None,
+                last_page_id: None,
                 tombstoned: false,
                 seq: 0,
                 version: None,
@@ -860,10 +872,15 @@ impl ProjectStore {
             Ok((bytes, version)) => match self.read_commit_point(&bytes, &key)? {
                 AnyManifest::Whole(manifest) => {
                     let head = manifest.head(path).cloned();
+                    let last_page_id = manifest
+                        .tombstones
+                        .get(path.as_str())
+                        .and_then(|tombstone| tombstone.last_page_id.clone());
                     let tombstoned = manifest.is_tombstoned(path);
                     let seq = manifest.seq;
                     Ok(PathState {
                         head,
+                        last_page_id,
                         tombstoned,
                         seq,
                         version: Some(version),
@@ -884,6 +901,10 @@ impl ProjectStore {
                     };
                     Ok(PathState {
                         head: shard.pages.get(path.as_str()).cloned(),
+                        last_page_id: shard
+                            .tombstones
+                            .get(path.as_str())
+                            .and_then(|tombstone| tombstone.last_page_id.clone()),
                         tombstoned: shard.tombstones.contains_key(path.as_str()),
                         seq: root.seq,
                         version: Some(version),
@@ -1461,7 +1482,13 @@ impl ProjectStore {
             let state = self
                 .load_path(&request.workspace_id, &request.project_id, &request.path)
                 .await?;
-            let supersedes = state.head.as_ref().map(|entry| entry.page_id.clone());
+            // Rewriting a deleted path continues its chain rather than starting
+            // a new one: the tombstone's version is what this commit replaces.
+            let supersedes = state
+                .head
+                .as_ref()
+                .map(|entry| entry.page_id.clone())
+                .or_else(|| state.last_page_id.clone());
             let page_id = derive_page_id(
                 &request.path,
                 &request.title,
@@ -2799,7 +2826,9 @@ impl ProjectStore {
         path: &PagePath,
     ) -> Result<Vec<WalEntry>, StoreError> {
         let state = self.load_path(workspace_id, project_id, path).await?;
-        let head = state.head.map(|entry| entry.page_id);
+        // A tombstone names the version it deleted, so a page that was deleted
+        // still has a history: walk from there instead of reporting none.
+        let head = state.head.map(|entry| entry.page_id).or(state.last_page_id);
         self.page_history_from_head(workspace_id, project_id, path, head)
             .await
     }
@@ -3913,6 +3942,118 @@ mod tests {
             writer_id: WriterId::new(writer).unwrap(),
             now_ms,
         }
+    }
+
+    /// A deleted page still has a history, and a rewrite continues it.
+    ///
+    /// The chain is walked *from* the commit point, and a deletion replaces the
+    /// head with a tombstone — which names the version it deleted. Reading the
+    /// past of a deleted page, and linking a rewrite to it, both depend on that
+    /// id being treated as the start of the chain. Observed on a real bucket
+    /// first: `qm history --path <deleted>` answered `[]` while
+    /// `read-page --as-of` still answered.
+    #[tokio::test]
+    async fn a_deleted_page_keeps_its_history_and_a_rewrite_continues_it() {
+        // Both storage forms: the tombstone is read from the whole manifest or
+        // from the one shard the path hashes to, and neither may be the branch
+        // where the chain quietly stops.
+        for format in [
+            qm_core::MANIFEST_FORMAT_WHOLE,
+            qm_core::MANIFEST_FORMAT_SHARDED,
+        ] {
+            let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let store = machine_with_format(&bucket, format);
+            deleted_page_history_and_rewrite(&store).await;
+        }
+    }
+
+    /// The body of [`a_deleted_page_keeps_its_history_and_a_rewrite_continues_it`],
+    /// once per storage form.
+    async fn deleted_page_history_and_rewrite(store: &ProjectStore) {
+        let path = PagePath::new("notes/doomed.md").unwrap();
+
+        let mut ids = Vec::new();
+        for (version, body) in [(1, "first"), (2, "second"), (3, "third")] {
+            ids.push(
+                store
+                    .commit_page(CommitPageRequest {
+                        workspace_id: ws(),
+                        project_id: proj(),
+                        path: path.clone(),
+                        title: "Doomed".into(),
+                        body: body.into(),
+                        writer_id: WriterId::new("mbp-a").unwrap(),
+                        now_ms: version,
+                    })
+                    .await
+                    .unwrap()
+                    .page_id,
+            );
+        }
+
+        store
+            .delete_page(&ws(), &proj(), &path, &WriterId::new("mbp-a").unwrap(), 4)
+            .await
+            .unwrap();
+
+        // Premise: the page really is gone from a reader's point of view, or
+        // the rest of this test would prove nothing.
+        assert!(
+            store
+                .read_page(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .is_none(),
+            "the page has to actually be deleted"
+        );
+
+        let history = store.page_history(&ws(), &proj(), &path).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.page_id.clone())
+                .collect::<Vec<_>>(),
+            ids,
+            "the history of a deleted page is still history"
+        );
+        assert_eq!(
+            store
+                .read_page_versions(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "and every version body is still readable"
+        );
+
+        // A rewrite is what `qm restore` does: it has to supersede the version
+        // the tombstone named, so the new version joins the same chain.
+        let rewrite = store
+            .commit_page(CommitPageRequest {
+                workspace_id: ws(),
+                project_id: proj(),
+                path: path.clone(),
+                title: "Doomed".into(),
+                body: "first".into(),
+                writer_id: WriterId::new("mbp-b").unwrap(),
+                now_ms: 5,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rewrite.supersedes.as_ref(),
+            ids.last(),
+            "a rewrite after a delete continues the chain instead of starting a new one"
+        );
+        assert_eq!(
+            store
+                .page_history(&ws(), &proj(), &path)
+                .await
+                .unwrap()
+                .len(),
+            4,
+            "so the restored page's history shows all four versions"
+        );
     }
 
     #[tokio::test]

@@ -99,11 +99,27 @@ impl ProjectStore {
             }
         }
 
+        // A tombstone is a chain head too, and the only one this scope has for
+        // a deleted path. Walking from it keeps the whole pre-deletion history
+        // reachable — `qm history` and `read-page --as-of` both read it, so
+        // keeping only the last version would erase the past of a page that
+        // happened to be deleted.
         for (path, tombstone) in &loaded.manifest.tombstones {
-            if let Some(page_id) = &tombstone.last_page_id {
-                let page_path = PagePath::new(path)?;
-                keys.insert(layout.page_version(workspace_id, project_id, &page_path, page_id));
-                keys.insert(layout.wal_entry(workspace_id, project_id, page_id.as_str()));
+            let Some(page_id) = &tombstone.last_page_id else {
+                continue;
+            };
+            let page_path = PagePath::new(path)?;
+            for wal in self
+                .page_history_from_head(workspace_id, project_id, &page_path, Some(page_id.clone()))
+                .await?
+            {
+                keys.insert(layout.wal_entry(workspace_id, project_id, wal.event_id()));
+                keys.insert(layout.page_version(
+                    workspace_id,
+                    project_id,
+                    &page_path,
+                    &wal.page_id,
+                ));
             }
         }
 
@@ -256,6 +272,75 @@ mod tests {
             "{}/manifest/archive",
             store.layout().scope_prefix(&ws(), &proj())
         )
+    }
+
+    /// Reclaiming must not erase the past of a deleted page.
+    ///
+    /// A tombstone names the version that was current when the page was
+    /// deleted, and everything it supersedes is still that page's history —
+    /// `qm history` and `read-page --as-of` read it. Keeping only the named
+    /// version, which is what this walk used to do, silently dropped the rest
+    /// as soon as the grace window passed.
+    #[tokio::test]
+    async fn gc_keeps_the_whole_history_of_a_deleted_page() {
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = store(&bucket);
+        let path = PagePath::new("notes/doomed.md").unwrap();
+
+        for (version, body) in [(1, "first"), (2, "second"), (3, "third")] {
+            store
+                .commit_page(CommitPageRequest {
+                    workspace_id: ws(),
+                    project_id: proj(),
+                    path: path.clone(),
+                    title: "Doomed".into(),
+                    body: body.into(),
+                    writer_id: WriterId::new("mbp-a").unwrap(),
+                    now_ms: version,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .delete_page(&ws(), &proj(), &path, &WriterId::new("mbp-a").unwrap(), 4)
+            .await
+            .unwrap();
+
+        // An object nothing names, so the pass has something to collect: a
+        // green result has to mean the reclaimer actually ran.
+        let orphan = "v1/ws/acme/proj/ai-memory/index/catalog/deadbeef.json";
+        store
+            .cas()
+            .create(orphan, bytes::Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        let outcome = store
+            .gc_orphans(&ws(), &proj(), 1_000, 0, true)
+            .await
+            .unwrap();
+        assert!(
+            outcome.deleted_keys.iter().any(|key| key == orphan),
+            "the pass has to have deleted the orphan: {outcome:?}"
+        );
+
+        let versions = store
+            .read_page_versions(&ws(), &proj(), &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.body.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"],
+            "every version of a deleted page is still history"
+        );
+        assert!(
+            store
+                .version_at(&ws(), &proj(), &path, 2)
+                .await
+                .unwrap()
+                .is_some(),
+            "and a point-in-time read of the past still answers"
+        );
     }
 
     #[tokio::test]

@@ -3446,6 +3446,60 @@ mod tests {
         assert!(out.contains("\"sessions\":1"), "{out}");
     }
 
+    /// The CLI surface of "a deleted page still has a history".
+    ///
+    /// Reported from a real bucket: `qm history --path <deleted>` printed `[]`
+    /// while `read-page --as-of` still answered. The store walked its chain
+    /// from the manifest head, which a deletion replaces with a tombstone.
+    #[tokio::test]
+    async fn history_of_a_deleted_page_lists_its_versions() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache = TempDir::new().unwrap();
+
+        for (index, body) in ["first", "second", "third"].iter().enumerate() {
+            execute(
+                &cli(&["write-page", "--path", "notes/doomed.md", "--body", body]),
+                Context {
+                    now_ms: (index as i64 + 1) * 1_000,
+                    ..context(Arc::clone(&bucket), &cache)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        execute(
+            &cli(&["delete-page", "--path", "notes/doomed.md"]),
+            Context {
+                now_ms: 4_000,
+                ..context(Arc::clone(&bucket), &cache)
+            },
+        )
+        .await
+        .unwrap();
+
+        // Premise: the page is really gone, so an empty history could not be
+        // explained by "there was nothing there".
+        let missing = execute(
+            &cli(&["read-page", "--path", "notes/doomed.md"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await;
+        assert!(missing.is_err(), "the page must actually be deleted");
+
+        let history = execute(
+            &cli(&["history", "--path", "notes/doomed.md", "--json"]),
+            context(Arc::clone(&bucket), &cache),
+        )
+        .await
+        .unwrap();
+        let versions: Vec<qm_core::PageVersion> = serde_json::from_str(&history).unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.body.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"],
+            "a deleted page still has a history"
+        );
+    }
+
     #[tokio::test]
     async fn history_lists_versions_and_restore_creates_a_new_one() {
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
