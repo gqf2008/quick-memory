@@ -1229,7 +1229,10 @@ C 有两种子形态，**代价完全不同**，必须分开谈：
 A 之下需要实测的是「一把桶作用域 token 足够跑通全部路径」，它由两条证据合起来支持：
 （a）§10.8 的真 R2 复验——`cas-conformance`、并发提交、跨分片检索、删除/压缩、format 2 迁移回滚
 等全部用**同一把** token 跑通；（b）凭据作用域本身的观测（§10.9，2026-09-17）——该 token 列桶被拒、
-同账户另一个确定存在的桶也被拒，本桶 HEAD/List 正常，写路径另由当天的写入冒烟（§10.9）证明。
+同账户另一个确定存在的桶也被拒，本桶 HEAD/List 正常；写路径由当天的写入冒烟（§10.9）覆盖**核心提交 /
+CAS 路径**（页面版本 + WAL + manifest CAS + commit record），`publish` / `delete` / `compact` /
+`migrate` 等其余写路径仍只归因于 §10.8 那次（同一配置文件来源，但当时那把凭据与现在是否同值
+没有单独核对）。
 仍然空着的是**前缀级 ACL** 与「错误签名必须被拒」这类负向矩阵（§10.8 边界、§11）。
 凭据本身不阻塞协议验证，也不阻塞部署。
 
@@ -1423,7 +1426,8 @@ aws s3api head-bucket     --bucket <不存在的桶名> --endpoint-url …
   不是凭据内容的指纹；对象时间只说明「那时发生过写」，不能单独证明写操作用的就是该文件里**当前版本**
   的凭据（若当时 export 了 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`，凭据来源其实是环境变量）。
 - **写路径冒烟（2026-09-17 当天补做）**：先把本进程里所有 `QM_S3_*` / `R2_*` / `AWS_*` 变量用
-  `env -u` 清掉（本机 shell 本来也没有 export 过这些变量，凭据只可能来自 `~/.quick-memory/env`），
+  `env -u` 清掉（本机 shell 本来也没有 export 过这些变量；`QM_CONFIG_FILE` 也一并 unset，所以凭据只可能
+  来自**默认的本机配置文件** `~/.quick-memory/env`），
   然后 `qm write-page` 提交一页、`qm read-page` 读回、`qm verify --strict` 报
   `verified 1 project(s): 4 page(s), 2 session(s), 3 split(s), no problems`；`status` 显示
   `manifest_seq` 5 → 6、`pages` 3 → 4。再用 aws CLI 独立核对象确实落在桶里：

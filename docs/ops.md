@@ -262,12 +262,25 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 1. 按上面签发**新** token；
 2. 在那台机器上更新 `~/.quick-memory/env` 里的 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`；
 3. 验证写路径仍通：`qm status --json` 正常、`qm publish --json` 能提交；同时按 `design.md` §10.9
-   重跑作用域观测（读：`head-bucket` 本桶成功、`list-buckets` 被拒）与写入冒烟（写：该节的
-   `write-page` → `read-page` → `verify --strict` 三步）；
-   **若那台机器另外 export 了 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`**，必须同步更新或
-   `unset`——环境变量优先于文件，只改文件会得到「文件里是新 key、进程仍用旧 key」的**假轮换**；
-   复核时两个值都要显式覆盖：
-   `env QM_S3_ACCESS_KEY_ID=<new> QM_S3_SECRET_ACCESS_KEY=<new> qm status --json`；
+   重跑作用域观测（读：`head-bucket` 本桶成功、`list-buckets` 被拒）与写入冒烟（写：见下面的完整命令）。
+   **若那台机器另外 export 了凭据类环境变量**，必须同步更新或 `unset`——环境变量整体优先于文件，
+   只改文件会得到「文件里是新 key、进程仍用旧 key」的**假轮换**。**两套别名都要处理**：
+   `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`，以及 `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`
+   （`R2_ENDPOINT` / `R2_BUCKET` 同样是别名；四张表在 `crates/qm-cli/src/lib.rs` 的
+   `S3_{ENDPOINT,BUCKET,ACCESS_KEY,SECRET_KEY}_ENV_NAMES`，别把它和 walgit 配置里的 `R2_ACCESS_KEY` /
+   `R2_SECRET_KEY` 混起来——那两个名字 quick-memory **不认**）。另外 `QM_CONFIG_FILE` 指向别的配置文件时
+   会绕过刚改的这份，也要一并确认。写入冒烟（正文走
+   `--body`，不读 stdin、不留临时文件）：
+
+   ```bash
+   env -u QM_S3_ACCESS_KEY_ID -u QM_S3_SECRET_ACCESS_KEY -u QM_S3_ENDPOINT -u QM_S3_BUCKET \
+       -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u R2_ENDPOINT -u R2_BUCKET \
+       -u QM_CONFIG_FILE \
+       qm write-page --path ops/credential-rotation-smoke.md --body "rotation smoke $(date -u +%FT%TZ)"
+   env -u QM_CONFIG_FILE qm read-page --path ops/credential-rotation-smoke.md >/dev/null && qm verify --strict
+   ```
+
+   注意这条冒烟**会真的写一页**：轮换演练请用专用 `--workspace` / `--project`，别往生产 scope 里塞。
 4. 回控制台**吊销旧** token；
 5. 吊销后旧凭据立即失效：还在用旧值的机器会读写失败并**报错**（`qm` 不会静默降级成本地存储）。
 
