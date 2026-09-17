@@ -1425,8 +1425,8 @@ aws s3api head-bucket     --bucket <不存在的桶名> --endpoint-url …
   `head.json` / `catalog` / splits）。这两条只是**旁证**：mtime 只说明配置文件最后一次被改的时间，
   不是凭据内容的指纹；对象时间只说明「那时发生过写」，不能单独证明写操作用的就是该文件里**当前版本**
   的凭据（若当时 export 了 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`，凭据来源其实是环境变量）。
-- **写路径冒烟（2026-09-17 当天补做）**：先把本进程里所有 `QM_S3_*` / `R2_*` / `AWS_*` 变量用
-  `env -u` 清掉（本机 shell 本来也没有 export 过这些变量；`QM_CONFIG_FILE` 也一并 unset，所以凭据只可能
+- **写路径冒烟（2026-09-17 当天补做）**：先把本进程里 `qm` 会读取的 `QM_S3_*` / `R2_*` 覆盖项用
+  `env -u` 清掉（`QM_CONFIG_FILE` 也一并 unset）（本机 shell 本来也没有 export 过这些变量；`QM_CONFIG_FILE` 也一并 unset，所以凭据只可能
   来自**默认的本机配置文件** `~/.quick-memory/env`），
   然后 `qm write-page` 提交一页、`qm read-page` 读回、`qm verify --strict` 报
   `verified 1 project(s): 4 page(s), 2 session(s), 3 split(s), no problems`；`status` 显示

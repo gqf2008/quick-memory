@@ -280,7 +280,7 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
        -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u R2_ENDPOINT -u R2_BUCKET \
        -u QM_CONFIG_FILE \
        sh -c 'set -e
-         W=cred-smoke-ws          # 演练专用 scope；必须是合法 identifier（不能带空格或 <>
+         W=cred-smoke-ws          # 演练专用 scope；必须是合法 identifier（不能带空格或 <>）
          P=cred-smoke-proj
          qm write-page --workspace "$W" --project "$P" \
            --path ops/credential-rotation-smoke.md --body "rotation smoke $(date -u +%FT%TZ)"
