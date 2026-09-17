@@ -251,18 +251,22 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 1. Cloudflare 控制台 → R2 → **Manage API Tokens** → Create API Token；
 2. 权限选 **Object Read & Write**，**Scope 指定到这一个 bucket**——不要选 All buckets，那等于账户级；
 3. **令牌只在创建时显示一次**，当场写进那台机器的 `~/.quick-memory/env`，并 `chmod 600`；
-4. 验证：`qm status --json` 能读到该 scope；`aws s3api head-bucket --bucket <bucket>` 成功，
-   而 `aws s3api list-buckets` 被 **AccessDenied / 403** 拒绝——这正是"桶作用域"的证据
-   （2026-09-17 在本仓库在用的那把上观测过，见 `design.md` §10.9）。
+4. 验证（用同一个 `--endpoint-url` 和刚签发的这把 token）：`qm status --json` 能读到该 scope；
+   `aws s3api head-bucket --bucket <bucket> --endpoint-url https://<account>.r2.cloudflarestorage.com` 成功，
+   而 `aws s3api list-buckets --endpoint-url …` 被 **AccessDenied / 403** 拒绝——这是"桶作用域"的证据
+   （2026-09-17 在本仓库在用的那把上观测过，完整命令与边界见 `design.md` §10.9）。
+   「恰好只授权这一个桶」来自你在第 2 步选的 Scope，不是 API 能证明的（§10.9 边界）。
 
 ### 轮换（先发新、再撤旧）
 
 1. 按上面签发**新** token；
 2. 在那台机器上更新 `~/.quick-memory/env` 里的 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`；
-3. 验证写路径仍通：`qm status --json` 正常、`qm publish --json` 能提交；
+3. 验证写路径仍通：`qm status --json` 正常、`qm publish --json` 能提交；同时按 `design.md` §10.9
+   重跑一次作用域观测（`head-bucket` 本桶成功、`list-buckets` 被拒）；
    **若那台机器另外 export 了 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`**，必须同步更新或
    `unset`——环境变量优先于文件，只改文件会得到「文件里是新 key、进程仍用旧 key」的**假轮换**；
-   复核时用显式环境跑一遍 `env QM_S3_ACCESS_KEY_ID=… qm status --json`；
+   复核时两个值都要显式覆盖：
+   `env QM_S3_ACCESS_KEY_ID=<new> QM_S3_SECRET_ACCESS_KEY=<new> qm status --json`；
 4. 回控制台**吊销旧** token；
 5. 吊销后旧凭据立即失效：还在用旧值的机器会读写失败并**报错**（`qm` 不会静默降级成本地存储）。
 
