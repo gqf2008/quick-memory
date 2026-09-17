@@ -237,7 +237,45 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 | 压缩者中途消失 | 租约到期后由别的机器接管 | 无需人工干预；过期租约可被抢 |
 | commit log 少一条（提交与日志之间崩溃） | 历史少一个时间戳 | 权威状态不受影响；无需修复 |
 | 索引损坏或格式升级 | 检索异常 | 从权威页面重建：`qm compact`（或清空 index 前缀后重建） |
-| 凭据泄露 | 全桶可读写（若用每机全桶 token） | 轮换 token；考虑前置 Worker 网关做前缀级鉴权（见 design.md §9） |
+| 凭据泄露 | **该桶可读写**（终局口径：§9 已拍板 A，每机一把 bucket-scoped token） | 轮换 token（**先发新、再撤旧**）；桶侧最小权限。见本文「凭据」与 `design.md` §9.5 |
+
+## 凭据：签发 / 轮换 / 吊销
+
+**形态（2026-09-17 拍板：方案 A）**：每台机器一把 **bucket-scoped** 的 R2 token，直连桶读写，没有网关。
+`qm` / `qm-mcp` 从环境变量或 `~/.quick-memory/env` 读四个值：`QM_S3_ENDPOINT`、`QM_S3_BUCKET`、
+`QM_S3_ACCESS_KEY_ID`、`QM_S3_SECRET_ACCESS_KEY`（`R2_*` 是别名；环境变量优先于文件）。
+
+### 签发（每台机器一把）
+
+1. Cloudflare 控制台 → R2 → **Manage API Tokens** → Create API Token；
+2. 权限选 **Object Read & Write**，**Scope 指定到这一个 bucket**——不要选 All buckets，那等于账户级；
+3. **令牌只在创建时显示一次**，当场写进那台机器的 `~/.quick-memory/env`，并 `chmod 600`；
+4. 验证：`qm status --json` 能读到该 scope；同时 `aws s3api list-buckets` 应当被 **403** 拒绝——
+   这正是"桶作用域"的证据（本仓库在用的这把就是如此）。
+
+### 轮换（先发新、再撤旧）
+
+1. 按上面签发**新** token；
+2. 在那台机器上更新 `~/.quick-memory/env` 里的 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`；
+3. 验证写路径仍通：`qm status --json` 正常、`qm publish --json` 能提交；
+4. 回控制台**吊销旧** token；
+5. 吊销后旧凭据立即失效：还在用旧值的机器会读写失败并**报错**（`qm` 不会静默降级成本地存储）。
+
+### 吊销（凭据泄露、机器退役）
+
+- 在控制台删掉那把 token 即可；桶里的历史数据不受影响——删的是"钥匙"，不是"内容"（对象不可变）。
+- 泄露面的终局口径：**一台机器的凭据 = 该桶可读写**。缓解只有两条：轮换、桶侧只给必要的桶。
+- **没有前缀级隔离**：`QM_S3_PREFIX` 只是对象键前缀，不是权限边界，别把它当 ACL 用。
+
+## 归因边界：`writer_id` 是自述，不是认证
+
+`PageEntry` / `WalEntry` / `Tombstone` / `SplitEntry` / `CommitRecord` 上都记着 `writer_id`，
+`qm history` / `qm log` 也能回答"哪台机器在什么时候写了什么"。但 `QM_WRITER` 只是一个环境变量
+（或 `--writer` 参数），**谁都能把它写成别人的名字**。所以：
+
+- 它是**诚实记录**，不是**可验证归属**：不要拿它当审计依据，也不要据此做权限判断；
+- 唯一可信的是**内容寻址的不可变记录本身**——某个 `page_id` 对应的字节存在过；
+- 需要可验证归属，就得引入认证过的 principal，也就是被否决的 §9 C1（网关）方案。
 
 ## 成本与容量
 

@@ -6,7 +6,8 @@
 ## 1. 准备
 
 - 一个 S3 兼容桶（Cloudflare R2 / AWS S3 / MinIO 均可）。
-  需要一个 **Object Read & Write** 的访问密钥。
+  需要一把 **Object Read & Write** 的访问密钥——**按桶签发、每台机器各一把**（别用账户级 token）。
+  签发 / 轮换 / 吊销的步骤见 `docs/ops.md` 的「凭据：签发 / 轮换 / 吊销」一节（2026-09-17 拍板：凭据方案 A）。
 - Rust 1.95（`rust-toolchain.toml` 已固定）。
 
 ```bash
