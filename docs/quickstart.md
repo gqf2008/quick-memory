@@ -320,7 +320,8 @@ cargo run -p qm-probe --bin digest-probe -- read --help
 
 stub 证据只覆盖本地 HTTP 协议层。真 R2 已于 2026-09-16 复验（条件写契约、跨进程检索、向量闭环、
 digest、删除/压缩、format 2 迁移回滚；见 `docs/design.md` §10.8），但**真 embedding provider**、
-ACL/凭据边界，以及 R2 的一致性、配额、延迟与错误 XML 变体仍未验证。
+**凭据边界的负向矩阵**（"错误签名必须被拒"、前缀级 ACL），以及 R2 的一致性、配额、延迟与错误 XML
+变体仍未验证；凭据的桶作用域另有 2026-09-17 的观测（§10.9）。
 
 `digest-probe` 不自动清理；`seed` 写入前会列出目标 scope，发现任何既有对象就 fail-loud，`read` 只读。
 `--workspace` / `--project` 是必填参数，必须由两个进程显式传入同一组唯一值；这个 listing 预检是

@@ -181,8 +181,9 @@ Quickwit 官方 0.9.0 容器产出的真分片读取验证已完成（见 `desig
 
 **真 R2 已于 2026-09-16 复验**（条件写契约、跨进程检索、S2/S4 场景、向量闭环、CLI 收口、删除/压缩、
 format 2 迁移回滚；R2 的 "PUT 返回 version、GET 不返回" 也从推断变成了实测观测）。复现命令与原始结果见
-`design.md` §10.8。仍未验证的是：**ACL / 签名拒绝 / 区域 / 一致性 / 配额 / 延迟 / 错误 XML 变体**，
-以及**向量链的真 provider**（当前 vector 证据使用本地 deterministic HTTP stub，不是真 provider）。
+`design.md` §10.8。仍未验证的是：**错误签名必须被拒、前缀级 ACL、区域 / 一致性 / 配额 / 延迟 /
+错误 XML 变体**，以及**向量链的真 provider**（当前 vector 证据使用本地 deterministic HTTP stub，
+不是真 provider）。凭据的**桶作用域**另有 2026-09-17 的观测（`design.md` §10.9）。
 再跑一次真桶验收时，`cas-conformance` 盯条件写契约，`search-probe vector-publish` / `vector-query`
 盯向量闭环，`digest-probe`（`--workspace` / `--project` 必填且两命令同一组唯一值）盯跨进程 digest。
 
@@ -210,8 +211,8 @@ manifest 仍认账的 live pages，所以「manifest 已不再返回那条 path�
 `cas-conformance` 与 `search-probe build/query` 采用，不是所有 probe 的全局隔离。
 这些 stub 路径本身仍只证明协议层；同样的命令形状也已在 MinIO current-head（§10.5）与真 R2（§10.8）上
 跑过，后者是 2026-09-16 的复验。其中仍未验证的是**真 embedding provider**，以及前面那份完整清单里的
-**ACL / 签名拒绝 / 区域 / 一致性 / 配额 / 延迟 / 错误 XML 变体**——两处说的是同一组剩余项，
-不要只读这一句就以为只剩两项。
+**错误签名必须被拒 / 前缀级 ACL / 区域 / 一致性 / 配额 / 延迟 / 错误 XML 变体**——两处说的是同一组剩余项，
+不要只读这一句就以为只剩两项（凭据的**桶作用域**本身已有 `design.md` §10.9 的观测）。
 
 **真桶是共享资源**：验证用的 bucket 同时可能存有其它项目的对象，所以每次运行都必须用唯一
 workspace / prefix 隔离，并在结束后清理自建对象；`digest-probe` 这类不自带清理的探针尤其如此。
@@ -250,14 +251,18 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 1. Cloudflare 控制台 → R2 → **Manage API Tokens** → Create API Token；
 2. 权限选 **Object Read & Write**，**Scope 指定到这一个 bucket**——不要选 All buckets，那等于账户级；
 3. **令牌只在创建时显示一次**，当场写进那台机器的 `~/.quick-memory/env`，并 `chmod 600`；
-4. 验证：`qm status --json` 能读到该 scope；同时 `aws s3api list-buckets` 应当被 **403** 拒绝——
-   这正是"桶作用域"的证据（本仓库在用的这把就是如此）。
+4. 验证：`qm status --json` 能读到该 scope；`aws s3api head-bucket --bucket <bucket>` 成功，
+   而 `aws s3api list-buckets` 被 **AccessDenied / 403** 拒绝——这正是"桶作用域"的证据
+   （2026-09-17 在本仓库在用的那把上观测过，见 `design.md` §10.9）。
 
 ### 轮换（先发新、再撤旧）
 
 1. 按上面签发**新** token；
 2. 在那台机器上更新 `~/.quick-memory/env` 里的 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`；
 3. 验证写路径仍通：`qm status --json` 正常、`qm publish --json` 能提交；
+   **若那台机器另外 export 了 `QM_S3_ACCESS_KEY_ID` / `QM_S3_SECRET_ACCESS_KEY`**，必须同步更新或
+   `unset`——环境变量优先于文件，只改文件会得到「文件里是新 key、进程仍用旧 key」的**假轮换**；
+   复核时用显式环境跑一遍 `env QM_S3_ACCESS_KEY_ID=… qm status --json`；
 4. 回控制台**吊销旧** token；
 5. 吊销后旧凭据立即失效：还在用旧值的机器会读写失败并**报错**（`qm` 不会静默降级成本地存储）。
 
