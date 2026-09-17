@@ -280,7 +280,8 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
        -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u R2_ENDPOINT -u R2_BUCKET \
        -u QM_CONFIG_FILE \
        sh -c 'set -e
-         W=<演练专用 workspace>; P=<演练专用 project>
+         W=cred-smoke-ws          # 演练专用 scope；必须是合法 identifier（不能带空格或 <>
+         P=cred-smoke-proj
          qm write-page --workspace "$W" --project "$P" \
            --path ops/credential-rotation-smoke.md --body "rotation smoke $(date -u +%FT%TZ)"
          qm read-page --workspace "$W" --project "$P" --path ops/credential-rotation-smoke.md >/dev/null
@@ -289,7 +290,9 @@ qm verify --global --strict   # 有问题就非零退出（可用于定时巡检
 
    注意这条冒烟**会真的写一页**（§10.9 那次写的是 `ops/r2-credential-scope.md`；轮换演练写的是这里
    的 `ops/credential-rotation-smoke.md`，两者不必同路径）——所以演练请用专用 `--workspace` /
-   `--project`，别往生产 scope 里塞。
+   `--project`，别往生产 scope 里塞。另外「默认配置文件」是靠 `$HOME` 定位的
+   （`crates/qm-cli/src/config.rs`），如果这台机器改过 `HOME`，先确认它指向的就是你要验的那份
+   `~/.quick-memory/env`。
 4. 回控制台**吊销旧** token；
 5. 吊销后旧凭据立即失效：还在用旧值的机器会读写失败并**报错**（`qm` 不会静默降级成本地存储）。
 
